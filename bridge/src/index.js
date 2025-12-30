@@ -48,7 +48,7 @@ const SPEC_ARTIFACTS = ['requirements', 'design', 'tasks'];
 const SPEC_TEMPLATES = {
   requirements: `# 需求（requirements）\n\n## 背景\n\n## 用户故事\n\n## 验收标准（EARS）\n- 当[条件/事件]时，系统应[期望行为]。\n`,
   design: `# 设计（design）\n\n## 架构概览\n\n## 关键流程/时序\n\n## 实现考虑\n`,
-  tasks: `# 任务（tasks）\n\n- [ ] 1. \n- [ ] 2. \n- [ ] 3. \n`,
+  tasks: `# 任务（tasks）\n\n## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务清单与执行记录入口。\n- AI IDE 应以此文件为唯一事实来源：逐条勾选任务、补充实现要点与验证结果，保持任务与代码同步。\n- 建议工作流：先完成 tasks.md → 再逐步实现代码 → 每完成一项就在此记录（类似 Kiro 的规范驱动开发）。\n\n## 任务清单\n\n- [ ] 1. \n- [ ] 2. \n- [ ] 3. \n`,
 };
 const DEFAULT_SPEC_STATUS = {
   requirementsConfirmed: false,
@@ -1160,7 +1160,8 @@ function buildTasksMarkdown(prompt, payload) {
           `编写与“${fallbackSummary}”相关的文案内容与排版样式。`,
           '加入响应式布局与阅读优化（字体/行高/间距）。',
         ];
-  return `# 任务（tasks）\n\n${list
+  const guide = `## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务清单与执行记录入口。\n- AI IDE 应以此文件为唯一事实来源：逐条勾选任务、补充实现要点与验证结果，保持任务与代码同步。\n- 建议工作流：先完成 tasks.md → 再逐步实现代码 → 每完成一项就在此记录（类似 Kiro 的规范驱动开发）。\n\n## 任务清单`;
+  return `# 任务（tasks）\n\n${guide}\n\n${list
     .map((item, index) => `- [ ] ${index + 1}. ${item}`)
     .join('\n')}\n`;
 }

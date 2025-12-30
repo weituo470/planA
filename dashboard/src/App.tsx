@@ -5,6 +5,21 @@ import { Button } from './components/ui/button';
 import type { ClarificationQuestion, LlmInfo, LlmPingResult, SpecArtifact, SpecSummary } from './types';
 
 const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
+const DOWNLOAD_PREFIX = 'planA-v0.1';
+
+function sanitizeFilePart(input: string) {
+  return String(input || '')
+    .trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_')
+    .replace(/\s+/g, ' ')
+    .slice(0, 80)
+    .trim();
+}
+
+function makeDownloadBaseName(specName: string) {
+  const safe = sanitizeFilePart(specName);
+  return safe ? `${DOWNLOAD_PREFIX}_${safe}` : DOWNLOAD_PREFIX;
+}
 
 function downloadBlob(filename: string, blob: Blob) {
   const url = URL.createObjectURL(blob);
@@ -458,7 +473,8 @@ export default function App() {
   const downloadCurrentMd = useCallback(() => {
     if (!selectedSpecName) return;
     const content = artifactContent[activeArtifact] ?? '';
-    downloadMarkdown(`${selectedSpecName}-${activeArtifact}.md`, content);
+    const base = makeDownloadBaseName(selectedSpecName);
+    downloadMarkdown(`${base}_${activeArtifact}.md`, content);
   }, [activeArtifact, artifactContent, selectedSpecName]);
 
   const downloadCurrentPng = useCallback(async () => {
@@ -469,7 +485,8 @@ export default function App() {
       const title = `${selectedSpecName} / ${artifactLabel(activeArtifact)}`;
       const content = artifactContent[activeArtifact] ?? '';
       const blob = await renderTextToPng(content, title);
-      downloadBlob(`${selectedSpecName}-${activeArtifact}.png`, blob);
+      const base = makeDownloadBaseName(selectedSpecName);
+      downloadBlob(`${base}_${activeArtifact}.png`, blob);
     } catch (e: any) {
       showToast(humanizeError(e));
     } finally {
@@ -483,6 +500,8 @@ export default function App() {
     setBusyLabel('生成中');
     try {
       const zip = new JSZip();
+      const base = makeDownloadBaseName(selectedSpecName);
+      const folder = zip.folder(base) ?? zip;
       const artifacts: SpecArtifact[] = ['requirements', 'design', 'tasks'];
       for (const a of artifacts) {
         const title = `${selectedSpecName} / ${artifactLabel(a)}`;
@@ -496,12 +515,12 @@ export default function App() {
         } catch {
           // Ignore refresh failures and use local snapshot.
         }
-        zip.file(`${selectedSpecName}-${a}.md`, content);
+        folder.file(`${a}.md`, content);
         const png = await renderTextToPng(content, title);
-        zip.file(`${selectedSpecName}-${a}.png`, png);
+        folder.file(`${a}.png`, png);
       }
       const blob = await zip.generateAsync({ type: 'blob' });
-      downloadBlob(`${selectedSpecName}-artifacts.zip`, blob);
+      downloadBlob(`${base}_all.zip`, blob);
     } catch (e: any) {
       showToast(humanizeError(e));
     } finally {
