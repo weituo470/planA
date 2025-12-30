@@ -185,7 +185,10 @@ export default function App() {
   const [clarifications, setClarifications] = useState<ClarificationQuestion[]>([]);
   const [llm, setLlm] = useState<LlmInfo | null>(null);
   const [modelPing, setModelPing] = useState<
-    Record<string, { status: 'pending' | 'ok' | 'error'; latencyMs?: number; error?: string }>
+    Record<
+      string,
+      { status: 'pending' | 'ok' | 'error' | 'unsupported'; latencyMs?: number; error?: string }
+    >
   >({});
   const [showLlmConfig, setShowLlmConfig] = useState(false);
   const [llmConfigUnlocked, setLlmConfigUnlocked] = useState(false);
@@ -241,6 +244,13 @@ export default function App() {
               }));
             }
           } catch (e: any) {
+            if (e?.status === 404) {
+              setModelPing((prev) => ({
+                ...prev,
+                [opt.id]: { status: 'unsupported' },
+              }));
+              return;
+            }
             setModelPing((prev) => ({
               ...prev,
               [opt.id]: { status: 'error', error: String(e?.message || e) },
@@ -507,17 +517,25 @@ export default function App() {
     [providerDrafts, refreshLlm],
   );
 
+  const normalizeModelLabel = useCallback((label: string, id: string) => {
+    const base = (label || id).trim();
+    return base.replace(/\s*\([^)]*\)\s*$/, '');
+  }, []);
+
   const modelOptionLabel = useCallback(
     (id: string, label: string) => {
-      const base = label || id;
+      const base = normalizeModelLabel(label, id);
       const ping = modelPing[id];
-      if (!ping) return base;
+      if (!ping || ping.status === 'unsupported') return base;
       if (ping.status === 'pending') return `${base} · ...`;
       if (ping.status === 'ok') return `${base} · ${Math.max(0, Math.round(ping.latencyMs ?? 0))}ms`;
       return `${base} · 错误`;
     },
-    [modelPing],
+    [modelPing, normalizeModelLabel],
   );
+
+  const activeModelId = llm?.model ?? '';
+  const activePing = activeModelId ? modelPing[activeModelId] : null;
 
   return (
     <div className="min-h-screen bg-surface text-slate-100">
@@ -576,7 +594,52 @@ export default function App() {
               >
                 {showLlmConfig ? '收起模型配置' : '展开模型配置'}
               </Button>
+              {activePing && activePing.status !== 'unsupported' && (
+                <span
+                  className={
+                    activePing.status === 'ok'
+                      ? 'text-xs text-green-400'
+                      : activePing.status === 'error'
+                        ? 'text-xs text-red-400'
+                        : 'text-xs text-slate-400'
+                  }
+                >
+                  {activePing.status === 'pending'
+                    ? '检测中…'
+                    : activePing.status === 'ok'
+                      ? `连接 ${Math.max(0, Math.round(activePing.latencyMs ?? 0))}ms`
+                      : '连接错误'}
+                </span>
+              )}
             </div>
+          </div>
+
+          <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs">
+            {(llm?.options ?? []).map((opt) => {
+              const ping = modelPing[opt.id];
+              if (!ping || ping.status === 'unsupported') return null;
+              const label = normalizeModelLabel(opt.label, opt.id);
+              const text =
+                ping.status === 'pending'
+                  ? '…'
+                  : ping.status === 'ok'
+                    ? `${Math.max(0, Math.round(ping.latencyMs ?? 0))}ms`
+                    : '错误';
+              const color =
+                ping.status === 'ok'
+                  ? 'text-green-400'
+                  : ping.status === 'error'
+                    ? 'text-red-400'
+                    : 'text-slate-400';
+              return (
+                <span key={opt.id} className="text-slate-400">
+                  {label}{' '}
+                  <span className={color}>
+                    {text}
+                  </span>
+                </span>
+              );
+            })}
           </div>
 
           {showLlmConfig && llm && (
