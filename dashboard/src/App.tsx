@@ -815,11 +815,15 @@ export default function App() {
                             const selected = q.answer?.selectedOptionIds ?? [];
                             const checked = selected.includes(opt.id);
                             return (
-                              <label key={opt.id} className="flex items-start gap-2 text-sm text-slate-200">
+                              <label
+                                key={opt.id}
+                                className="flex items-start gap-2 text-sm leading-5 text-slate-200"
+                              >
                                 <input
                                   type="checkbox"
                                   name={`q-${q.id}`}
                                   checked={checked}
+                                  className="mt-0.5 h-4 w-4 shrink-0"
                                   onChange={(e) => {
                                     const nextSelected =
                                       q.mode === 'single'
