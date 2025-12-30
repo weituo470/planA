@@ -210,6 +210,26 @@ export default function App() {
     design: '',
     tasks: '',
   });
+  const baselineContentRef = useRef<Record<SpecArtifact, string>>({
+    requirements: '',
+    design: '',
+    tasks: '',
+  });
+  const historyRef = useRef<
+    Record<SpecArtifact, { undo: string[]; redo: string[] }>
+  >({
+    requirements: { undo: [], redo: [] },
+    design: { undo: [], redo: [] },
+    tasks: { undo: [], redo: [] },
+  });
+  const isApplyingHistoryRef = useRef(false);
+  const [historyState, setHistoryState] = useState<
+    Record<SpecArtifact, { undo: number; redo: number }>
+  >({
+    requirements: { undo: 0, redo: 0 },
+    design: { undo: 0, redo: 0 },
+    tasks: { undo: 0, redo: 0 },
+  });
   const [clarifications, setClarifications] = useState<ClarificationQuestion[]>([]);
   const [llm, setLlm] = useState<LlmInfo | null>(null);
   const [modelPing, setModelPing] = useState<
@@ -306,10 +326,23 @@ export default function App() {
         const data = await apiJson<{ content: string }>(
           `/specs/${encodeURIComponent(specName)}/${artifact}`,
         );
-        setArtifactContent((prev) => ({ ...prev, [artifact]: data.content ?? '' }));
+        const next = data.content ?? '';
+        baselineContentRef.current[artifact] = next;
+        historyRef.current[artifact] = { undo: [], redo: [] };
+        setHistoryState((prev) => ({
+          ...prev,
+          [artifact]: { undo: 0, redo: 0 },
+        }));
+        setArtifactContent((prev) => ({ ...prev, [artifact]: next }));
       } catch (e: any) {
         const message = String(e?.message || e);
         if (e?.status === 404 && /Spec file not found/i.test(message)) {
+          baselineContentRef.current[artifact] = '';
+          historyRef.current[artifact] = { undo: [], redo: [] };
+          setHistoryState((prev) => ({
+            ...prev,
+            [artifact]: { undo: 0, redo: 0 },
+          }));
           setArtifactContent((prev) => ({ ...prev, [artifact]: '' }));
           return;
         }
@@ -502,6 +535,41 @@ export default function App() {
       const zip = new JSZip();
       const base = makeDownloadBaseName(selectedSpecName);
       const folder = zip.folder(base) ?? zip;
+      folder.file(
+        '使用说明.txt',
+        [
+          'planA 规范驱动开发 - 文档使用说明',
+          '',
+          '本压缩包包含 3 份核心文档（requirements/design/tasks），用于在 AI IDE 中执行类似 Kiro 的“规范驱动开发（Spec-Driven Development）”。',
+          '',
+          '1) requirements.md（需求）',
+          '- 用途：产品/业务需求的唯一事实来源（Source of Truth）。',
+          '- 建议：补全背景、用户故事、验收标准，并在“需求确认”中记录关键选择与补充信息。',
+          '',
+          '2) design.md（设计）',
+          '- 用途：面向实现的技术方案与架构说明，指导代码组织、关键流程、边界与风险。',
+          '- 建议：让 AI IDE 在编码前先阅读 design.md，确保实现方向一致。',
+          '',
+          '3) tasks.md（任务）',
+          '- 用途：可执行的任务清单与执行记录入口（强烈建议 AI IDE 以此文件驱动实现）。',
+          '- 工作方式：',
+          '  a) AI IDE 读取 tasks.md，逐条实现任务；',
+          '  b) 每完成一项就勾选（- [x]）并在任务下补充“实现说明/变更文件/验证结果”；',
+          '  c) 如发现遗漏，先更新 tasks.md 再写代码，保持任务与代码同步。',
+          '',
+          '推荐流程（类似 Kiro）：',
+          '1. 写原始需求 → 生成 requirements',
+          '2. 完成“需求确认” → 生成 design',
+          '3. 从 design 生成 tasks',
+          '4. 将 requirements/design/tasks 提供给你的 AI 编程工具/IDE，要求它：',
+          '   - 以 requirements/design 作为约束与上下文',
+          '   - 以 tasks.md 作为执行计划与完成记录',
+          '   - 只在 tasks.md 明确的范围内改代码，并持续回写 tasks.md',
+          '',
+          '提示：当你要加功能或改需求时，先更新 requirements/design/tasks，再让 AI IDE 继续执行。',
+          '',
+        ].join('\n'),
+      );
       const artifacts: SpecArtifact[] = ['requirements', 'design', 'tasks'];
       for (const a of artifacts) {
         const title = `${selectedSpecName} / ${artifactLabel(a)}`;
@@ -527,6 +595,73 @@ export default function App() {
       setBusyLabel(null);
     }
   }, [artifactContent, selectedSpecName]);
+
+  const updateHistoryState = useCallback((artifact: SpecArtifact) => {
+    const h = historyRef.current[artifact];
+    setHistoryState((prev) => ({
+      ...prev,
+      [artifact]: { undo: h.undo.length, redo: h.redo.length },
+    }));
+  }, []);
+
+  const undoEdit = useCallback(() => {
+    const artifact = activeArtifact;
+    const h = historyRef.current[artifact];
+    if (!h.undo.length) return;
+    const current = artifactContent[artifact] ?? '';
+    const prevValue = h.undo.pop() ?? '';
+    h.redo.push(current);
+    isApplyingHistoryRef.current = true;
+    setArtifactContent((prev) => ({ ...prev, [artifact]: prevValue }));
+    updateHistoryState(artifact);
+    if (selectedSpecName) {
+      if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = window.setTimeout(() => void saveArtifact(artifact), 250);
+    }
+    queueMicrotask(() => {
+      isApplyingHistoryRef.current = false;
+    });
+  }, [activeArtifact, artifactContent, saveArtifact, selectedSpecName, updateHistoryState]);
+
+  const redoEdit = useCallback(() => {
+    const artifact = activeArtifact;
+    const h = historyRef.current[artifact];
+    if (!h.redo.length) return;
+    const current = artifactContent[artifact] ?? '';
+    const nextValue = h.redo.pop() ?? '';
+    h.undo.push(current);
+    isApplyingHistoryRef.current = true;
+    setArtifactContent((prev) => ({ ...prev, [artifact]: nextValue }));
+    updateHistoryState(artifact);
+    if (selectedSpecName) {
+      if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = window.setTimeout(() => void saveArtifact(artifact), 250);
+    }
+    queueMicrotask(() => {
+      isApplyingHistoryRef.current = false;
+    });
+  }, [activeArtifact, artifactContent, saveArtifact, selectedSpecName, updateHistoryState]);
+
+  const resetToBaseline = useCallback(() => {
+    const artifact = activeArtifact;
+    const baseline = baselineContentRef.current[artifact] ?? '';
+    const current = artifactContent[artifact] ?? '';
+    if (current === baseline) return;
+    const h = historyRef.current[artifact];
+    h.undo.push(current);
+    if (h.undo.length > 80) h.undo.shift();
+    h.redo = [];
+    isApplyingHistoryRef.current = true;
+    setArtifactContent((prev) => ({ ...prev, [artifact]: baseline }));
+    updateHistoryState(artifact);
+    if (selectedSpecName) {
+      if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = window.setTimeout(() => void saveArtifact(artifact), 250);
+    }
+    queueMicrotask(() => {
+      isApplyingHistoryRef.current = false;
+    });
+  }, [activeArtifact, artifactContent, saveArtifact, selectedSpecName, updateHistoryState]);
 
   const setModel = useCallback(async (model: string) => {
     setToast(null);
@@ -932,12 +1067,60 @@ export default function App() {
               </div>
             </div>
 
+            <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+              <div>可按需编辑内容</div>
+              <div className="ml-auto flex flex-wrap items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={undoEdit}
+                  disabled={!selectedSpecName || historyState[activeArtifact].undo === 0}
+                >
+                  撤销
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={redoEdit}
+                  disabled={!selectedSpecName || historyState[activeArtifact].redo === 0}
+                >
+                  还原
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={resetToBaseline}
+                  disabled={!selectedSpecName}
+                >
+                  回到初始
+                </Button>
+              </div>
+            </div>
+
             <textarea
               className="h-[520px] w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent"
               value={artifactContent[activeArtifact] ?? ''}
               onChange={(e) =>
                 setArtifactContent((prev) => {
-                  const next = { ...prev, [activeArtifact]: e.target.value };
+                  const nextValue = e.target.value;
+                  const currentValue = prev[activeArtifact] ?? '';
+                  const next = { ...prev, [activeArtifact]: nextValue };
+
+                  if (
+                    selectedSpecName &&
+                    !isApplyingHistoryRef.current &&
+                    nextValue !== currentValue
+                  ) {
+                    const h = historyRef.current[activeArtifact];
+                    h.undo.push(currentValue);
+                    if (h.undo.length > 80) h.undo.shift();
+                    h.redo = [];
+                    setHistoryState((prevState) => ({
+                      ...prevState,
+                      [activeArtifact]: { undo: h.undo.length, redo: 0 },
+                    }));
+                  }
+
                   if (selectedSpecName) {
                     if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
                     saveTimerRef.current = window.setTimeout(() => {
