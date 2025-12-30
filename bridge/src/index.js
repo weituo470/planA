@@ -12,6 +12,7 @@ const pty = require('node-pty');
 const PORT = process.env.WORKFLOW_BRIDGE_PORT || 4100;
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const EVENT_LOG = path.join(DATA_DIR, 'events.jsonl');
+const LLM_CONFIG_FILE = path.join(DATA_DIR, 'llm-config.json');
 const ROOT_DIR = path.resolve(__dirname, '..', '..', '..');
 const WATCH_DIRS =
   process.env.WORKFLOW_WATCH_DIRS || '.codex,task,workflow';
@@ -45,7 +46,7 @@ const fileSnapshots = new Map();
 let isPaused = false;
 const SPEC_ARTIFACTS = ['requirements', 'design', 'tasks'];
 const SPEC_TEMPLATES = {
-  requirements: `# 需求（requirements）\n\n## 背景\n\n## 用户故事\n\n## 验收标准（EARS）\n- WHEN [条件/事件]\n  THE SYSTEM SHALL [期望行为]\n`,
+  requirements: `# 需求（requirements）\n\n## 背景\n\n## 用户故事\n\n## 验收标准（EARS）\n- 当[条件/事件]时，系统应[期望行为]。\n`,
   design: `# 设计（design）\n\n## 架构概览\n\n## 关键流程/时序\n\n## 实现考虑\n`,
   tasks: `# 任务（tasks）\n\n- [ ] 1. \n- [ ] 2. \n- [ ] 3. \n`,
 };
@@ -54,6 +55,36 @@ const DEFAULT_SPEC_STATUS = {
   designConfirmed: false,
   tasksConfirmed: false,
   prompt: '',
+  requirementsReview: {
+    notes: '',
+    points: [],
+    updatedAt: null,
+    confirmedAt: null,
+  },
+  requirementsClarifications: {
+    questions: [],
+    updatedAt: null,
+    confirmedAt: null,
+  },
+};
+
+const LLM_PROVIDERS = [
+  { id: 'openai', label: 'OpenAI / OpenAI-Compatible' },
+  { id: 'google', label: 'Google / Gemini (OpenAI-Compatible Gateway)' },
+  { id: 'anthropic', label: 'Anthropic / Claude (OpenAI-Compatible Gateway)' },
+];
+
+const LLM_MODEL_OPTIONS = [
+  { id: 'gpt-5.2-codex', providerId: 'openai', label: 'ChatGPT-5.2-Codex (OpenAI/Codex)' },
+  // NOTE: Some gateways expose Gemini/Claude under provider-specific ids.
+  { id: 'gemini-3-pro-preview[x6]', providerId: 'google', label: 'Gemini 3 Pro' },
+  { id: 'claude-opus-4-5-20251101', providerId: 'anthropic', label: 'Claude 4.5 Opus' },
+];
+
+const LLM_MODEL_ALIASES = {
+  // Backward-compatible aliases (previous UI labels).
+  'gemini-3-pro': 'gemini-3-pro-preview[x6]',
+  'claude-4.5-opus': 'claude-opus-4-5-20251101',
 };
 
 function loadLocalEnv() {
@@ -80,59 +111,180 @@ function loadLocalEnv() {
 
 loadLocalEnv();
 
-function getLlmConfig() {
-  const baseUrl = (process.env.LLM_BASE_URL || '').trim();
-  const apiKey = (process.env.LLM_API_KEY || '').trim();
+function loadPersistedLlmConfig() {
+  if (!fs.existsSync(LLM_CONFIG_FILE)) return;
+  try {
+    const raw = fs.readFileSync(LLM_CONFIG_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    let model = typeof parsed?.model === 'string' ? parsed.model.trim() : '';
+    if (model && LLM_MODEL_ALIASES[model]) {
+      model = LLM_MODEL_ALIASES[model];
+    }
+    if (model) process.env.LLM_MODEL = model;
+
+    const providers = parsed?.providers && typeof parsed.providers === 'object' ? parsed.providers : null;
+    if (providers) {
+      process.env.LLM_PROVIDER_OPENAI_BASE_URL =
+        typeof providers?.openai?.baseUrl === 'string' ? providers.openai.baseUrl : '';
+      process.env.LLM_PROVIDER_OPENAI_API_KEY =
+        typeof providers?.openai?.apiKey === 'string' ? providers.openai.apiKey : '';
+
+      process.env.LLM_PROVIDER_GOOGLE_BASE_URL =
+        typeof providers?.google?.baseUrl === 'string' ? providers.google.baseUrl : '';
+      process.env.LLM_PROVIDER_GOOGLE_API_KEY =
+        typeof providers?.google?.apiKey === 'string' ? providers.google.apiKey : '';
+
+      process.env.LLM_PROVIDER_ANTHROPIC_BASE_URL =
+        typeof providers?.anthropic?.baseUrl === 'string' ? providers.anthropic.baseUrl : '';
+      process.env.LLM_PROVIDER_ANTHROPIC_API_KEY =
+        typeof providers?.anthropic?.apiKey === 'string' ? providers.anthropic.apiKey : '';
+    }
+  } catch (error) {
+    // Ignore malformed local config.
+  }
+}
+
+function persistLlmConfig(patch) {
+  const existing = {};
+  if (fs.existsSync(LLM_CONFIG_FILE)) {
+    try {
+      Object.assign(existing, JSON.parse(fs.readFileSync(LLM_CONFIG_FILE, 'utf8')));
+    } catch {
+      // ignore
+    }
+  }
+  const next = { ...existing, ...patch, updatedAt: new Date().toISOString() };
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(LLM_CONFIG_FILE, JSON.stringify(next, null, 2), 'utf8');
+}
+
+function isSupportedModel(model) {
+  return LLM_MODEL_OPTIONS.some((opt) => opt.id === model);
+}
+
+function getProviderForModel(model) {
+  return LLM_MODEL_OPTIONS.find((opt) => opt.id === model)?.providerId || null;
+}
+
+function setLlmModel(model) {
+  let normalized = typeof model === 'string' ? model.trim() : '';
+  if (!normalized) {
+    throw new Error('Model is required');
+  }
+  if (LLM_MODEL_ALIASES[normalized]) {
+    normalized = LLM_MODEL_ALIASES[normalized];
+  }
+  if (!isSupportedModel(normalized)) {
+    throw new Error(`Unsupported model: ${normalized}`);
+  }
+  process.env.LLM_MODEL = normalized;
+  persistLlmConfig({ model: normalized });
+  return normalized;
+}
+
+loadPersistedLlmConfig();
+
+function getProviderEnv(providerId, kind) {
+  const key = `LLM_PROVIDER_${String(providerId || '').toUpperCase()}_${String(kind || '').toUpperCase()}`;
+  return (process.env[key] || '').trim();
+}
+
+function getActiveLlmConfig() {
   const model = (process.env.LLM_MODEL || '').trim();
-  const responseFormat = (process.env.LLM_RESPONSE_FORMAT || 'text').trim();
-  return { baseUrl, apiKey, model, responseFormat };
+  const responseFormat = (process.env.LLM_RESPONSE_FORMAT || 'none').trim();
+  const providerId = getProviderForModel(model);
+
+  const providerBaseUrl = providerId ? getProviderEnv(providerId, 'base_url') : '';
+  const providerApiKey = providerId ? getProviderEnv(providerId, 'api_key') : '';
+
+  // Backward compat: allow single env var config as fallback for active provider.
+  const fallbackBaseUrl = (process.env.LLM_BASE_URL || '').trim();
+  const fallbackApiKey = (process.env.LLM_API_KEY || '').trim();
+
+  const baseUrl = providerBaseUrl || fallbackBaseUrl;
+  const apiKey = providerApiKey || fallbackApiKey;
+
+  return { baseUrl, apiKey, model, providerId, responseFormat };
 }
 
 function hasLlmConfig() {
-  const { baseUrl, apiKey, model } = getLlmConfig();
+  const { baseUrl, apiKey, model } = getActiveLlmConfig();
   return Boolean(baseUrl && apiKey && model);
 }
 
 async function callLlm(messages) {
-  const { baseUrl, apiKey, model, responseFormat } = getLlmConfig();
-  const url = `${baseUrl.replace(/\/$/, '')}/chat/completions`;
-  const controller = new AbortController();
-  const timeoutMs = Number(process.env.LLM_TIMEOUT_MS || 15000);
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const body = {
-    model,
-    temperature: 0.3,
-    messages,
+  const { baseUrl, apiKey, model, responseFormat } = getActiveLlmConfig();
+
+  const tryOnce = async (rootUrl) => {
+    const url = `${String(rootUrl || '').replace(/\/$/, '')}/chat/completions`;
+    const controller = new AbortController();
+    const timeoutMs = Number(process.env.LLM_TIMEOUT_MS || 60000);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const body = {
+      model,
+      temperature: 0.3,
+      messages,
+    };
+    if (responseFormat && responseFormat !== 'none' && responseFormat !== 'text') {
+      body.response_format = { type: responseFormat };
+    }
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        const message = text ? `${response.status}: ${text}` : `${response.status}`;
+        throw new Error(`LLM request failed: ${message}`);
+      }
+      const data = await response.json();
+      const content = data?.choices?.[0]?.message?.content;
+      if (!content || typeof content !== 'string') {
+        throw new Error('LLM response empty');
+      }
+      return content.trim();
+    } catch (error) {
+      if (error?.name === 'AbortError') {
+        throw new Error(`LLM request timeout after ${timeoutMs}ms`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
   };
-  if (responseFormat && responseFormat !== 'none') {
-    body.response_format = { type: responseFormat };
-  }
+
+  const withV1Fallback = async () => {
+    // Some gateways require /v1 prefix; retry once if the first attempt fails.
+    const trimmed = String(baseUrl || '').replace(/\/$/, '');
+    const v1Url = trimmed.endsWith('/v1') ? trimmed : `${trimmed}/v1`;
+
+    try {
+      return await tryOnce(trimmed);
+    } catch (error) {
+      if (trimmed === v1Url) {
+        throw error;
+      }
+      try {
+        return await tryOnce(v1Url);
+      } catch (error2) {
+        // Preserve the original error for easier debugging when both fail.
+        throw error;
+      }
+    }
+  };
+
   try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      const message = text ? `${response.status}: ${text}` : `${response.status}`;
-      throw new Error(`LLM request failed: ${message}`);
-    }
-    const data = await response.json();
-    const content = data?.choices?.[0]?.message?.content;
-    if (!content || typeof content !== 'string') {
-      throw new Error('LLM response empty');
-    }
-    return content.trim();
+    return await withV1Fallback();
   } catch (error) {
     console.error('LLM call failed:', error?.message || error);
     throw error;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -223,6 +375,560 @@ function normalizePrompt(prompt) {
   return prompt.trim();
 }
 
+function sanitizeReviewText(value, maxLen = 4000) {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  const cleaned = trimmed.replace(/\u0000/g, '');
+  if (cleaned.length <= maxLen) return cleaned;
+  return cleaned.slice(0, maxLen);
+}
+
+function sanitizeOptionLabel(value) {
+  return sanitizeReviewText(value, 120);
+}
+
+function normalizeClarificationOption(input) {
+  const label = sanitizeOptionLabel(input?.label);
+  if (!label) return null;
+  const id =
+    typeof input?.id === 'string' && input.id.trim() ? input.id.trim() : nanoid();
+  return { id, label };
+}
+
+function normalizeClarificationAnswer(input, mode) {
+  const selectedOptionIds = Array.isArray(input?.selectedOptionIds)
+    ? input.selectedOptionIds.filter((value) => typeof value === 'string' && value.trim()).map((v) => v.trim())
+    : [];
+  const otherText = sanitizeReviewText(input?.otherText, 2000);
+  const unique = Array.from(new Set(selectedOptionIds));
+  const normalizedSelected = mode === 'single' ? unique.slice(0, 1) : unique;
+  return { selectedOptionIds: normalizedSelected, otherText };
+}
+
+function normalizeClarificationQuestion(input) {
+  const question = sanitizeReviewText(input?.question, 300);
+  if (!question) return null;
+  const rawMode = typeof input?.mode === 'string' ? input.mode.trim().toLowerCase() : '';
+  const mode =
+    rawMode === 'multi' ||
+    rawMode === 'multiple' ||
+    rawMode === 'multiselect' ||
+    rawMode === 'multi-select'
+      ? 'multi'
+      : rawMode === 'single' || rawMode === 'singleselect' || rawMode === 'single-select'
+        ? 'single'
+        : 'single';
+  const required = typeof input?.required === 'boolean' ? input.required : true;
+  const allowOther = typeof input?.allowOther === 'boolean' ? input.allowOther : true;
+  const options = Array.isArray(input?.options)
+    ? input.options.map(normalizeClarificationOption).filter(Boolean)
+    : [];
+  const id =
+    typeof input?.id === 'string' && input.id.trim() ? input.id.trim() : nanoid();
+  const createdAt =
+    typeof input?.createdAt === 'string' && input.createdAt.trim()
+      ? input.createdAt.trim()
+      : new Date().toISOString();
+  const answer = normalizeClarificationAnswer(input?.answer, mode);
+  return { id, question, mode, required, allowOther, options, answer, createdAt };
+}
+
+function normalizeRequirementsClarifications(input) {
+  const rawQuestions = Array.isArray(input?.questions) ? input.questions : [];
+  const questions = rawQuestions.map(normalizeClarificationQuestion).filter(Boolean);
+  const updatedAt =
+    typeof input?.updatedAt === 'string' && input.updatedAt.trim()
+      ? input.updatedAt.trim()
+      : null;
+  const confirmedAt =
+    typeof input?.confirmedAt === 'string' && input.confirmedAt.trim()
+      ? input.confirmedAt.trim()
+      : null;
+  return { questions, updatedAt, confirmedAt };
+}
+
+function normalizeReviewPoint(input) {
+  if (!input || typeof input !== 'object') return null;
+  const text = sanitizeReviewText(input.text, 1000);
+  const note = sanitizeReviewText(input.note, 2000);
+  if (!text) return null;
+
+  const start = Number.isFinite(Number(input.start)) ? Number(input.start) : null;
+  const end = Number.isFinite(Number(input.end)) ? Number(input.end) : null;
+  const normalizedStart = start !== null && start >= 0 ? start : null;
+  const normalizedEnd =
+    end !== null && end >= 0 && normalizedStart !== null && end >= normalizedStart
+      ? end
+      : null;
+
+  const checked = typeof input.checked === 'boolean' ? input.checked : false;
+  const kind =
+    typeof input.kind === 'string' && input.kind.trim() ? input.kind.trim() : null;
+
+  const createdAt =
+    typeof input.createdAt === 'string' && input.createdAt.trim()
+      ? input.createdAt.trim()
+      : new Date().toISOString();
+
+  const id =
+    typeof input.id === 'string' && input.id.trim() ? input.id.trim() : nanoid();
+
+  return {
+    id,
+    start: normalizedStart,
+    end: normalizedEnd,
+    text,
+    note,
+    checked,
+    kind,
+    createdAt,
+  };
+}
+
+function normalizeRequirementsReview(input) {
+  const notes = sanitizeReviewText(input?.notes, 6000);
+  const rawPoints = Array.isArray(input?.points) ? input.points : [];
+  const points = rawPoints.map(normalizeReviewPoint).filter(Boolean);
+  const updatedAt =
+    typeof input?.updatedAt === 'string' && input.updatedAt.trim()
+      ? input.updatedAt.trim()
+      : null;
+  const confirmedAt =
+    typeof input?.confirmedAt === 'string' && input.confirmedAt.trim()
+      ? input.confirmedAt.trim()
+      : null;
+
+  return {
+    notes,
+    points,
+    updatedAt,
+    confirmedAt,
+  };
+}
+
+function mergeRequirementsReview(previous, next) {
+  const prev = normalizeRequirementsReview(previous || {});
+  const incoming = normalizeRequirementsReview(next || {});
+
+  const notes = incoming.notes || prev.notes;
+  const points = incoming.points.length ? incoming.points : prev.points;
+  const updatedAt = incoming.updatedAt || prev.updatedAt;
+  const confirmedAt = incoming.confirmedAt || prev.confirmedAt;
+
+  return { notes, points, updatedAt, confirmedAt };
+}
+
+function mergeRequirementsClarifications(previous, next) {
+  const prev = normalizeRequirementsClarifications(previous || {});
+  const incoming = normalizeRequirementsClarifications(next || {});
+
+  const byId = new Map();
+  for (const q of prev.questions) byId.set(q.id, q);
+  for (const q of incoming.questions) {
+    const existing = byId.get(q.id);
+    if (!existing) {
+      byId.set(q.id, q);
+      continue;
+    }
+    const answer = normalizeClarificationAnswer(q.answer, q.mode);
+    byId.set(q.id, { ...existing, ...q, answer });
+  }
+
+  const questions = Array.from(byId.values());
+  const updatedAt = incoming.updatedAt || prev.updatedAt;
+  const confirmedAt = incoming.confirmedAt || prev.confirmedAt;
+  const generatedBy =
+    (next && typeof next.generatedBy === 'string' && next.generatedBy) ||
+    (previous && typeof previous.generatedBy === 'string' && previous.generatedBy) ||
+    null;
+  const generationError =
+    (next && typeof next.generationError === 'string' && next.generationError) ||
+    (previous && typeof previous.generationError === 'string' && previous.generationError) ||
+    null;
+  return { questions, updatedAt, confirmedAt, generatedBy, generationError };
+}
+
+function isQuestionAnswered(question) {
+  if (!question) return false;
+  if (!question.required) return true;
+  const selected = Array.isArray(question.answer?.selectedOptionIds)
+    ? question.answer.selectedOptionIds
+    : [];
+  const other = sanitizeReviewText(question.answer?.otherText, 2000);
+  return selected.length > 0 || Boolean(other);
+}
+
+function areClarificationsComplete(clarifications) {
+  const normalized = normalizeRequirementsClarifications(clarifications || {});
+  if (!normalized.questions.length) return false;
+  return normalized.questions.every(isQuestionAnswered);
+}
+
+function buildClarificationsSummary(clarifications) {
+  const normalized = normalizeRequirementsClarifications(clarifications || {});
+  if (!normalized.questions.length) return '';
+  const lines = normalized.questions.map((q) => {
+    const selected = Array.isArray(q.answer?.selectedOptionIds)
+      ? q.answer.selectedOptionIds
+      : [];
+    const selectedLabels = q.options
+      .filter((opt) => selected.includes(opt.id))
+      .map((opt) => opt.label);
+    const other = sanitizeReviewText(q.answer?.otherText, 2000);
+    const parts = [];
+    if (selectedLabels.length) parts.push(`选择：${selectedLabels.join('、')}`);
+    if (other) parts.push(`其他：${other}`);
+    return `- ${q.question}${parts.length ? `（${parts.join('；')}）` : ''}`;
+  });
+  return `需求澄清结论：\n${lines.join('\n')}`.trim();
+}
+
+function buildReviewSummary(review) {
+  const normalized = normalizeRequirementsReview(review || {});
+  const notes = sanitizeReviewText(normalized.notes, 6000);
+  const pointNotes = normalized.points
+    .filter((p) => sanitizeReviewText(p.note, 2000))
+    .slice(0, 20)
+    .map((p) => `- ${p.text}${p.note ? `：${p.note}` : ''}`)
+    .join('\n');
+  const blocks = [];
+  if (notes) blocks.push(`补充说明：\n${notes}`);
+  if (pointNotes) blocks.push(`确认点补充：\n${pointNotes}`);
+  return blocks.join('\n\n').trim();
+}
+
+function normalizeLineEndings(content) {
+  if (typeof content !== 'string') return '';
+  return content.replace(/\r\n?/g, '\n');
+}
+
+function extractBulletsFromSection(markdown, headingRegex) {
+  const normalized = normalizeLineEndings(markdown);
+  const lines = normalized.split('\n');
+  const headerIndex = lines.findIndex((line) => headingRegex.test(line));
+  if (headerIndex === -1) return [];
+  const items = [];
+  for (let i = headerIndex + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^##\s+/.test(line)) break;
+    const match = line.match(/^\s*[-*]\s+(.*)$/);
+    if (match) {
+      const text = sanitizeReviewText(match[1], 1000);
+      if (text) items.push(text);
+    }
+  }
+  return items;
+}
+
+function extractRequirementsReviewPoints(markdown) {
+  const now = new Date().toISOString();
+  const storyItems = extractBulletsFromSection(markdown, /^##\s*用户故事\s*$/);
+  const acceptanceItems = extractBulletsFromSection(markdown, /^##\s*验收标准/);
+
+  const points = [];
+  const seen = new Set();
+  for (const text of storyItems) {
+    if (seen.has(text)) continue;
+    seen.add(text);
+    points.push({
+      id: nanoid(),
+      start: null,
+      end: null,
+      text,
+      note: '',
+      checked: false,
+      kind: 'story',
+      createdAt: now,
+    });
+  }
+  for (const text of acceptanceItems) {
+    if (seen.has(text)) continue;
+    seen.add(text);
+    points.push({
+      id: nanoid(),
+      start: null,
+      end: null,
+      text,
+      note: '',
+      checked: false,
+      kind: 'acceptance',
+      createdAt: now,
+    });
+  }
+  return points;
+}
+
+function ensureRequirementsReviewSeeded(specName, status, requirementsMarkdown) {
+  const normalized = { ...DEFAULT_SPEC_STATUS, ...status };
+  const currentReview = normalizeRequirementsReview(normalized.requirementsReview || {});
+  if (normalized.requirementsConfirmed) return { changed: false, status: normalized };
+  if (currentReview.points.length > 0) return { changed: false, status: normalized };
+
+  const points = extractRequirementsReviewPoints(requirementsMarkdown || '');
+  if (points.length === 0) return { changed: false, status: normalized };
+
+  const next = {
+    ...normalized,
+    requirementsReview: {
+      ...currentReview,
+      points,
+      updatedAt: new Date().toISOString(),
+    },
+  };
+  writeSpecStatus(specName, next);
+  return { changed: true, status: next };
+}
+
+function buildDefaultClarificationQuestions(prompt) {
+  const now = new Date().toISOString();
+  const normalizedPrompt = normalizePrompt(prompt);
+
+  const isBlog = /博客|blog/i.test(normalizedPrompt);
+  const isEcommerce = /电商|商城|购物车|下单|订单|支付|退款|物流/i.test(normalizedPrompt);
+  const isWorkflow = /审批|请假|工单|流程|报销|OA|办公/i.test(normalizedPrompt);
+
+  const deliveryQuestion = {
+    id: 'delivery',
+    question: '你希望交付的最终形态是什么？',
+    mode: 'single',
+    required: true,
+    allowOther: true,
+    options: [
+      { id: 'web', label: 'Web 网站/后台' },
+      { id: 'h5', label: '移动端 H5' },
+      { id: 'miniapp', label: '小程序' },
+      { id: 'api', label: '仅接口/后端服务' },
+      { id: 'prototype', label: '原型/方案优先' },
+    ],
+    answer: { selectedOptionIds: [], otherText: '' },
+    createdAt: now,
+  };
+
+  const usersQuestion = {
+    id: 'users',
+    question: '主要用户角色有哪些？（可多选）',
+    mode: 'multi',
+    required: true,
+    allowOther: true,
+    options: [
+      { id: 'visitor', label: '访客/未登录用户' },
+      { id: 'user', label: '普通用户/员工' },
+      { id: 'admin', label: '管理员/运营' },
+      { id: 'manager', label: '主管/审批人' },
+    ],
+    answer: { selectedOptionIds: [], otherText: '' },
+    createdAt: now,
+  };
+
+  const nonFunctionalQuestion = {
+    id: 'nonfunctional',
+    question: '更关注哪些非功能要求？（可多选）',
+    mode: 'multi',
+    required: true,
+    allowOther: true,
+    options: [
+      { id: 'seo', label: 'SEO/可被搜索引擎收录' },
+      { id: 'perf', label: '性能/首屏加载速度' },
+      { id: 'a11y', label: '可访问性/可读性' },
+      { id: 'audit', label: '审计/操作日志' },
+      { id: 'mobile', label: '移动端体验' },
+    ],
+    answer: { selectedOptionIds: [], otherText: '' },
+    createdAt: now,
+  };
+
+  const questions = [deliveryQuestion];
+
+  if (isBlog) {
+    questions.push(
+      {
+        id: 'theme',
+        question: '你期望的页面风格是哪一种？',
+        mode: 'single',
+        required: true,
+        allowOther: true,
+        options: [
+          { id: 'minimal', label: 'A 极简' },
+          { id: 'tech', label: 'B 科技' },
+          { id: 'warm', label: 'C 温馨' },
+        ],
+        answer: { selectedOptionIds: [], otherText: '' },
+        createdAt: now,
+      },
+      {
+        id: 'blog-features',
+        question: '需要包含哪些内容/阅读功能？（可多选）',
+        mode: 'multi',
+        required: true,
+        allowOther: true,
+        options: [
+          { id: 'list', label: '文章列表' },
+          { id: 'detail', label: '文章详情' },
+          { id: 'tags', label: '分类/标签' },
+          { id: 'search', label: '搜索' },
+          { id: 'toc', label: '目录/阅读进度' },
+          { id: 'comment', label: '评论（可选）' },
+        ],
+        answer: { selectedOptionIds: [], otherText: '' },
+        createdAt: now,
+      },
+      {
+        id: 'publish',
+        question: '内容来源/发布方式是什么？',
+        mode: 'single',
+        required: true,
+        allowOther: true,
+        options: [
+          { id: 'md', label: 'Markdown 文件' },
+          { id: 'cms', label: '后台管理发布（CMS）' },
+          { id: 'static', label: '纯静态页面（先写死内容）' },
+        ],
+        answer: { selectedOptionIds: [], otherText: '' },
+        createdAt: now,
+      },
+    );
+  } else if (isEcommerce) {
+    questions.push({
+      id: 'ecom-modules',
+      question: '需要包含哪些电商模块？（可多选）',
+      mode: 'multi',
+      required: true,
+      allowOther: true,
+      options: [
+        { id: 'catalog', label: '商品/分类' },
+        { id: 'cart', label: '购物车' },
+        { id: 'checkout', label: '下单/结算' },
+        { id: 'payment', label: '支付/退款' },
+        { id: 'shipping', label: '物流/配送' },
+        { id: 'promo', label: '优惠券/活动' },
+        { id: 'admin', label: '运营后台/订单管理' },
+      ],
+      answer: { selectedOptionIds: [], otherText: '' },
+      createdAt: now,
+    });
+  } else if (isWorkflow) {
+    questions.push(
+      {
+        id: 'workflow-type',
+        question: '这类流程主要是哪一种？',
+        mode: 'single',
+        required: true,
+        allowOther: true,
+        options: [
+          { id: 'leave', label: '请假' },
+          { id: 'expense', label: '报销' },
+          { id: 'ticket', label: '工单/问题处理' },
+          { id: 'approval', label: '通用审批（可配置）' },
+        ],
+        answer: { selectedOptionIds: [], otherText: '' },
+        createdAt: now,
+      },
+      {
+        id: 'workflow-rules',
+        question: '审批规则偏向哪种？',
+        mode: 'single',
+        required: true,
+        allowOther: true,
+        options: [
+          { id: 'fixed', label: '固定流程（写死节点）' },
+          { id: 'byDept', label: '按部门/层级自动路由' },
+          { id: 'config', label: '可配置流程（后台配置）' },
+        ],
+        answer: { selectedOptionIds: [], otherText: '' },
+        createdAt: now,
+      },
+    );
+  } else {
+    questions.push({
+      id: 'core',
+      question: '你最想先做成的 3 个核心功能是什么？（可多选）',
+      mode: 'multi',
+      required: true,
+      allowOther: true,
+      options: [
+        { id: 'auth', label: '登录/注册/权限' },
+        { id: 'crud', label: '创建/编辑/删除内容' },
+        { id: 'list', label: '列表/详情页' },
+        { id: 'search', label: '搜索/筛选' },
+        { id: 'notify', label: '通知（站内信/邮件）' },
+        { id: 'admin', label: '管理后台' },
+      ],
+      answer: { selectedOptionIds: [], otherText: '' },
+      createdAt: now,
+    });
+  }
+
+  questions.push(usersQuestion, nonFunctionalQuestion);
+  return questions.map(normalizeClarificationQuestion).filter(Boolean);
+}
+
+async function generateClarificationsWithModel(prompt) {
+  if (!hasLlmConfig()) throw new Error('LLM config missing');
+
+  const isBadQuestionText = (text) => {
+    if (!text || typeof text !== 'string') return true;
+    const trimmed = text.trim();
+    if (!trimmed) return true;
+    if (/\?{3,}/.test(trimmed) || /？{3,}/.test(trimmed)) return true;
+    if (/(请提供|需要补充|原始需求.*完整|无法|不能|不明确|不清楚|缺失)/.test(trimmed)) {
+      return true;
+    }
+    return false;
+  };
+
+  const isValidClarifications = (normalized) => {
+    if (!normalized || !Array.isArray(normalized.questions)) return false;
+    if (normalized.questions.length < 3 || normalized.questions.length > 10) return false;
+    return normalized.questions.every((q) => {
+      if (isBadQuestionText(q.question)) return false;
+      if (!Array.isArray(q.options) || q.options.length < 2) return false;
+      return q.options.every((opt) => typeof opt.label === 'string' && opt.label.trim());
+    });
+  };
+
+  try {
+    const content = await callLlm([
+      {
+        role: 'system',
+        content:
+          '你是需求澄清助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
+      },
+      {
+        role: 'user',
+        content:
+          `原始需求：${prompt}\n\n` +
+          '请生成 5-8 个“需求确认问题”，用于对齐开发口径：\n' +
+          '- 必须结合原始需求的领域/关键词（至少 2 题需要直接引用关键词）\n' +
+          '- 每题都要给出 3-6 个可点击选项，并允许“其他（用户输入）”\n' +
+          '- 避免泛泛而谈（例如“还有什么需求？”、“预算多少？”）\n\n' +
+          '仅输出 JSON，结构如下（示例字段，不要输出示例说明文字）：\n' +
+          '{\"questions\":[{\"id\":\"q1\",\"question\":\"...\",\"mode\":\"single\",\"required\":true,\"allowOther\":true,\"options\":[{\"id\":\"a\",\"label\":\"...\"}]}]}',
+      },
+    ]);
+    const payload = tryParseJson(content);
+    if (!payload) throw new Error(`LLM output not JSON: ${String(content).slice(0, 200)}`);
+    const normalized = normalizeRequirementsClarifications(payload);
+    if (!isValidClarifications(normalized)) {
+      throw new Error(`LLM questions invalid: ${String(content).slice(0, 200)}`);
+    }
+    return { questions: normalized.questions, generatedBy: 'llm', generationError: null };
+  } catch (error) {
+    console.error('Clarifications generation failed:', error?.message || error);
+    throw error;
+  }
+}
+
+function ensureRequirementsClarificationsSeeded(specName, status, prompt) {
+  const normalized = { ...DEFAULT_SPEC_STATUS, ...status };
+  const current = normalizeRequirementsClarifications(
+    normalized.requirementsClarifications || {},
+  );
+  if (normalized.requirementsConfirmed) return { changed: false, status: normalized };
+  if (current.questions.length > 0) return { changed: false, status: normalized };
+  return { changed: false, status: normalized };
+}
+
 function slugifyPrompt(prompt) {
   const trimmed = normalizePrompt(prompt).toLowerCase();
   const slug = trimmed
@@ -272,6 +978,17 @@ function generateTasksContent(design, prompt) {
 function tryParseJson(text) {
   if (!text || typeof text !== 'string') return null;
   const trimmed = text.trim();
+
+  // Handle fenced JSON blocks (common for Gemini/Claude).
+  const fenceMatch = trimmed.match(/```[a-zA-Z]*\s*([\s\S]*?)\s*```/);
+  if (fenceMatch && fenceMatch[1]) {
+    const inner = fenceMatch[1].trim();
+    try {
+      return JSON.parse(inner);
+    } catch {
+      // continue with fallback strategies below
+    }
+  }
   try {
     return JSON.parse(trimmed);
   } catch {
@@ -342,7 +1059,9 @@ function filterAcceptanceLines(lines) {
     .filter(
       (item) =>
         item &&
-        /(WHEN\b|当|若|如果)/i.test(item) &&
+        /^当/.test(item) &&
+        /系统应/.test(item) &&
+        !/(WHEN\b|THE SYSTEM SHALL)/i.test(item) &&
         !/(需求描述缺失|需要补充|请提供|无法|不能|不明确|不清楚|缺失)/.test(item),
     );
 }
@@ -369,6 +1088,14 @@ function buildRequirementsMarkdown(prompt, payload) {
   const acceptance = filterAcceptanceLines(
     payload?.acceptance || payload?.ears || payload?.criteria,
   );
+  const acceptanceLines =
+    acceptance.length > 0
+      ? acceptance
+      : [
+          '当用户开始使用该功能时，系统应提供清晰的引导与默认配置（可后续调整）。',
+          '当用户执行核心操作时，系统应提供可感知的反馈（加载态/提示）。',
+          '当发生异常或输入不合法时，系统应给出可理解的错误提示与恢复路径。',
+        ];
   const stories =
     userStories.length > 0
       ? userStories
@@ -377,7 +1104,7 @@ function buildRequirementsMarkdown(prompt, payload) {
         ];
   return `# 需求（requirements）\n\n## 原始需求\n${rawPrompt}\n\n## 背景\n${background || ''}\n\n## 用户故事\n${stories
     .map((item) => `- ${item}`)
-    .join('\n')}\n\n## 验收标准（EARS）\n${acceptance
+    .join('\n')}\n\n## 验收标准（EARS）\n${acceptanceLines
     .map((item) => `- ${item}`)
     .join('\n')}\n`;
 }
@@ -434,71 +1161,38 @@ function buildTasksMarkdown(prompt, payload) {
 }
 
 async function generateRequirementsWithModel(prompt) {
-  if (!hasLlmConfig()) {
-    throw new Error('LLM config missing');
-  }
+  if (!hasLlmConfig()) throw new Error('LLM config missing');
+
   const content = await callLlm([
     {
       role: 'system',
-      content:
-        '你是产品需求助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
+      content: '你是产品需求助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
     },
     {
       role: 'user',
       content:
         `需求描述：${prompt}\n\n` +
-        '请只输出 JSON，必须包含字段：background（字符串）, user_stories（字符串数组）, acceptance（字符串数组，EARS 语句）。不要输出除 JSON 以外的任何内容。',
+        '请只输出 JSON，必须包含字段：background（字符串）, user_stories（字符串数组）, acceptance（字符串数组）。\n' +
+        '要求：所有内容必须为简体中文；acceptance 每条为“当...时，系统应...”风格的可验证语句。\n' +
+        '不要输出除 JSON 以外的任何内容。',
     },
   ]);
-  let payload = tryParseJson(content);
+
+  const payload = tryParseJson(content);
   if (!payload) {
-    payload = { summary: content };
+    throw new Error(`LLM output not JSON: ${String(content).slice(0, 200)}`);
   }
-  if (!Array.isArray(payload.acceptance) || payload.acceptance.length === 0) {
-    const repair = await callLlm([
-      {
-        role: 'system',
-        content: '你是产品需求助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
-      },
-      {
-        role: 'user',
-        content:
-          `需求描述：${prompt}\n\n` +
-          '请仅输出 JSON，包含字段 acceptance（字符串数组，EARS 语句）。不要提问，信息不足时请自行合理假设并给出 3-6 条 EARS。',
-      },
-    ]);
-    const repairPayload = tryParseJson(repair);
-    let acceptance = filterAcceptanceLines(
-      repairPayload?.acceptance || extractAcceptanceFromText(repair),
-    );
-    if (!acceptance || acceptance.length === 0) {
-      const retry = await callLlm([
-        {
-          role: 'system',
-          content: '你是产品需求助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
-        },
-        {
-          role: 'user',
-          content:
-            `需求描述：${prompt}\n\n` +
-            '请仅输出 JSON，字段 acceptance（字符串数组，EARS 语句）。不要提问，不要提到信息缺失，直接合理假设并给出 3-6 条 EARS。',
-        },
-      ]);
-      const retryPayload = tryParseJson(retry);
-      acceptance = filterAcceptanceLines(
-        retryPayload?.acceptance || extractAcceptanceFromText(retry),
-      );
-    }
-    if (!acceptance || acceptance.length === 0) {
-      console.error(
-        'LLM acceptance generation failed:',
-        String(repair).slice(0, 200).replace(/\s+/g, ' '),
-      );
-      throw new Error('LLM response must include acceptance array');
-    }
-    payload = { ...payload, acceptance };
+  if (typeof payload.background !== 'string' || !payload.background.trim()) {
+    throw new Error(`LLM requirements missing background: ${JSON.stringify(payload).slice(0, 200)}`);
   }
-  return buildRequirementsMarkdown(prompt, payload);
+  if (!Array.isArray(payload.user_stories) || payload.user_stories.length === 0) {
+    throw new Error(`LLM requirements missing user_stories: ${JSON.stringify(payload).slice(0, 200)}`);
+  }
+  const acceptance = filterAcceptanceLines(payload.acceptance);
+  if (!acceptance || acceptance.length === 0) {
+    throw new Error(`LLM requirements acceptance invalid: ${JSON.stringify(payload).slice(0, 200)}`);
+  }
+  return buildRequirementsMarkdown(prompt, { ...payload, acceptance });
 }
 
 function extractOriginalRequirement(markdown) {
@@ -517,9 +1211,8 @@ function resolveDesignPrompt(prompt, requirements) {
 }
 
 async function generateDesignWithModel(requirements, prompt) {
-  if (!hasLlmConfig()) {
-    throw new Error('LLM config missing');
-  }
+  if (!hasLlmConfig()) throw new Error('LLM config missing');
+
   const content = await callLlm([
     {
       role: 'system',
@@ -533,7 +1226,10 @@ async function generateDesignWithModel(requirements, prompt) {
         '请只输出 JSON，字段：overview（字符串）, flows（字符串数组）, considerations（字符串数组）。不要输出除 JSON 以外的任何内容。',
     },
   ]);
-  const payload = tryParseJson(content) || { summary: content };
+  const payload = tryParseJson(content);
+  if (!payload) {
+    throw new Error(`LLM design output not JSON: ${String(content).slice(0, 200)}`);
+  }
   const designPrompt = resolveDesignPrompt(prompt, requirements);
   return buildDesignMarkdown(designPrompt, payload);
 }
@@ -542,21 +1238,61 @@ async function generateTasksWithModel(design, prompt) {
   if (!hasLlmConfig()) {
     throw new Error('LLM config missing');
   }
+
+  const parseTasksFromAny = (raw) => {
+    const text = typeof raw === 'string' ? raw.trim() : '';
+    if (!text) return [];
+    const payload = tryParseJson(text);
+    const tasks = normalizeLines(payload?.tasks || payload?.items || payload?.todo);
+    if (tasks.length > 0) return tasks;
+
+    // fallback: extract bullet-ish lines from plain text
+    return extractAcceptanceFromText(text);
+  };
+
+  const looksLikeChinese = (line) => /[\u4e00-\u9fa5]/.test(String(line || ''));
+
   const content = await callLlm([
     {
       role: 'system',
       content:
-        '你是任务拆解助手。只输出 Markdown，不要解释，不要包含分析或思考过程。',
+        '你是任务拆解助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
     },
     {
       role: 'user',
       content:
         `设计内容如下：\n${design || ''}\n\n补充描述：${prompt}\n\n` +
-        '请输出 JSON 或纯文本。JSON 可包含字段：tasks（数组）。纯文本会用于生成任务概述。',
+        '请严格输出 JSON：{"tasks":[...]}。\n' +
+        '要求：所有任务必须为简体中文、可执行、以动词开头；数量 6-12 条。\n' +
+        '不要输出除 JSON 以外的任何内容。',
     },
   ]);
-  const payload = tryParseJson(content) || { summary: content };
-  return buildTasksMarkdown(prompt || design, payload);
+
+  let tasks = parseTasksFromAny(content);
+  if (tasks.length === 0 || tasks.every((t) => !looksLikeChinese(t))) {
+    const repair = await callLlm([
+      {
+        role: 'system',
+        content: '你是任务拆解助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
+      },
+      {
+        role: 'user',
+        content:
+          '请把下面的任务列表改写为“简体中文、可执行、以动词开头”的任务（6-12 条），并严格输出 JSON：{"tasks":[...]}。\n\n' +
+          `原始输出：\n${content}\n`,
+      },
+    ]);
+    tasks = parseTasksFromAny(repair);
+  }
+
+  if (tasks.length === 0) {
+    throw new Error('LLM tasks output invalid');
+  }
+  if (tasks.every((t) => !looksLikeChinese(t))) {
+    throw new Error('LLM tasks not in Simplified Chinese');
+  }
+
+  return buildTasksMarkdown(prompt || design, { tasks });
 }
 
 function ensureSpecTemplate(name, artifact) {
@@ -576,7 +1312,15 @@ function listSpecs() {
       SPEC_ARTIFACTS.forEach((artifact) => {
         files[artifact] = fs.existsSync(resolveSpecFile(specName, artifact));
       });
-      const status = readSpecStatus(specName);
+      let status = readSpecStatus(specName);
+      if (files.requirements) {
+        try {
+          const requirementsMarkdown = fs.readFileSync(resolveSpecFile(specName, 'requirements'), 'utf8');
+          status = ensureRequirementsReviewSeeded(specName, status, requirementsMarkdown).status;
+        } catch {
+          // ignore seeding failures
+        }
+      }
       return { name: specName, files, status };
     });
 }
@@ -589,6 +1333,22 @@ async function createSpecTemplates(name, artifacts = ['requirements'], prompt = 
       if (artifact === 'requirements') {
         const content = await generateRequirementsWithModel(prompt);
         writeSpecFile(name, artifact, content);
+        const status = readSpecStatus(name);
+        ensureRequirementsReviewSeeded(name, status, content);
+        const clarifications = await generateClarificationsWithModel(prompt);
+        const normalizedClarifications = normalizeRequirementsClarifications(clarifications);
+        const nextStatus = readSpecStatus(name);
+        nextStatus.requirementsClarifications = {
+          ...nextStatus.requirementsClarifications,
+          questions: normalizedClarifications.questions.length
+            ? normalizedClarifications.questions
+            : [],
+          generatedBy: 'llm',
+          generationError: null,
+          updatedAt: new Date().toISOString(),
+          confirmedAt: nextStatus.requirementsClarifications?.confirmedAt ?? null,
+        };
+        writeSpecStatus(name, nextStatus);
       } else {
         ensureSpecTemplate(name, artifact);
       }
@@ -823,6 +1583,134 @@ app.get('/health', (req, res) => {
   res.json({ ok: true });
 });
 
+app.get('/llm', (req, res) => {
+  const { baseUrl, model, providerId, responseFormat } = getActiveLlmConfig();
+  res.json({
+    hasConfig: hasLlmConfig(),
+    model: model || null,
+    providerId: providerId || null,
+    baseUrl: baseUrl || null,
+    responseFormat: responseFormat || null,
+    options: LLM_MODEL_OPTIONS,
+    providers: LLM_PROVIDERS.map((provider) => {
+      const directBaseUrl = getProviderEnv(provider.id, 'base_url');
+      const directApiKey = getProviderEnv(provider.id, 'api_key');
+      return {
+        id: provider.id,
+        label: provider.label,
+        baseUrl: directBaseUrl || null,
+        baseUrlPresent: Boolean(directBaseUrl),
+        apiKeyPresent: Boolean(directApiKey),
+      };
+    }),
+  });
+});
+
+app.post('/llm/provider', (req, res) => {
+  try {
+    const providerId = typeof req.body?.providerId === 'string' ? req.body.providerId.trim() : '';
+    if (!providerId || !LLM_PROVIDERS.some((p) => p.id === providerId)) {
+      return res.status(400).json({ error: 'Invalid providerId' });
+    }
+
+    const hasBaseUrl = typeof req.body?.baseUrl === 'string';
+    const hasApiKey = typeof req.body?.apiKey === 'string';
+    if (!hasBaseUrl && !hasApiKey) {
+      return res.status(400).json({ error: 'Nothing to update' });
+    }
+
+    const existing = {};
+    if (fs.existsSync(LLM_CONFIG_FILE)) {
+      try {
+        Object.assign(existing, JSON.parse(fs.readFileSync(LLM_CONFIG_FILE, 'utf8')));
+      } catch {
+        // ignore
+      }
+    }
+
+    const providers = (existing.providers && typeof existing.providers === 'object')
+      ? { ...existing.providers }
+      : {};
+    const currentProvider = (providers[providerId] && typeof providers[providerId] === 'object')
+      ? { ...providers[providerId] }
+      : {};
+
+    if (hasBaseUrl) {
+      currentProvider.baseUrl = String(req.body.baseUrl || '').trim();
+    }
+    if (hasApiKey) {
+      currentProvider.apiKey = String(req.body.apiKey || '').trim();
+    }
+
+    providers[providerId] = currentProvider;
+    persistLlmConfig({ providers });
+
+    const envPrefix = `LLM_PROVIDER_${providerId.toUpperCase()}_`;
+    if (hasBaseUrl) process.env[`${envPrefix}BASE_URL`] = currentProvider.baseUrl || '';
+    if (hasApiKey) process.env[`${envPrefix}API_KEY`] = currentProvider.apiKey || '';
+
+    emitEvent('log:append', {
+      source: 'llm',
+      message: `[llm] provider ${providerId} updated`,
+    });
+
+    const { baseUrl, model, providerId: activeProviderId, responseFormat } = getActiveLlmConfig();
+    return res.json({
+      hasConfig: hasLlmConfig(),
+      model: model || null,
+      providerId: activeProviderId || null,
+      baseUrl: baseUrl || null,
+      responseFormat: responseFormat || null,
+      options: LLM_MODEL_OPTIONS,
+      providers: LLM_PROVIDERS.map((provider) => {
+        const directBaseUrl = getProviderEnv(provider.id, 'base_url');
+        const directApiKey = getProviderEnv(provider.id, 'api_key');
+        return {
+          id: provider.id,
+          label: provider.label,
+          baseUrl: directBaseUrl || null,
+          baseUrlPresent: Boolean(directBaseUrl),
+          apiKeyPresent: Boolean(directApiKey),
+        };
+      }),
+    });
+  } catch (error) {
+    return res.status(400).json({ error: error?.message || 'Invalid provider config' });
+  }
+});
+
+app.post('/llm/model', (req, res) => {
+  try {
+    const nextModel = setLlmModel(req.body?.model);
+    emitEvent('log:append', {
+      source: 'llm',
+      message: `[llm] model set to ${nextModel}`,
+    });
+    const { baseUrl, model, providerId, responseFormat } = getActiveLlmConfig();
+    return res.json({
+      hasConfig: hasLlmConfig(),
+      model: model || null,
+      providerId: providerId || null,
+      baseUrl: baseUrl || null,
+      responseFormat: responseFormat || null,
+      options: LLM_MODEL_OPTIONS,
+      providers: LLM_PROVIDERS.map((provider) => {
+        const directBaseUrl = getProviderEnv(provider.id, 'base_url');
+        const directApiKey = getProviderEnv(provider.id, 'api_key');
+        return {
+          id: provider.id,
+          label: provider.label,
+          baseUrl: directBaseUrl || null,
+          baseUrlPresent: Boolean(directBaseUrl),
+          apiKeyPresent: Boolean(directApiKey),
+        };
+      }),
+    });
+  } catch (error) {
+    return res.status(400).json({ error: error?.message || 'Invalid model' });
+  }
+});
+
 app.get('/state', (req, res) => {
   res.json({
     status: state.status,
@@ -885,7 +1773,52 @@ app.get('/specs/:name/:artifact', (req, res) => {
       writeSpecFile(specName, 'requirements', content);
     }
   }
+  if (artifact === 'requirements') {
+    const status = readSpecStatus(specName);
+    ensureRequirementsReviewSeeded(specName, status, content);
+    ensureRequirementsClarificationsSeeded(specName, status, status.prompt);
+  }
   return res.json({ content });
+});
+
+app.post('/specs/:name/requirements/review', (req, res) => {
+  const specName = sanitizeSpecName(req.params.name);
+  if (!specName) {
+    return res.status(400).json({ error: 'Invalid spec request' });
+  }
+  const status = readSpecStatus(specName);
+  const nextReview = normalizeRequirementsReview(req.body || {});
+  status.requirementsReview = {
+    ...nextReview,
+    updatedAt: new Date().toISOString(),
+    confirmedAt: status.requirementsReview?.confirmedAt ?? null,
+  };
+  writeSpecStatus(specName, status);
+  emitEvent('log:append', {
+    source: 'spec',
+    message: `[spec] saved ${specName}/requirements-review`,
+  });
+  return res.json({ ok: true, status });
+});
+
+app.post('/specs/:name/requirements/clarifications', (req, res) => {
+  const specName = sanitizeSpecName(req.params.name);
+  if (!specName) {
+    return res.status(400).json({ error: 'Invalid spec request' });
+  }
+  const status = readSpecStatus(specName);
+  const nextClarifications = normalizeRequirementsClarifications(req.body || {});
+  status.requirementsClarifications = {
+    ...nextClarifications,
+    updatedAt: new Date().toISOString(),
+    confirmedAt: status.requirementsClarifications?.confirmedAt ?? null,
+  };
+  writeSpecStatus(specName, status);
+  emitEvent('log:append', {
+    source: 'spec',
+    message: `[spec] saved ${specName}/requirements-clarifications`,
+  });
+  return res.json({ ok: true, status });
 });
 
 app.post('/specs/:name/confirm', async (req, res) => {
@@ -898,6 +1831,32 @@ app.post('/specs/:name/confirm', async (req, res) => {
   const status = readSpecStatus(specName);
 
   if (artifact === 'requirements') {
+    const incomingReview = req.body?.review || req.body?.requirementsReview || null;
+    if (incomingReview) {
+      status.requirementsReview = mergeRequirementsReview(status.requirementsReview, incomingReview);
+    }
+    const incomingClarifications =
+      req.body?.clarifications || req.body?.requirementsClarifications || null;
+    if (incomingClarifications) {
+      status.requirementsClarifications = mergeRequirementsClarifications(
+        status.requirementsClarifications,
+        incomingClarifications,
+      );
+    }
+    if (!areClarificationsComplete(status.requirementsClarifications)) {
+      return res.status(409).json({ error: 'Requirements clarifications incomplete' });
+    }
+    const now = new Date().toISOString();
+    status.requirementsReview = {
+      ...normalizeRequirementsReview(status.requirementsReview || {}),
+      updatedAt: now,
+      confirmedAt: now,
+    };
+    status.requirementsClarifications = {
+      ...normalizeRequirementsClarifications(status.requirementsClarifications || {}),
+      updatedAt: now,
+      confirmedAt: now,
+    };
     status.requirementsConfirmed = true;
     const requirementsPath = resolveSpecFile(specName, 'requirements');
     const requirementsContent = fs.existsSync(requirementsPath)
@@ -908,7 +1867,14 @@ app.post('/specs/:name/confirm', async (req, res) => {
       !fs.existsSync(designPath) || fs.readFileSync(designPath, 'utf8').trim() === '';
     if (shouldGenerate) {
       try {
-        const content = await generateDesignWithModel(requirementsContent, status.prompt);
+        const supplementalPrompt = [
+          status.prompt,
+          buildClarificationsSummary(status.requirementsClarifications),
+          buildReviewSummary(status.requirementsReview),
+        ]
+          .filter(Boolean)
+          .join('\n\n');
+        const content = await generateDesignWithModel(requirementsContent, supplementalPrompt);
         writeSpecFile(specName, 'design', content);
       } catch (error) {
         console.error('Design generation failed:', error?.message || error);

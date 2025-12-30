@@ -1,41 +1,39 @@
-﻿export type WorkflowStatus = 'Thinking' | 'Executing' | 'Reviewing';
-
-export interface WorkflowEvent<T = any> {
-  id: string;
-  type: string;
-  payload: T;
-  timestamp: string;
-}
-
-export interface TaskGraph {
-  nodes: Array<{ id: string; data: { label: string; status?: string }; position: { x: number; y: number } }>;
-  edges: Array<{ id: string; source: string; target: string }>;
-}
-
-export interface DiffPreview {
-  filePath: string;
-  diff: string;
-}
-
-export interface ApprovalRequest {
-  id: string;
-  title: string;
-  description?: string;
-  options?: string[];
-}
-
-export interface TestReport {
-  status: 'pass' | 'fail';
-  summary: string;
-  details?: string;
-}
-
 export type SpecArtifact = 'requirements' | 'design' | 'tasks';
+
+export interface ClarificationOption {
+  id: string;
+  label: string;
+}
+
+export interface ClarificationAnswer {
+  selectedOptionIds: string[];
+  otherText: string;
+}
+
+export interface ClarificationQuestion {
+  id: string;
+  question: string;
+  mode: 'single' | 'multi';
+  required: boolean;
+  allowOther: boolean;
+  options: ClarificationOption[];
+  answer: ClarificationAnswer;
+  createdAt: string;
+}
+
+export interface RequirementsClarifications {
+  questions: ClarificationQuestion[];
+  generatedBy?: 'llm' | 'default' | string | null;
+  generationError?: string | null;
+  updatedAt: string | null;
+  confirmedAt: string | null;
+}
 
 export interface SpecStatus {
   requirementsConfirmed: boolean;
   designConfirmed: boolean;
   tasksConfirmed: boolean;
+  requirementsClarifications?: RequirementsClarifications;
 }
 
 export interface SpecSummary {
@@ -44,11 +42,26 @@ export interface SpecSummary {
   status?: SpecStatus;
 }
 
-export interface BridgeState {
-  status: WorkflowStatus;
-  tasks: TaskGraph;
-  lastDiff: DiffPreview | null;
-  approvals: ApprovalRequest[];
-  testReport: TestReport | null;
-  logs: Array<{ source: string; message: string }>;
+export interface LlmOption {
+  id: string;
+  label: string;
+  providerId: string;
+}
+
+export interface LlmProviderInfo {
+  id: string;
+  label: string;
+  baseUrl: string | null;
+  baseUrlPresent: boolean;
+  apiKeyPresent: boolean;
+}
+
+export interface LlmInfo {
+  hasConfig: boolean;
+  model: string | null;
+  providerId: string | null;
+  baseUrl: string | null;
+  responseFormat: string | null;
+  options: LlmOption[];
+  providers: LlmProviderInfo[];
 }
