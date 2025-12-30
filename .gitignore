@@ -1,0 +1,19 @@
+node_modules/
+dist/
+logs/
+coverage/
+.runlogs/
+.idea/
+.env
+.env.*
+*.log
+
+# local env (do not commit)
+task/mvp2/.mvp2env
+
+# runtime artifacts
+bridge/data/
+
+# nested repos (keep separate)
+openspec/
+planA/
