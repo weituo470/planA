@@ -124,7 +124,7 @@ function buildClarificationsMarkdown(questions: ClarificationQuestion[]) {
     const otherText = (q.answer?.otherText ?? '').trim();
     lines.push(`### Q${i + 1}. ${q.question}`);
     lines.push(`- 选择：${selectedLabels.length ? selectedLabels.join('、') : '（未选择）'}`);
-    if (q.allowOther) lines.push(`- 其他：${otherText ? otherText : '（无）'}`);
+    if (q.allowOther) lines.push(`- 补充：${otherText ? otherText : '（无）'}`);
     lines.push('');
   });
   return lines.join('\n').trimEnd();
@@ -817,18 +817,18 @@ export default function App() {
                             return (
                               <label key={opt.id} className="flex items-start gap-2 text-sm text-slate-200">
                                 <input
-                                  type={q.mode === 'single' ? 'radio' : 'checkbox'}
+                                  type="checkbox"
                                   name={`q-${q.id}`}
                                   checked={checked}
                                   onChange={(e) => {
                                     const nextSelected =
                                       q.mode === 'single'
-                                        ? e.target.checked
-                                          ? [opt.id]
-                                          : []
-                                        : e.target.checked
-                                          ? Array.from(new Set([...selected, opt.id]))
-                                          : selected.filter((id) => id !== opt.id);
+                                        ? checked
+                                          ? []
+                                          : [opt.id]
+                                        : checked
+                                          ? selected.filter((id) => id !== opt.id)
+                                          : Array.from(new Set([...selected, opt.id]));
                                     setClarifications((prev) =>
                                       prev.map((qq) =>
                                         qq.id === q.id
@@ -851,7 +851,7 @@ export default function App() {
 
                           {q.allowOther && (
                             <label className="block space-y-1 text-xs text-slate-300">
-                              <div>其他</div>
+                              <div>补充</div>
                               <input
                                 className="h-9 w-full rounded-md border border-slate-700 bg-slate-950 px-2 text-sm text-slate-100"
                                 value={q.answer?.otherText ?? ''}
@@ -870,7 +870,7 @@ export default function App() {
                                     ),
                                   )
                                 }
-                                placeholder="可选"
+                                placeholder="选填"
                               />
                             </label>
                           )}
