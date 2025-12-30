@@ -782,7 +782,8 @@ export default function App() {
                       <div key={q.id} className="rounded-md border border-slate-800 bg-slate-950/40 p-3">
                         <div className="flex flex-wrap items-start justify-between gap-2">
                           <div className="text-sm text-slate-100">
-                            {idx + 1}. {q.question}{' '}
+                            {idx + 1}. {q.question}
+                            {q.mode === 'multi' && <span className="text-slate-400">（可多选）</span>}{' '}
                             {q.required && <span className="text-red-300">*</span>}
                           </div>
                           <div className="text-xs text-slate-400">
