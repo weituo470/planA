@@ -12,11 +12,9 @@
     "@radix-ui/react-slot": "^1.0.2",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.0",
-    "lucide-react": "^0.453.0",
+    "jszip": "^3.10.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "reactflow": "^11.11.4",
-    "socket.io-client": "^4.7.2",
     "tailwind-merge": "^2.5.4"
   },
   "devDependencies": {
