@@ -75,7 +75,7 @@ const LLM_PROVIDERS = [
 ];
 
 const LLM_MODEL_OPTIONS = [
-  { id: 'gpt-5.2-codex', providerId: 'openai', label: 'ChatGPT-5.2-Codex (OpenAI/Codex)' },
+  { id: 'gpt-5.2-codex', providerId: 'openai', label: 'ChatGPT-5.2-Codex' },
   // NOTE: Some gateways expose Gemini/Claude under provider-specific ids.
   { id: 'gemini-3-pro-preview[x6]', providerId: 'google', label: 'Gemini 3 Pro' },
   { id: 'claude-opus-4-5-20251101', providerId: 'anthropic', label: 'Claude 4.5 Opus' },
@@ -189,10 +189,10 @@ function getProviderEnv(providerId, kind) {
   return (process.env[key] || '').trim();
 }
 
-function getActiveLlmConfig() {
-  const model = (process.env.LLM_MODEL || '').trim();
+function getLlmConfigForModel(model) {
+  const normalizedModel = (model || '').trim();
   const responseFormat = (process.env.LLM_RESPONSE_FORMAT || 'none').trim();
-  const providerId = getProviderForModel(model);
+  const providerId = getProviderForModel(normalizedModel);
 
   const providerBaseUrl = providerId ? getProviderEnv(providerId, 'base_url') : '';
   const providerApiKey = providerId ? getProviderEnv(providerId, 'api_key') : '';
@@ -204,7 +204,11 @@ function getActiveLlmConfig() {
   const baseUrl = providerBaseUrl || fallbackBaseUrl;
   const apiKey = providerApiKey || fallbackApiKey;
 
-  return { baseUrl, apiKey, model, providerId, responseFormat };
+  return { baseUrl, apiKey, model: normalizedModel, providerId, responseFormat };
+}
+
+function getActiveLlmConfig() {
+  return getLlmConfigForModel((process.env.LLM_MODEL || '').trim());
 }
 
 function hasLlmConfig() {
@@ -212,13 +216,14 @@ function hasLlmConfig() {
   return Boolean(baseUrl && apiKey && model);
 }
 
-async function callLlm(messages) {
-  const { baseUrl, apiKey, model, responseFormat } = getActiveLlmConfig();
+async function callLlm(messages, overrideConfig = null) {
+  const { baseUrl, apiKey, model, responseFormat } = overrideConfig || getActiveLlmConfig();
+  const timeoutMsOverride = Number(overrideConfig?.timeoutMs || 0) || null;
 
   const tryOnce = async (rootUrl) => {
     const url = `${String(rootUrl || '').replace(/\/$/, '')}/chat/completions`;
     const controller = new AbortController();
-    const timeoutMs = Number(process.env.LLM_TIMEOUT_MS || 60000);
+    const timeoutMs = timeoutMsOverride || Number(process.env.LLM_TIMEOUT_MS || 60000);
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const body = {
       model,
@@ -1604,6 +1609,35 @@ app.get('/llm', (req, res) => {
       };
     }),
   });
+});
+
+app.get('/llm/ping', async (req, res) => {
+  try {
+    let model = typeof req.query?.model === 'string' ? req.query.model.trim() : '';
+    if (!model) {
+      model = (process.env.LLM_MODEL || '').trim();
+    }
+    if (LLM_MODEL_ALIASES[model]) model = LLM_MODEL_ALIASES[model];
+    if (!isSupportedModel(model)) {
+      return res.status(400).json({ ok: false, error: `Unsupported model: ${model}` });
+    }
+
+    const cfg = getLlmConfigForModel(model);
+    if (!cfg.baseUrl || !cfg.apiKey) {
+      return res.json({ ok: false, model, providerId: cfg.providerId, error: 'Missing baseUrl or apiKey' });
+    }
+
+    const startedAt = Date.now();
+    await callLlm([{ role: 'user', content: 'ping' }], {
+      ...cfg,
+      timeoutMs: Number(process.env.LLM_PING_TIMEOUT_MS || 8000),
+    });
+
+    const latencyMs = Date.now() - startedAt;
+    return res.json({ ok: true, model, providerId: cfg.providerId, latencyMs });
+  } catch (error) {
+    return res.json({ ok: false, error: error?.message || String(error) });
+  }
 });
 
 app.post('/llm/provider', (req, res) => {

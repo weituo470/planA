@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import JSZip from 'jszip';
 
 import { Button } from './components/ui/button';
-import type { ClarificationQuestion, LlmInfo, SpecArtifact, SpecSummary } from './types';
+import type { ClarificationQuestion, LlmInfo, LlmPingResult, SpecArtifact, SpecSummary } from './types';
 
 const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
 
@@ -145,7 +145,10 @@ async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!res.ok) {
     const message = typeof data === 'string' ? data : data?.error || res.statusText;
-    throw new Error(message);
+    const error: any = new Error(message);
+    error.status = res.status;
+    error.data = data;
+    throw error;
   }
   return data as T;
 }
@@ -181,9 +184,15 @@ export default function App() {
   });
   const [clarifications, setClarifications] = useState<ClarificationQuestion[]>([]);
   const [llm, setLlm] = useState<LlmInfo | null>(null);
+  const [modelPing, setModelPing] = useState<
+    Record<string, { status: 'pending' | 'ok' | 'error'; latencyMs?: number; error?: string }>
+  >({});
   const [showLlmConfig, setShowLlmConfig] = useState(false);
+  const [llmConfigUnlocked, setLlmConfigUnlocked] = useState(false);
   const [providerDrafts, setProviderDrafts] = useState<Record<string, { baseUrl: string; apiKey: string }>>({});
   const [busyLabel, setBusyLabel] = useState<string | null>(null);
+  const busyStartedAtRef = useRef<number | null>(null);
+  const [busySeconds, setBusySeconds] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   const selectedSpec = useMemo(
@@ -204,12 +213,59 @@ export default function App() {
       drafts[p.id] = { baseUrl: p.baseUrl ?? '', apiKey: '' };
     }
     setProviderDrafts(drafts);
+
+    const opts = data.options ?? [];
+    if (opts.length) {
+      setModelPing((prev) => {
+        const next = { ...prev };
+        for (const opt of opts) {
+          next[opt.id] = { status: 'pending' };
+        }
+        return next;
+      });
+      void Promise.all(
+        opts.map(async (opt) => {
+          try {
+            const result = await apiJson<LlmPingResult>(
+              `/llm/ping?model=${encodeURIComponent(opt.id)}`,
+            );
+            if (result.ok) {
+              setModelPing((prev) => ({
+                ...prev,
+                [opt.id]: { status: 'ok', latencyMs: result.latencyMs ?? 0 },
+              }));
+            } else {
+              setModelPing((prev) => ({
+                ...prev,
+                [opt.id]: { status: 'error', error: result.error || '错误' },
+              }));
+            }
+          } catch (e: any) {
+            setModelPing((prev) => ({
+              ...prev,
+              [opt.id]: { status: 'error', error: String(e?.message || e) },
+            }));
+          }
+        }),
+      );
+    }
   }, []);
 
   const loadArtifact = useCallback(
     async (specName: string, artifact: SpecArtifact) => {
-      const data = await apiJson<{ content: string }>(`/specs/${encodeURIComponent(specName)}/${artifact}`);
-      setArtifactContent((prev) => ({ ...prev, [artifact]: data.content ?? '' }));
+      try {
+        const data = await apiJson<{ content: string }>(
+          `/specs/${encodeURIComponent(specName)}/${artifact}`,
+        );
+        setArtifactContent((prev) => ({ ...prev, [artifact]: data.content ?? '' }));
+      } catch (e: any) {
+        const message = String(e?.message || e);
+        if (e?.status === 404 && /Spec file not found/i.test(message)) {
+          setArtifactContent((prev) => ({ ...prev, [artifact]: '' }));
+          return;
+        }
+        throw e;
+      }
     },
     [],
   );
@@ -218,6 +274,26 @@ export default function App() {
     void refreshSpecs().catch((e) => setError(String(e?.message || e)));
     void refreshLlm().catch((e) => setError(String(e?.message || e)));
   }, [refreshLlm, refreshSpecs]);
+
+  useEffect(() => {
+    if (!busyLabel) {
+      busyStartedAtRef.current = null;
+      setBusySeconds(0);
+      return;
+    }
+
+    if (!busyStartedAtRef.current) {
+      busyStartedAtRef.current = Date.now();
+      setBusySeconds(0);
+    }
+
+    const t = window.setInterval(() => {
+      const startedAt = busyStartedAtRef.current ?? Date.now();
+      setBusySeconds(Math.floor((Date.now() - startedAt) / 1000));
+    }, 300);
+
+    return () => window.clearInterval(t);
+  }, [busyLabel]);
 
   useEffect(() => {
     if (!selectedSpec) return;
@@ -422,19 +498,29 @@ export default function App() {
           ...prev,
           [providerId]: { baseUrl: draft.baseUrl, apiKey: '' },
         }));
+        // Re-ping models after provider update.
+        void refreshLlm();
       } catch (e: any) {
         setError(String(e?.message || e));
       }
     },
-    [providerDrafts],
+    [providerDrafts, refreshLlm],
+  );
+
+  const modelOptionLabel = useCallback(
+    (id: string, label: string) => {
+      const base = label || id;
+      const ping = modelPing[id];
+      if (!ping) return base;
+      if (ping.status === 'pending') return `${base} · ...`;
+      if (ping.status === 'ok') return `${base} · ${Math.max(0, Math.round(ping.latencyMs ?? 0))}ms`;
+      return `${base} · 错误`;
+    },
+    [modelPing],
   );
 
   return (
     <div className="min-h-screen bg-surface text-slate-100">
-      <header className="border-b border-slate-800 bg-panel px-6 py-4">
-        <h1 className="text-xl font-semibold">Codex Workflow Console</h1>
-      </header>
-
       <main className="mx-auto grid max-w-[1400px] grid-cols-12 gap-4 px-6 py-6">
         <section className="col-span-12 space-y-3 rounded-lg border border-slate-800 bg-panel p-4">
           <div className="text-sm font-semibold text-slate-200">原始需求</div>
@@ -461,14 +547,32 @@ export default function App() {
                 </option>
                 {(llm?.options ?? []).map((opt) => (
                   <option key={opt.id} value={opt.id}>
-                    {opt.label}
+                    {modelOptionLabel(opt.id, opt.label)}
                   </option>
                 ))}
               </select>
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => setShowLlmConfig((v) => !v)}
+                onClick={() => {
+                  if (showLlmConfig) {
+                    setShowLlmConfig(false);
+                    return;
+                  }
+                  if (llmConfigUnlocked) {
+                    setShowLlmConfig(true);
+                    return;
+                  }
+                  const input = window.prompt('请输入密码以展开模型配置');
+                  if (input === '159753') {
+                    setLlmConfigUnlocked(true);
+                    setShowLlmConfig(true);
+                    return;
+                  }
+                  if (input !== null) {
+                    setError('密码错误');
+                  }
+                }}
               >
                 {showLlmConfig ? '收起模型配置' : '展开模型配置'}
               </Button>
@@ -535,50 +639,10 @@ export default function App() {
           )}
         </section>
 
-        <section className="col-span-12 md:col-span-3">
-          <div className="h-full rounded-lg border border-slate-800 bg-panel p-4">
-            <div className="mb-3 flex items-center justify-between">
-              <div className="text-sm font-semibold text-slate-200">Specs</div>
-              <Button variant="outline" size="sm" onClick={() => void refreshSpecs()}>
-                刷新
-              </Button>
-            </div>
-            <div className="space-y-1">
-              {(specs ?? []).map((s) => (
-                <button
-                  key={s.name}
-                  className={`w-full rounded-md px-3 py-2 text-left text-sm ${
-                    s.name === selectedSpecName ? 'bg-slate-800 text-white' : 'hover:bg-slate-900/60'
-                  }`}
-                  onClick={() => {
-                    setSelectedSpecName(s.name);
-                    setActiveArtifact('requirements');
-                  }}
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="truncate">{s.name}</div>
-                    <div className="text-xs text-slate-400">
-                      {s.status?.tasksConfirmed ? '已完成' : ''}
-                    </div>
-                  </div>
-                  <div className="mt-1 text-xs text-slate-400">
-                    需求 {s.status?.requirementsConfirmed ? '✔' : '—'} / 设计{' '}
-                    {s.status?.designConfirmed ? '✔' : '—'} / 任务 {s.status?.tasksConfirmed ? '✔' : '—'}
-                  </div>
-                </button>
-              ))}
-              {!specs.length && <div className="text-sm text-slate-400">暂无 Spec</div>}
-            </div>
-          </div>
-        </section>
-
-        <section className="col-span-12 md:col-span-9">
+        <section className="col-span-12">
           <div className="rounded-lg border border-slate-800 bg-panel p-4">
             <div className="mb-3 flex flex-wrap items-center gap-2">
-              <div className="text-sm font-semibold text-slate-200">
-                {selectedSpecName ? selectedSpecName : '请选择一个 Spec'}
-              </div>
-              <div className="ml-auto flex flex-wrap items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 {(['requirements', 'design', 'tasks'] as const).map((a) => (
                   <Button
                     key={a}
@@ -605,31 +669,6 @@ export default function App() {
                   <div className="text-sm font-semibold text-slate-200">需求澄清</div>
                   <div className="text-xs text-slate-400">
                     {areClarificationsComplete(clarifications) ? '已完成' : '未完成'}
-                  </div>
-                  <div className="ml-auto flex flex-wrap items-center gap-2">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => void saveClarifications()}
-                      disabled={!selectedSpecName || Boolean(busyLabel)}
-                    >
-                      保存澄清
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => void applyClarificationsToRequirements()}
-                      disabled={!selectedSpecName || Boolean(busyLabel) || !clarifications.length}
-                    >
-                      回写到需求
-                    </Button>
-                    <Button
-                      size="sm"
-                      onClick={() => void confirmRequirementsAndGenerateDesign()}
-                      disabled={!selectedSpecName || Boolean(busyLabel) || !clarifications.length}
-                    >
-                      生成设计
-                    </Button>
                   </div>
                 </div>
 
@@ -718,6 +757,24 @@ export default function App() {
                 ) : (
                   <div className="text-sm text-slate-400">暂无澄清问题</div>
                 )}
+
+                <div className="flex justify-end gap-2 pt-1">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void saveClarifications()}
+                    disabled={!selectedSpecName || Boolean(busyLabel)}
+                  >
+                    保存澄清
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={() => void confirmRequirementsAndGenerateDesign()}
+                    disabled={!selectedSpecName || Boolean(busyLabel) || !clarifications.length}
+                  >
+                    生成设计
+                  </Button>
+                </div>
               </div>
             )}
 
@@ -780,8 +837,20 @@ export default function App() {
 
       {busyLabel && (
         <div className="fixed inset-0 flex items-center justify-center bg-black/40">
-          <div className="rounded-md border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-slate-100">
-            {busyLabel}
+          <div className="w-[520px] max-w-[90vw] rounded-lg border border-slate-700 bg-slate-950 px-5 py-4 text-slate-100 shadow-xl">
+            <div className="flex items-center gap-3">
+              <div className="h-5 w-5 animate-spin rounded-full border-2 border-slate-500 border-t-slate-100" />
+              <div className="text-sm font-semibold">{busyLabel}</div>
+              <div className="ml-auto text-xs text-slate-400">{busySeconds}s</div>
+            </div>
+            <div className="mt-3 text-xs leading-5 text-slate-300">
+              <div>生成过程可能需要几十秒，请保持页面打开。</div>
+              {busySeconds >= 20 && (
+                <div className="mt-1 text-slate-400">
+                  若长时间无响应：检查模型是否可用、Base URL/Key 是否正确、以及反代是否能访问到 bridge。
+                </div>
+              )}
+            </div>
           </div>
         </div>
       )}

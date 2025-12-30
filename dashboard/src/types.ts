@@ -65,3 +65,11 @@ export interface LlmInfo {
   options: LlmOption[];
   providers: LlmProviderInfo[];
 }
+
+export interface LlmPingResult {
+  ok: boolean;
+  model?: string;
+  providerId?: string | null;
+  latencyMs?: number;
+  error?: string;
+}
