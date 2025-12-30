@@ -99,7 +99,7 @@ async function renderTextToPng(text: string, title: string) {
 
 function buildClarificationsMarkdown(questions: ClarificationQuestion[]) {
   const lines: string[] = [];
-  lines.push('## 需求澄清', '');
+  lines.push('## 需求确认', '');
   questions.forEach((q, i) => {
     const selectedIds = q.answer?.selectedOptionIds ?? [];
     const selectedLabels = q.options
@@ -118,7 +118,7 @@ function buildClarificationsMarkdown(questions: ClarificationQuestion[]) {
 function upsertClarificationsSection(markdown: string, questions: ClarificationQuestion[]) {
   const section = buildClarificationsMarkdown(questions);
   const text = markdown ?? '';
-  const re = /^## 需求澄清[\s\S]*?(?=\n## |\n# |$)/m;
+  const re = /^## 需求(?:澄清|确认)[\s\S]*?(?=\n## |\n# |$)/m;
   if (re.test(text)) return text.replace(re, section).trimEnd();
   const afterOriginal = /(## 原始需求[\s\S]*?)(\n## |\n# |$)/m.exec(text);
   if (afterOriginal) {
@@ -151,6 +151,19 @@ async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
     throw error;
   }
   return data as T;
+}
+
+function humanizeError(e: any) {
+  const status = Number(e?.status || 0) || null;
+  const msg = String(e?.message || e || '').trim();
+
+  if (!msg) return '发生未知错误';
+  if (status === 409 && /Design not confirmed/i.test(msg)) return '设计尚未生成，请先生成设计。';
+  if (status === 409 && /Requirements not confirmed/i.test(msg)) return '需求尚未确认，请先完成需求确认并生成设计。';
+  if (status === 409 && /clarifications incomplete/i.test(msg)) return '需求确认未完成，请先完成必填项。';
+  if (status === 404 && /Spec file not found/i.test(msg)) return '文档尚未生成。';
+  if (/Failed to fetch/i.test(msg)) return '无法连接到服务，请检查 bridge 地址/反代配置。';
+  return msg;
 }
 
 function isClarificationComplete(q: ClarificationQuestion) {
@@ -196,12 +209,23 @@ export default function App() {
   const [busyLabel, setBusyLabel] = useState<string | null>(null);
   const busyStartedAtRef = useRef<number | null>(null);
   const [busySeconds, setBusySeconds] = useState(0);
-  const [error, setError] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ message: string; tone: 'error' | 'info' } | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
+  const saveTimerRef = useRef<number | null>(null);
+  const clarifSaveTimerRef = useRef<number | null>(null);
+
+  const showToast = useCallback((message: string, tone: 'error' | 'info' = 'error') => {
+    if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+    setToast({ message, tone });
+    toastTimerRef.current = window.setTimeout(() => setToast(null), 4500);
+  }, []);
 
   const selectedSpec = useMemo(
     () => specs.find((s) => s.name === selectedSpecName) ?? null,
     [specs, selectedSpecName],
   );
+  const canOpenDesign = Boolean(selectedSpecName && (selectedSpec?.files?.design || selectedSpec?.status?.requirementsConfirmed));
+  const canOpenTasks = Boolean(selectedSpecName && (selectedSpec?.files?.tasks || selectedSpec?.status?.designConfirmed));
 
   const refreshSpecs = useCallback(async () => {
     const data = await apiJson<{ specs: SpecSummary[] }>('/specs');
@@ -281,8 +305,8 @@ export default function App() {
   );
 
   useEffect(() => {
-    void refreshSpecs().catch((e) => setError(String(e?.message || e)));
-    void refreshLlm().catch((e) => setError(String(e?.message || e)));
+    void refreshSpecs().catch((e) => showToast(humanizeError(e)));
+    void refreshLlm().catch((e) => showToast(humanizeError(e)));
   }, [refreshLlm, refreshSpecs]);
 
   useEffect(() => {
@@ -312,11 +336,19 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedSpecName) return;
-    void loadArtifact(selectedSpecName, activeArtifact).catch((e) => setError(String(e?.message || e)));
-  }, [activeArtifact, loadArtifact, selectedSpecName]);
+    if (activeArtifact === 'tasks' && !canOpenTasks) {
+      setActiveArtifact(canOpenDesign ? 'design' : 'requirements');
+      return;
+    }
+    if (activeArtifact === 'design' && !canOpenDesign) {
+      setActiveArtifact('requirements');
+      return;
+    }
+    void loadArtifact(selectedSpecName, activeArtifact).catch((e) => showToast(humanizeError(e)));
+  }, [activeArtifact, canOpenDesign, canOpenTasks, loadArtifact, selectedSpecName]);
 
   const createSpec = useCallback(async () => {
-    setError(null);
+    setToast(null);
     setBusyLabel('生成中');
     try {
       const data = await apiJson<{ name: string }>('/specs', {
@@ -328,7 +360,7 @@ export default function App() {
       setActiveArtifact('requirements');
       await loadArtifact(data.name, 'requirements');
     } catch (e: any) {
-      setError(String(e?.message || e));
+      showToast(humanizeError(e));
     } finally {
       setBusyLabel(null);
     }
@@ -337,7 +369,6 @@ export default function App() {
   const saveArtifact = useCallback(
     async (artifact: SpecArtifact) => {
       if (!selectedSpecName) return;
-      setError(null);
       try {
         await apiJson(`/specs/${encodeURIComponent(selectedSpecName)}/${artifact}`, {
           method: 'POST',
@@ -345,15 +376,14 @@ export default function App() {
         });
         await refreshSpecs();
       } catch (e: any) {
-        setError(String(e?.message || e));
+        showToast(humanizeError(e));
       }
     },
-    [artifactContent, refreshSpecs, selectedSpecName],
+    [artifactContent, refreshSpecs, selectedSpecName, showToast],
   );
 
   const saveClarifications = useCallback(async () => {
     if (!selectedSpecName) return;
-    setError(null);
     try {
       await apiJson(`/specs/${encodeURIComponent(selectedSpecName)}/requirements/clarifications`, {
         method: 'POST',
@@ -365,9 +395,9 @@ export default function App() {
       }));
       await refreshSpecs();
     } catch (e: any) {
-      setError(String(e?.message || e));
+      showToast(humanizeError(e));
     }
-  }, [clarifications, refreshSpecs, selectedSpecName]);
+  }, [clarifications, refreshSpecs, selectedSpecName, showToast]);
 
   const applyClarificationsToRequirements = useCallback(async () => {
     const next = upsertClarificationsSection(artifactContent.requirements ?? '', clarifications);
@@ -377,11 +407,11 @@ export default function App() {
 
   const confirmRequirementsAndGenerateDesign = useCallback(async () => {
     if (!selectedSpecName) return;
-    setError(null);
+    setToast(null);
     setBusyLabel('生成中');
     try {
       if (!areClarificationsComplete(clarifications)) {
-        throw new Error('请先完成所有必填的需求澄清');
+        throw new Error('请先完成所有必填的需求确认');
       }
       await saveClarifications();
       await applyClarificationsToRequirements();
@@ -393,7 +423,7 @@ export default function App() {
       await loadArtifact(selectedSpecName, 'design');
       setActiveArtifact('design');
     } catch (e: any) {
-      setError(String(e?.message || e));
+      showToast(humanizeError(e));
     } finally {
       setBusyLabel(null);
     }
@@ -408,7 +438,7 @@ export default function App() {
 
   const generateTasksFromDesign = useCallback(async () => {
     if (!selectedSpecName) return;
-    setError(null);
+    setToast(null);
     setBusyLabel('生成中');
     try {
       await apiJson(`/specs/${encodeURIComponent(selectedSpecName)}/confirm`, {
@@ -419,7 +449,7 @@ export default function App() {
       await loadArtifact(selectedSpecName, 'tasks');
       setActiveArtifact('tasks');
     } catch (e: any) {
-      setError(String(e?.message || e));
+      showToast(humanizeError(e));
     } finally {
       setBusyLabel(null);
     }
@@ -433,7 +463,7 @@ export default function App() {
 
   const downloadCurrentPng = useCallback(async () => {
     if (!selectedSpecName) return;
-    setError(null);
+    setToast(null);
     setBusyLabel('生成中');
     try {
       const title = `${selectedSpecName} / ${artifactLabel(activeArtifact)}`;
@@ -441,7 +471,7 @@ export default function App() {
       const blob = await renderTextToPng(content, title);
       downloadBlob(`${selectedSpecName}-${activeArtifact}.png`, blob);
     } catch (e: any) {
-      setError(String(e?.message || e));
+      showToast(humanizeError(e));
     } finally {
       setBusyLabel(null);
     }
@@ -449,7 +479,7 @@ export default function App() {
 
   const downloadAllZip = useCallback(async () => {
     if (!selectedSpecName) return;
-    setError(null);
+    setToast(null);
     setBusyLabel('生成中');
     try {
       const zip = new JSZip();
@@ -473,14 +503,14 @@ export default function App() {
       const blob = await zip.generateAsync({ type: 'blob' });
       downloadBlob(`${selectedSpecName}-artifacts.zip`, blob);
     } catch (e: any) {
-      setError(String(e?.message || e));
+      showToast(humanizeError(e));
     } finally {
       setBusyLabel(null);
     }
   }, [artifactContent, selectedSpecName]);
 
   const setModel = useCallback(async (model: string) => {
-    setError(null);
+    setToast(null);
     try {
       const data = await apiJson<LlmInfo>('/llm/model', {
         method: 'POST',
@@ -488,13 +518,13 @@ export default function App() {
       });
       setLlm(data);
     } catch (e: any) {
-      setError(String(e?.message || e));
+      showToast(humanizeError(e));
     }
   }, []);
 
   const saveProvider = useCallback(
     async (providerId: string) => {
-      setError(null);
+      setToast(null);
       try {
         const draft = providerDrafts[providerId] ?? { baseUrl: '', apiKey: '' };
         const payload: any = { providerId, baseUrl: draft.baseUrl };
@@ -511,7 +541,7 @@ export default function App() {
         // Re-ping models after provider update.
         void refreshLlm();
       } catch (e: any) {
-        setError(String(e?.message || e));
+        showToast(humanizeError(e));
       }
     },
     [providerDrafts, refreshLlm],
@@ -539,6 +569,19 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-surface text-slate-100">
+      <div className="border-b border-slate-800 bg-panel px-6 py-3">
+        <div className="mx-auto flex max-w-[1400px] flex-col items-center gap-1 text-center">
+          <div className="text-lg font-semibold text-slate-100 md:text-xl">planA规范驱动V0.1</div>
+          <a
+            className="text-xs text-slate-400 underline underline-offset-4 hover:text-slate-200"
+            href="https://github.com/weituo470/planA/issues"
+            target="_blank"
+            rel="noreferrer"
+          >
+            https://github.com/weituo470/planA/issues（欢迎留言）
+          </a>
+        </div>
+      </div>
       <main className="mx-auto grid max-w-[1400px] grid-cols-12 gap-4 px-6 py-6">
         <section className="col-span-12 space-y-3 rounded-lg border border-slate-800 bg-panel p-4">
           <div className="text-sm font-semibold text-slate-200">原始需求</div>
@@ -588,7 +631,7 @@ export default function App() {
                     return;
                   }
                   if (input !== null) {
-                    setError('密码错误');
+                    showToast('密码错误');
                   }
                 }}
               >
@@ -712,7 +755,11 @@ export default function App() {
                     variant={activeArtifact === a ? 'default' : 'outline'}
                     size="sm"
                     onClick={() => setActiveArtifact(a)}
-                    disabled={!selectedSpecName}
+                    disabled={
+                      !selectedSpecName ||
+                      (a === 'design' && !canOpenDesign) ||
+                      (a === 'tasks' && !canOpenTasks)
+                    }
                   >
                     {artifactLabel(a)}
                   </Button>
@@ -720,16 +767,10 @@ export default function App() {
               </div>
             </div>
 
-            {error && (
-              <div className="mb-3 rounded-md border border-red-800 bg-red-950/40 px-3 py-2 text-sm text-red-200">
-                {error}
-              </div>
-            )}
-
             {selectedSpecName && activeArtifact === 'requirements' && (
               <div className="mb-4 space-y-3 rounded-md border border-slate-800 bg-slate-900/30 p-3">
                 <div className="flex flex-wrap items-center gap-2">
-                  <div className="text-sm font-semibold text-slate-200">需求澄清</div>
+                  <div className="text-sm font-semibold text-slate-200">需求确认</div>
                   <div className="text-xs text-slate-400">
                     {areClarificationsComplete(clarifications) ? '已完成' : '未完成'}
                   </div>
@@ -823,14 +864,6 @@ export default function App() {
 
                 <div className="flex justify-end gap-2 pt-1">
                   <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => void saveClarifications()}
-                    disabled={!selectedSpecName || Boolean(busyLabel)}
-                  >
-                    保存澄清
-                  </Button>
-                  <Button
                     size="sm"
                     onClick={() => void confirmRequirementsAndGenerateDesign()}
                     disabled={!selectedSpecName || Boolean(busyLabel) || !clarifications.length}
@@ -842,14 +875,6 @@ export default function App() {
             )}
 
             <div className="mb-2 flex flex-wrap items-center gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => void saveArtifact(activeArtifact)}
-                disabled={!selectedSpecName || Boolean(busyLabel)}
-              >
-                保存
-              </Button>
               {activeArtifact === 'design' && (
                 <Button
                   size="sm"
@@ -887,10 +912,16 @@ export default function App() {
               className="h-[520px] w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent"
               value={artifactContent[activeArtifact] ?? ''}
               onChange={(e) =>
-                setArtifactContent((prev) => ({
-                  ...prev,
-                  [activeArtifact]: e.target.value,
-                }))
+                setArtifactContent((prev) => {
+                  const next = { ...prev, [activeArtifact]: e.target.value };
+                  if (selectedSpecName) {
+                    if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+                    saveTimerRef.current = window.setTimeout(() => {
+                      void saveArtifact(activeArtifact);
+                    }, 900);
+                  }
+                  return next;
+                })
               }
               disabled={!selectedSpecName}
             />
@@ -914,6 +945,18 @@ export default function App() {
                 </div>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {toast && (
+        <div className="fixed bottom-4 left-1/2 w-[680px] max-w-[92vw] -translate-x-1/2">
+          <div
+            className={`rounded-md border border-slate-700 bg-slate-950 px-4 py-2 text-sm ${
+              toast.tone === 'error' ? 'text-red-300' : 'text-slate-200'
+            }`}
+          >
+            {toast.message}
           </div>
         </div>
       )}
