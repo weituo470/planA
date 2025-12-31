@@ -1,13 +1,17 @@
 ﻿const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const { Server } = require('socket.io');
-const { nanoid } = require('nanoid');
 const chokidar = require('chokidar');
 const { createTwoFilesPatch } = require('diff');
 const pty = require('node-pty');
+
+function nanoid(size = 21) {
+  return crypto.randomBytes(size).toString('base64url').slice(0, size);
+}
 
 const PORT = process.env.WORKFLOW_BRIDGE_PORT || 4100;
 const DATA_DIR = path.join(__dirname, '..', 'data');
@@ -1245,6 +1249,9 @@ async function generateTasksWithModel(design, prompt) {
     throw new Error('LLM config missing');
   }
 
+  const TARGET_MIN_TASKS = 25;
+  const TARGET_MAX_TASKS = 80;
+
   const parseTasksFromAny = (raw) => {
     const text = typeof raw === 'string' ? raw.trim() : '';
     if (!text) return [];
@@ -1262,29 +1269,47 @@ async function generateTasksWithModel(design, prompt) {
     {
       role: 'system',
       content:
-        '你是任务拆解助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
+        '你是资深软件工程师，擅长把设计文档拆解为“commit 级”的可执行任务。只输出 JSON，不要解释，不要包含分析或思考过程。',
     },
     {
       role: 'user',
       content:
         `设计内容如下：\n${design || ''}\n\n补充描述：${prompt}\n\n` +
         '请严格输出 JSON：{"tasks":[...]}。\n' +
-        '要求：所有任务必须为简体中文、可执行、以动词开头；数量 6-12 条。\n' +
+        `要求：\n` +
+        `1) 任务必须是“commit 级”颗粒度：每条任务对应一次可独立提交的变更，尽量可在 15-60 分钟内完成。\n` +
+        `2) 任务必须为简体中文、可执行、以动词开头；数量 ${TARGET_MIN_TASKS}-${TARGET_MAX_TASKS} 条。\n` +
+        `3) 每条任务必须是“单行文本”，并包含以下信息（用中文分号或“｜”分隔均可）：\n` +
+        `   - 目的/产出：本次提交要交付什么\n` +
+        `   - 修改内容：具体改动点\n` +
+        `   - 涉及文件：列出关键文件路径（不确定就写 TBD，不要瞎编大量路径）\n` +
+        `   - 验证方式：至少 1 条可执行的验证方式（例如 npm 脚本、curl、手工检查点）\n` +
+        `4) 任务覆盖面要完整：前后端改动（如有）、异常处理、可观测性（日志/提示）、以及最基本的验证/自测步骤。\n` +
+        `5) 避免“泛泛而谈”的任务，例如“完善功能/优化体验”；必须落到具体改动与产出。\n` +
+        `示例（仅示例格式，不要照抄内容）：\n` +
+        `- 新增登录接口｜修改：新增 /api/login 与校验逻辑｜文件：src/modules/auth/auth.controller.ts、src/modules/auth/auth.service.ts｜验证：curl -X POST ...\n` +
         '不要输出除 JSON 以外的任何内容。',
     },
   ]);
 
   let tasks = parseTasksFromAny(content);
-  if (tasks.length === 0 || tasks.every((t) => !looksLikeChinese(t))) {
+  if (
+    tasks.length === 0 ||
+    tasks.length < TARGET_MIN_TASKS ||
+    tasks.every((t) => !looksLikeChinese(t))
+  ) {
     const repair = await callLlm([
       {
         role: 'system',
-        content: '你是任务拆解助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
+        content:
+          '你是资深软件工程师，擅长把设计文档拆解为“commit 级”的可执行任务。只输出 JSON，不要解释，不要包含分析或思考过程。',
       },
       {
         role: 'user',
         content:
-          '请把下面的任务列表改写为“简体中文、可执行、以动词开头”的任务（6-12 条），并严格输出 JSON：{"tasks":[...]}。\n\n' +
+          `请把下面的任务列表改写/扩展为“简体中文、可执行、commit 级、单行文本”的任务，并严格输出 JSON：{"tasks":[...]}。\n` +
+          `数量要求：${TARGET_MIN_TASKS}-${TARGET_MAX_TASKS} 条。\n` +
+          `每条任务必须包含：目的/产出、修改内容、涉及文件（不确定写 TBD）、验证方式。\n\n` +
           `原始输出：\n${content}\n`,
       },
     ]);
@@ -1293,6 +1318,9 @@ async function generateTasksWithModel(design, prompt) {
 
   if (tasks.length === 0) {
     throw new Error('LLM tasks output invalid');
+  }
+  if (tasks.length < TARGET_MIN_TASKS) {
+    throw new Error(`LLM tasks too few: ${tasks.length} (expected >= ${TARGET_MIN_TASKS})`);
   }
   if (tasks.every((t) => !looksLikeChinese(t))) {
     throw new Error('LLM tasks not in Simplified Chinese');
@@ -1859,6 +1887,7 @@ app.post('/specs/:name/requirements/clarifications', (req, res) => {
 app.post('/specs/:name/confirm', async (req, res) => {
   const specName = sanitizeSpecName(req.params.name);
   const artifact = req.body?.artifact;
+  const force = req.body?.force === true;
   if (!specName || !SPEC_ARTIFACTS.includes(artifact)) {
     return res.status(400).json({ error: 'Invalid spec request' });
   }
@@ -1927,7 +1956,7 @@ app.post('/specs/:name/confirm', async (req, res) => {
     const designContent = fs.existsSync(designPath) ? fs.readFileSync(designPath, 'utf8') : '';
     const tasksPath = resolveSpecFile(specName, 'tasks');
     const shouldGenerate =
-      !fs.existsSync(tasksPath) || fs.readFileSync(tasksPath, 'utf8').trim() === '';
+      force || !fs.existsSync(tasksPath) || fs.readFileSync(tasksPath, 'utf8').trim() === '';
     if (shouldGenerate) {
       try {
         const content = await generateTasksWithModel(designContent, status.prompt);
