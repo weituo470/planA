@@ -1155,19 +1155,47 @@ function buildDesignMarkdown(prompt, payload) {
 
 function buildTasksMarkdown(prompt, payload) {
   const fallbackSummary = normalizePrompt(prompt);
-  const tasks = normalizeLines(payload?.tasks || payload?.items || payload?.todo);
-  const list =
-    tasks.length > 0
-      ? tasks
-      : [
-          '搭建页面基础结构（header/正文/推荐阅读）。',
-          `编写与“${fallbackSummary}”相关的文案内容与排版样式。`,
-          '加入响应式布局与阅读优化（字体/行高/间距）。',
-        ];
   const guide = `## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务清单与执行记录入口。\n- AI IDE 应以此文件为唯一事实来源：逐条勾选任务、补充实现要点与验证结果，保持任务与代码同步。\n- 建议工作流：先完成 tasks.md → 再逐步实现代码 → 每完成一项就在此记录（类似 Kiro 的规范驱动开发）。\n\n## 任务清单`;
-  return `# 任务（tasks）\n\n${guide}\n\n${list
-    .map((item, index) => `- [ ] ${index + 1}. ${item}`)
-    .join('\n')}\n`;
+
+  const rawTasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
+  const tasks = rawTasks
+    .map((t) => (t && typeof t === 'object' ? t : null))
+    .filter(Boolean);
+
+  const fallbackList = [
+    {
+      title: `创建 README 任务说明｜文件：TBD｜验证：阅读并确认理解`,
+      core: '补全任务拆解与执行记录的基本说明。',
+      details: '说明 tasks.md 的用途与使用方式。',
+      ac: '在仓库中可找到并阅读该说明。',
+    },
+    {
+      title: `创建基础结构｜文件：TBD｜验证：启动并能访问页面`,
+      core: `梳理与“${fallbackSummary}”相关的最小可运行骨架。`,
+      details: '包含基本路由/页面/启动脚本。',
+      ac: '本地能启动并访问。',
+    },
+  ];
+
+  const list = tasks.length ? tasks : fallbackList;
+
+  const blocks = list
+    .map((t, idx) => {
+      const title = sanitizeModelText(t.title || t.task || t.name || '', '').trim();
+      const core = sanitizeModelText(t.core || t.logic || t.coreLogic || '', '').trim();
+      const details = sanitizeModelText(t.details || t.tech || t.technical || t.techDetails || '', '').trim();
+      const ac = sanitizeModelText(t.ac || t.acceptance || t.criteria || '', '').trim();
+
+      return [
+        `- [ ] **Task ${idx + 1}**: ${title || 'TBD'}`,
+        `  - **核心逻辑**: ${core || 'TBD'}`,
+        `  - **技术细节**: ${details || 'TBD'}`,
+        `  - **验收准则 (AC)**: ${ac || 'TBD'}`,
+      ].join('\n');
+    })
+    .join('\n\n');
+
+  return `# 任务（tasks）\n\n${guide}\n\n${blocks}\n`;
 }
 
 async function generateRequirementsWithModel(prompt) {
@@ -1249,27 +1277,53 @@ async function generateTasksWithModel(design, prompt) {
     throw new Error('LLM config missing');
   }
 
-  const TARGET_MIN_TASKS = 25;
-  const TARGET_MAX_TASKS = 80;
+  const TARGET_MIN_TASKS = 40;
+  const TARGET_MAX_TASKS = 160;
 
   const parseTasksFromAny = (raw) => {
     const text = typeof raw === 'string' ? raw.trim() : '';
     if (!text) return [];
     const payload = tryParseJson(text);
-    const tasks = normalizeLines(payload?.tasks || payload?.items || payload?.todo);
+    const tasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
     if (tasks.length > 0) return tasks;
-
-    // fallback: extract bullet-ish lines from plain text
-    return extractAcceptanceFromText(text);
+    return [];
   };
 
   const looksLikeChinese = (line) => /[\u4e00-\u9fa5]/.test(String(line || ''));
+
+  const normalizeTaskObject = (t) => {
+    const obj = t && typeof t === 'object' ? t : null;
+    if (!obj) return null;
+    const title = String(obj.title || obj.task || obj.name || '').trim();
+    const core = String(obj.core || obj.logic || obj.coreLogic || '').trim();
+    const details = String(obj.details || obj.tech || obj.technical || obj.techDetails || '').trim();
+    const ac = String(obj.ac || obj.acceptance || obj.criteria || '').trim();
+    return { title, core, details, ac };
+  };
+
+  const validateTasks = (tasks) => {
+    if (!Array.isArray(tasks) || tasks.length < TARGET_MIN_TASKS) return { ok: false, error: 'too_few' };
+    const normalized = tasks.map(normalizeTaskObject).filter(Boolean);
+    if (normalized.length < TARGET_MIN_TASKS) return { ok: false, error: 'invalid_shape' };
+    const hasChinese = normalized.some((t) => looksLikeChinese(t.title + t.core + t.details + t.ac));
+    if (!hasChinese) return { ok: false, error: 'not_zh' };
+
+    // Enforce file-lock style hint in title: should contain a file path-ish token.
+    const hasPathish = normalized.some((t) => /[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/.test(t.title) || /\\/.test(t.title));
+    if (!hasPathish) return { ok: false, error: 'no_paths' };
+
+    // Each entry should have basic fields.
+    const missingFields = normalized.some((t) => !t.title || !t.core || !t.details || !t.ac);
+    if (missingFields) return { ok: false, error: 'missing_fields' };
+
+    return { ok: true, tasks: normalized };
+  };
 
   const content = await callLlm([
     {
       role: 'system',
       content:
-        '你是资深软件工程师，擅长把设计文档拆解为“commit 级”的可执行任务。只输出 JSON，不要解释，不要包含分析或思考过程。',
+        'Role: 硬核工程架构师 (Hardcore Engineering Lead)。你擅长把设计文档拆解为 A计划的“原子级执行指令”。只输出 JSON，不要解释，不要包含分析或思考过程。',
     },
     {
       role: 'user',
@@ -1277,56 +1331,54 @@ async function generateTasksWithModel(design, prompt) {
         `设计内容如下：\n${design || ''}\n\n补充描述：${prompt}\n\n` +
         '请严格输出 JSON：{"tasks":[...]}。\n' +
         `要求：\n` +
-        `1) 任务必须是“commit 级”颗粒度：每条任务对应一次可独立提交的变更，尽量可在 15-60 分钟内完成。\n` +
-        `2) 任务必须为简体中文、可执行、以动词开头；数量 ${TARGET_MIN_TASKS}-${TARGET_MAX_TASKS} 条。\n` +
-        `3) 每条任务必须是“单行文本”，并包含以下信息（用中文分号或“｜”分隔均可）：\n` +
-        `   - 目的/产出：本次提交要交付什么\n` +
-        `   - 修改内容：具体改动点\n` +
-        `   - 涉及文件：列出关键文件路径（不确定就写 TBD，不要瞎编大量路径）\n` +
-        `   - 验证方式：至少 1 条可执行的验证方式（例如 npm 脚本、curl、手工检查点）\n` +
-        `4) 任务覆盖面要完整：前后端改动（如有）、异常处理、可观测性（日志/提示）、以及最基本的验证/自测步骤。\n` +
-        `5) 避免“泛泛而谈”的任务，例如“完善功能/优化体验”；必须落到具体改动与产出。\n` +
-        `示例（仅示例格式，不要照抄内容）：\n` +
-        `- 新增登录接口｜修改：新增 /api/login 与校验逻辑｜文件：src/modules/auth/auth.controller.ts、src/modules/auth/auth.service.ts｜验证：curl -X POST ...\n` +
+        `1) 输出不再是“任务摘要”，而是“原子级执行指令”。严格遵守：定义 Types/Interfaces -> 数据库 Schema -> 基础 Utils/Storage -> UI 静态组件 -> 状态管理 -> 交互逻辑 -> 边界自愈。\n` +
+        `2) 数量：${TARGET_MIN_TASKS}-${TARGET_MAX_TASKS} 条。\n` +
+        `3) [文件锁定]：每个任务 title 必须以“创建/修改/删除 <文件路径>”开头，严禁模糊动词。\n` +
+        `4) [15分钟原则]：单任务保证 AI Agent 15 分钟内可完成；涉及两条以上逻辑分支必须拆分。\n` +
+        `5) [定义先行]：禁止在定义数据结构之前编写业务逻辑。\n` +
+        `6) [禁止自由发挥]：核心逻辑中必须写出函数名/变量名/组件 Prop 名称；涉及样式需写明 CSS 类名或布局方案。\n` +
+        `7) 每个任务必须是一个对象：\n` +
+        `   - title: 字符串，格式："<动作> <文件路径>｜<目的/产出>｜验证：<可执行验证>"\n` +
+        `   - core: 字符串，写清函数签名/步骤/变量名\n` +
+        `   - details: 字符串，写清依赖、API、命令、CSS 类名等\n` +
+        `   - ac: 字符串，写清验收标准（如何证明成功）\n` +
+        `8) 任务必须为简体中文。\n` +
+        `9) 如果某些文件路径不确定，用 TBD 占位，但仍必须以“创建/修改/删除”开头。\n` +
+        `示例（仅格式示例，不要照抄）：\n` +
+        `{ "title": "创建 src/types/note.ts｜产出：Note 类型定义｜验证：tsc 通过", "core": "export interface Note { id: string; ... }", "details": "字段：id/content/...；命名：Note；不引入外部依赖", "ac": "其他模块可 import { Note } 并通过编译" }\n` +
         '不要输出除 JSON 以外的任何内容。',
     },
   ]);
 
   let tasks = parseTasksFromAny(content);
-  if (
-    tasks.length === 0 ||
-    tasks.length < TARGET_MIN_TASKS ||
-    tasks.every((t) => !looksLikeChinese(t))
-  ) {
+  let verdict = validateTasks(tasks);
+  if (!verdict.ok) {
     const repair = await callLlm([
       {
         role: 'system',
         content:
-          '你是资深软件工程师，擅长把设计文档拆解为“commit 级”的可执行任务。只输出 JSON，不要解释，不要包含分析或思考过程。',
+          'Role: 硬核工程架构师 (Hardcore Engineering Lead)。你擅长把设计文档拆解为 A计划的“原子级执行指令”。只输出 JSON，不要解释，不要包含分析或思考过程。',
       },
       {
         role: 'user',
         content:
-          `请把下面的任务列表改写/扩展为“简体中文、可执行、commit 级、单行文本”的任务，并严格输出 JSON：{"tasks":[...]}。\n` +
-          `数量要求：${TARGET_MIN_TASKS}-${TARGET_MAX_TASKS} 条。\n` +
-          `每条任务必须包含：目的/产出、修改内容、涉及文件（不确定写 TBD）、验证方式。\n\n` +
+          `你上一次输出不符合要求（原因：${verdict.error}）。请直接重做并严格输出 JSON：{"tasks":[...]}。\n` +
+          `数量：${TARGET_MIN_TASKS}-${TARGET_MAX_TASKS}。\n` +
+          `每个 tasks[i] 必须是对象：{title, core, details, ac}。\n` +
+          `title 必须以“创建/修改/删除 <文件路径>”开头，并包含“验证：...”。\n` +
+          `core/details/ac 必须是简体中文且具体可执行。\n\n` +
           `原始输出：\n${content}\n`,
       },
     ]);
     tasks = parseTasksFromAny(repair);
+    verdict = validateTasks(tasks);
   }
 
-  if (tasks.length === 0) {
+  if (!verdict.ok) {
     throw new Error('LLM tasks output invalid');
   }
-  if (tasks.length < TARGET_MIN_TASKS) {
-    throw new Error(`LLM tasks too few: ${tasks.length} (expected >= ${TARGET_MIN_TASKS})`);
-  }
-  if (tasks.every((t) => !looksLikeChinese(t))) {
-    throw new Error('LLM tasks not in Simplified Chinese');
-  }
 
-  return buildTasksMarkdown(prompt || design, { tasks });
+  return buildTasksMarkdown(prompt || design, { tasks: verdict.tasks });
 }
 
 function ensureSpecTemplate(name, artifact) {
