@@ -5,7 +5,26 @@ import { Button } from './components/ui/button';
 import type { ClarificationQuestion, LlmInfo, LlmPingResult, SpecArtifact, SpecSummary } from './types';
 
 const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
+const API_TIMEOUT_MS = Number(import.meta.env.VITE_API_TIMEOUT_MS || 90000);
+const TASK_TIMEOUT_MS = Number(import.meta.env.VITE_TASK_TIMEOUT_MS || 180000);
 const DOWNLOAD_PREFIX = 'planA-v0.1';
+
+type TaskView = 'tasks' | 'atomic';
+
+type AtomizeLogEntry = {
+  at: string;
+  message: string;
+};
+
+type AtomizeStatus = {
+  running: boolean;
+  total: number;
+  completed: number;
+  logs: AtomizeLogEntry[];
+  error?: string | null;
+  startedAt?: string | null;
+  updatedAt?: string | null;
+};
 
 function sanitizeFilePart(input: string) {
   return String(input || '')
@@ -143,14 +162,28 @@ function upsertClarificationsSection(markdown: string, questions: ClarificationQ
   return `${text.trimEnd()}\n\n${section}\n`.trimEnd();
 }
 
-async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BRIDGE_URL}${path}`, {
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init?.headers ?? {}),
-    },
-  });
+async function apiJson<T>(path: string, init?: RequestInit, timeoutMsOverride?: number): Promise<T> {
+  const controller = new AbortController();
+  const timeoutMs = Number(timeoutMsOverride ?? API_TIMEOUT_MS);
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  let res: Response;
+  try {
+    res = await fetch(`${BRIDGE_URL}${path}`, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(init?.headers ?? {}),
+      },
+      signal: controller.signal,
+    });
+  } catch (error: any) {
+    if (error?.name === 'AbortError') {
+      throw new Error(`请求超时（${timeoutMs}ms）`);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timer);
+  }
   const text = await res.text();
   let data: any = null;
   try {
@@ -178,6 +211,12 @@ function humanizeError(e: any) {
   if (status === 409 && /clarifications incomplete/i.test(msg)) return '需求确认未完成，请先完成必填项。';
   if (status === 404 && /Spec file not found/i.test(msg)) return '文档尚未生成。';
   if (/Failed to fetch/i.test(msg)) return '无法连接到服务，请检查 bridge 地址/反代配置。';
+  if (/LLM config missing/i.test(msg)) return `模型配置缺失：${msg.replace(/^LLM config missing:\s*/i, '')}`;
+  if (/LLM base_url invalid protocol/i.test(msg)) return `模型地址协议无效：${msg}`;
+  if (/LLM base_url invalid/i.test(msg)) return `模型地址无效：${msg.replace(/^LLM base_url invalid:\s*/i, '')}`;
+  if (/LLM request timeout/i.test(msg)) return `模型请求超时：${msg.replace(/^LLM request timeout\s*after\s*/i, '')}`;
+  if (/LLM request failed/i.test(msg)) return `模型请求失败：${msg.replace(/^LLM request failed:\s*/i, '')}`;
+  if (/LLM response empty/i.test(msg)) return '模型返回为空。';
   return msg;
 }
 
@@ -192,6 +231,23 @@ function isClarificationComplete(q: ClarificationQuestion) {
 
 function areClarificationsComplete(questions: ClarificationQuestion[]) {
   return questions.every(isClarificationComplete);
+}
+
+
+function errorStageLabel(stage?: string | null) {
+  if (!stage) return '未知阶段';
+  if (stage === 'requirements') return '需求生成';
+  if (stage === 'design') return '设计生成';
+  if (stage === 'tasks') return '任务生成';
+  if (stage === 'atomize') return '任务原子化';
+  return stage;
+}
+
+function formatErrorTime(value?: string | null) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
 }
 
 function artifactLabel(a: SpecArtifact) {
@@ -210,6 +266,9 @@ export default function App() {
     design: '',
     tasks: '',
   });
+  const [taskView, setTaskView] = useState<TaskView>('tasks');
+  const [tasksAtomicContent, setTasksAtomicContent] = useState('');
+  const [atomizeStatus, setAtomizeStatus] = useState<AtomizeStatus | null>(null);
   const baselineContentRef = useRef<Record<SpecArtifact, string>>({
     requirements: '',
     design: '',
@@ -235,7 +294,7 @@ export default function App() {
   const [modelPing, setModelPing] = useState<
     Record<
       string,
-      { status: 'pending' | 'ok' | 'error' | 'unsupported'; latencyMs?: number; error?: string }
+      { status: 'pending' | 'ok' | 'error' | 'unstable' | 'unsupported'; latencyMs?: number; error?: string }
     >
   >({});
   const [showLlmConfig, setShowLlmConfig] = useState(false);
@@ -261,6 +320,7 @@ export default function App() {
   );
   const canOpenDesign = Boolean(selectedSpecName && (selectedSpec?.files?.design || selectedSpec?.status?.requirementsConfirmed));
   const canOpenTasks = Boolean(selectedSpecName && (selectedSpec?.files?.tasks || selectedSpec?.status?.designConfirmed));
+  const lastError = selectedSpec?.status?.lastError ?? null;
 
   const refreshSpecs = useCallback(async () => {
     const data = await apiJson<{ specs: SpecSummary[] }>('/specs');
@@ -297,9 +357,11 @@ export default function App() {
                 [opt.id]: { status: 'ok', latencyMs: result.latencyMs ?? 0 },
               }));
             } else {
+              const errorText = String(result.error || '');
+              const isConfigError = /Missing baseUrl|apiKey|LLM config missing|base_url invalid|Unsupported model/i.test(errorText);
               setModelPing((prev) => ({
                 ...prev,
-                [opt.id]: { status: 'error', error: result.error || '错误' },
+                [opt.id]: { status: isConfigError ? 'error' : 'unstable', error: result.error || '错误' },
               }));
             }
           } catch (e: any) {
@@ -312,7 +374,7 @@ export default function App() {
             }
             setModelPing((prev) => ({
               ...prev,
-              [opt.id]: { status: 'error', error: String(e?.message || e) },
+              [opt.id]: { status: 'unstable', error: String(e?.message || e) },
             }));
           }
         }),
@@ -351,6 +413,30 @@ export default function App() {
     },
     [],
   );
+
+  const loadTasksAtomic = useCallback(async (specName: string) => {
+    try {
+      const data = await apiJson<{ content: string }>(
+        `/specs/${encodeURIComponent(specName)}/tasks_atomic`,
+      );
+      setTasksAtomicContent(data.content ?? '');
+    } catch (e: any) {
+      const message = String(e?.message || e);
+      if (e?.status === 404 && /Spec file not found/i.test(message)) {
+        setTasksAtomicContent('');
+        return;
+      }
+      throw e;
+    }
+  }, []);
+
+  const fetchAtomizeStatus = useCallback(async (specName: string) => {
+    const data = await apiJson<AtomizeStatus>(
+      `/specs/${encodeURIComponent(specName)}/tasks/atomize`,
+    );
+    setAtomizeStatus(data);
+    return data;
+  }, []);
 
   useEffect(() => {
     void refreshSpecs().catch((e) => showToast(humanizeError(e)));
@@ -395,6 +481,34 @@ export default function App() {
     void loadArtifact(selectedSpecName, activeArtifact).catch((e) => showToast(humanizeError(e)));
   }, [activeArtifact, canOpenDesign, canOpenTasks, loadArtifact, selectedSpecName]);
 
+  useEffect(() => {
+    if (!selectedSpecName) return;
+    void fetchAtomizeStatus(selectedSpecName).catch((e) => showToast(humanizeError(e)));
+  }, [fetchAtomizeStatus, selectedSpecName, showToast]);
+
+  useEffect(() => {
+    if (!selectedSpecName) return;
+    if (activeArtifact !== 'tasks' || taskView !== 'atomic') return;
+    void loadTasksAtomic(selectedSpecName).catch((e) => showToast(humanizeError(e)));
+  }, [activeArtifact, loadTasksAtomic, selectedSpecName, showToast, taskView]);
+
+  useEffect(() => {
+    if (!selectedSpecName) return;
+    if (!atomizeStatus?.running) return;
+    const timer = window.setInterval(() => {
+      void fetchAtomizeStatus(selectedSpecName).catch((e) => showToast(humanizeError(e)));
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [atomizeStatus?.running, fetchAtomizeStatus, selectedSpecName, showToast]);
+
+  useEffect(() => {
+    if (!selectedSpecName) return;
+    if (atomizeStatus?.running) return;
+    if (activeArtifact === 'tasks' && taskView === 'atomic') {
+      void loadTasksAtomic(selectedSpecName).catch((e) => showToast(humanizeError(e)));
+    }
+  }, [activeArtifact, atomizeStatus?.running, loadTasksAtomic, selectedSpecName, showToast, taskView]);
+
   const createSpec = useCallback(async () => {
     setToast(null);
     setBusyLabel('生成中');
@@ -409,6 +523,13 @@ export default function App() {
       await loadArtifact(data.name, 'requirements');
     } catch (e: any) {
       showToast(humanizeError(e));
+      await refreshSpecs();
+      const message = String(e?.message || e || '');
+      if (message.includes('请求超时')) {
+        window.setTimeout(() => {
+          void refreshSpecs().catch(() => null);
+        }, 6000);
+      }
     } finally {
       setBusyLabel(null);
     }
@@ -472,6 +593,7 @@ export default function App() {
       setActiveArtifact('design');
     } catch (e: any) {
       showToast(humanizeError(e));
+      await refreshSpecs();
     } finally {
       setBusyLabel(null);
     }
@@ -497,40 +619,71 @@ export default function App() {
       await apiJson(`/specs/${encodeURIComponent(selectedSpecName)}/confirm`, {
         method: 'POST',
         body: JSON.stringify({ artifact: 'design', force: true }),
-      });
+      }, TASK_TIMEOUT_MS);
       await refreshSpecs();
       await loadArtifact(selectedSpecName, 'tasks');
       setActiveArtifact('tasks');
+      setTaskView('tasks');
     } catch (e: any) {
       showToast(humanizeError(e));
+      await refreshSpecs();
+      const message = String(e?.message || e || '');
+      if (message.includes('请求超时')) {
+        window.setTimeout(() => {
+          void refreshSpecs().catch(() => null);
+        }, 6000);
+      }
     } finally {
       setBusyLabel(null);
     }
   }, [loadArtifact, refreshSpecs, selectedSpec, selectedSpecName]);
 
+  const startAtomizeTasks = useCallback(async () => {
+    if (!selectedSpecName) return;
+    setToast(null);
+    try {
+      const data = await apiJson<AtomizeStatus>(
+        `/specs/${encodeURIComponent(selectedSpecName)}/tasks/atomize`,
+        { method: 'POST' },
+      );
+      setAtomizeStatus(data);
+    } catch (e: any) {
+      showToast(humanizeError(e));
+    }
+  }, [selectedSpecName, showToast]);
+
   const downloadCurrentMd = useCallback(() => {
     if (!selectedSpecName) return;
-    const content = artifactContent[activeArtifact] ?? '';
+    const isAtomicView = activeArtifact === 'tasks' && taskView === 'atomic';
+    const displayArtifact = isAtomicView ? 'tasks_atomic' : activeArtifact;
+    const content = isAtomicView
+      ? tasksAtomicContent
+      : artifactContent[activeArtifact] ?? '';
     const base = makeDownloadBaseName(selectedSpecName);
-    downloadMarkdown(`${base}_${activeArtifact}.md`, content);
-  }, [activeArtifact, artifactContent, selectedSpecName]);
+    downloadMarkdown(`${base}_${displayArtifact}.md`, content);
+  }, [activeArtifact, artifactContent, selectedSpecName, taskView, tasksAtomicContent]);
 
   const downloadCurrentPng = useCallback(async () => {
     if (!selectedSpecName) return;
     setToast(null);
     setBusyLabel('生成中');
     try {
-      const title = `${selectedSpecName} / ${artifactLabel(activeArtifact)}`;
-      const content = artifactContent[activeArtifact] ?? '';
+      const isAtomicView = activeArtifact === 'tasks' && taskView === 'atomic';
+      const displayArtifact = isAtomicView ? 'tasks_atomic' : activeArtifact;
+      const label = isAtomicView ? '任务原子化' : artifactLabel(activeArtifact);
+      const title = `${selectedSpecName} / ${label}`;
+      const content = isAtomicView
+        ? tasksAtomicContent
+        : artifactContent[activeArtifact] ?? '';
       const blob = await renderTextToPng(content, title);
       const base = makeDownloadBaseName(selectedSpecName);
-      downloadBlob(`${base}_${activeArtifact}.png`, blob);
+      downloadBlob(`${base}_${displayArtifact}.png`, blob);
     } catch (e: any) {
       showToast(humanizeError(e));
     } finally {
       setBusyLabel(null);
     }
-  }, [activeArtifact, artifactContent, selectedSpecName]);
+  }, [activeArtifact, artifactContent, selectedSpecName, taskView, tasksAtomicContent]);
 
   const downloadAllZip = useCallback(async () => {
     if (!selectedSpecName) return;
@@ -545,7 +698,7 @@ export default function App() {
         [
           'planA 规范驱动开发 - 文档使用说明',
           '',
-          '本压缩包包含 3 份核心文档（requirements/design/tasks），用于在 AI IDE 中执行类似 Kiro 的“规范驱动开发（Spec-Driven Development）”。',
+          '本压缩包包含 4 份核心文档（requirements/design/tasks/tasks_atomic），用于在 AI IDE 中执行类似 Kiro 的“规范驱动开发（Spec-Driven Development）”。',
           '',
           '1) requirements.md（需求）',
           '- 用途：产品/业务需求的唯一事实来源（Source of Truth）。',
@@ -562,11 +715,16 @@ export default function App() {
           '  b) 每完成一项就勾选（- [x]）并在任务下补充“实现说明/变更文件/验证结果”；',
           '  c) 如发现遗漏，先更新 tasks.md 再写代码，保持任务与代码同步。',
           '',
+          '4) tasks_atomic.md（任务原子化）',
+          '- 用途：基于 tasks.md 自动拆解的原子任务列表，适合精细执行与逐条验收。',
+          '- 建议：当 tasks.md 过于粗略时，先生成 tasks_atomic.md，再要求 AI IDE 按原子任务逐条实现。',
+          '',
           '推荐流程（类似 Kiro）：',
           '1. 写原始需求 → 生成 requirements',
           '2. 完成“需求确认” → 生成 design',
           '3. 从 design 生成 tasks',
-          '4. 将 requirements/design/tasks 提供给你的 AI 编程工具/IDE，要求它：',
+          '4. 需要更细粒度时，生成 tasks_atomic',
+          '5. 将 requirements/design/tasks/tasks_atomic 提供给你的 AI 编程工具/IDE，要求它：',
           '   - 以 requirements/design 作为约束与上下文',
           '   - 以 tasks.md 作为执行计划与完成记录',
           '   - 只在 tasks.md 明确的范围内改代码，并持续回写 tasks.md',
@@ -591,6 +749,20 @@ export default function App() {
         folder.file(`${a}.md`, content);
         const png = await renderTextToPng(content, title);
         folder.file(`${a}.png`, png);
+      }
+      try {
+        const latest = await apiJson<{ content: string }>(
+          `/specs/${encodeURIComponent(selectedSpecName)}/tasks_atomic`,
+        );
+        const atomicContent = latest.content ?? '';
+        if (atomicContent.trim()) {
+          folder.file('tasks_atomic.md', atomicContent);
+          const atomicTitle = `${selectedSpecName} / 任务原子化`;
+          const png = await renderTextToPng(atomicContent, atomicTitle);
+          folder.file('tasks_atomic.png', png);
+        }
+      } catch {
+        // Ignore missing atomic tasks
       }
       const blob = await zip.generateAsync({ type: 'blob' });
       downloadBlob(`${base}_all.zip`, blob);
@@ -718,6 +890,7 @@ export default function App() {
       if (!ping || ping.status === 'unsupported') return base;
       if (ping.status === 'pending') return `${base} · ...`;
       if (ping.status === 'ok') return `${base} · ${Math.max(0, Math.round(ping.latencyMs ?? 0))}ms`;
+      if (ping.status === 'unstable') return `${base} · 不稳定`;
       return `${base} · 错误`;
     },
     [modelPing, normalizeModelLabel],
@@ -725,6 +898,10 @@ export default function App() {
 
   const activeModelId = llm?.model ?? '';
   const activePing = activeModelId ? modelPing[activeModelId] : null;
+  const isAtomicView = activeArtifact === 'tasks' && taskView === 'atomic';
+  const displayContent = isAtomicView
+    ? tasksAtomicContent
+    : artifactContent[activeArtifact] ?? '';
 
   return (
     <div className="min-h-screen bg-surface text-slate-100">
@@ -803,14 +980,18 @@ export default function App() {
                       ? 'text-xs text-green-400'
                       : activePing.status === 'error'
                         ? 'text-xs text-red-400'
-                        : 'text-xs text-slate-400'
+                        : activePing.status === 'unstable'
+                          ? 'text-xs text-amber-400'
+                          : 'text-xs text-slate-400'
                   }
                 >
                   {activePing.status === 'pending'
                     ? '检测中…'
                     : activePing.status === 'ok'
                       ? `连接 ${Math.max(0, Math.round(activePing.latencyMs ?? 0))}ms`
-                      : '连接错误'}
+                      : activePing.status === 'unstable'
+                        ? '连接不稳定'
+                        : '连接错误'}
                 </span>
               )}
             </div>
@@ -826,13 +1007,17 @@ export default function App() {
                   ? '…'
                   : ping.status === 'ok'
                     ? `${Math.max(0, Math.round(ping.latencyMs ?? 0))}ms`
-                    : '错误';
+                    : ping.status === 'unstable'
+                      ? '不稳定'
+                      : '错误';
               const color =
                 ping.status === 'ok'
                   ? 'text-green-400'
                   : ping.status === 'error'
                     ? 'text-red-400'
-                    : 'text-slate-400';
+                    : ping.status === 'unstable'
+                      ? 'text-amber-400'
+                      : 'text-slate-400';
               return (
                 <span key={opt.id} className="text-slate-400">
                   {label}{' '}
@@ -925,6 +1110,27 @@ export default function App() {
                 ))}
               </div>
             </div>
+
+
+            {lastError && (
+              <div className="mb-3 rounded-md border border-red-800/40 bg-red-950/40 p-3 text-xs text-red-200">
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="font-semibold">最近错误</div>
+                  <div className="text-red-300">{errorStageLabel(lastError.stage)}</div>
+                  <div className="ml-auto text-red-300">{formatErrorTime(lastError.at)}</div>
+                </div>
+                <div className="mt-1">原因：{lastError.message}</div>
+                {(lastError.context?.baseUrl || lastError.context?.model) && (
+                  <div className="mt-1 text-red-300">
+                    {lastError.context?.model ? `模型：${lastError.context.model}` : '模型：未设置'}
+                    {lastError.context?.baseUrl ? ` · 地址：${lastError.context.baseUrl}` : ''}
+                  </div>
+                )}
+                {lastError.timeoutMs ? (
+                  <div className="mt-1 text-red-300">超时阈值：{lastError.timeoutMs}ms</div>
+                ) : null}
+              </div>
+            )}
 
             {selectedSpecName && activeArtifact === 'requirements' && (
               <div className="mb-4 space-y-3 rounded-md border border-slate-800 bg-slate-900/30 p-3">
@@ -1049,13 +1255,45 @@ export default function App() {
                 </Button>
               )}
               {activeArtifact === 'tasks' && (
-                <Button
-                  size="sm"
-                  onClick={() => void downloadAllZip()}
-                  disabled={!selectedSpecName || Boolean(busyLabel)}
-                >
-                  一键下载（ZIP）
-                </Button>
+                <>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      variant={taskView === 'tasks' ? 'default' : 'outline'}
+                      size="sm"
+                      onClick={() => setTaskView('tasks')}
+                      disabled={!selectedSpecName}
+                    >
+                      任务
+                    </Button>
+                    <Button
+                      variant={taskView === 'atomic' ? 'default' : 'outline'}
+                      size="sm"
+                      onClick={() => setTaskView('atomic')}
+                      disabled={!selectedSpecName}
+                    >
+                      原子任务
+                    </Button>
+                    <Button
+                      size="sm"
+                      onClick={() => void startAtomizeTasks()}
+                      disabled={
+                        !selectedSpecName ||
+                        Boolean(busyLabel) ||
+                        !artifactContent.tasks.trim() ||
+                        atomizeStatus?.running
+                      }
+                    >
+                      {atomizeStatus?.running ? '原子化中' : '开始原子化'}
+                    </Button>
+                  </div>
+                  <Button
+                    size="sm"
+                    onClick={() => void downloadAllZip()}
+                    disabled={!selectedSpecName || Boolean(busyLabel)}
+                  >
+                    一键下载（ZIP）
+                  </Button>
+                </>
               )}
               <div className="ml-auto flex flex-wrap items-center gap-2">
                 <Button variant="outline" size="sm" onClick={downloadCurrentMd} disabled={!selectedSpecName}>
@@ -1072,6 +1310,36 @@ export default function App() {
               </div>
             </div>
 
+            {activeArtifact === 'tasks' && (
+              <div className="mb-3 rounded-md border border-slate-800 bg-slate-950/40 p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="text-sm font-semibold text-slate-200">原子化日志</div>
+                  <div className="text-xs text-slate-400">
+                    {atomizeStatus?.running ? '进行中' : '未运行'}
+                  </div>
+                  <div className="ml-auto text-xs text-slate-400">
+                    {atomizeStatus?.total
+                      ? `完成 ${atomizeStatus.completed}/${atomizeStatus.total}`
+                      : '完成 0/0'}
+                  </div>
+                </div>
+                <div className="mt-2 h-32 overflow-auto rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-300">
+                  {atomizeStatus?.logs?.length ? (
+                    atomizeStatus.logs.map((entry, idx) => (
+                      <div key={`${entry.at}-${idx}`}>{entry.message}</div>
+                    ))
+                  ) : (
+                    <div className="text-slate-400">暂无日志</div>
+                  )}
+                </div>
+                {atomizeStatus?.error && (
+                  <div className="mt-2 text-xs text-red-300">
+                    失败：{atomizeStatus.error}
+                  </div>
+                )}
+              </div>
+            )}
+
             <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-slate-400">
               <div>可按需编辑内容</div>
               <div className="ml-auto flex flex-wrap items-center gap-2">
@@ -1079,7 +1347,11 @@ export default function App() {
                   variant="outline"
                   size="sm"
                   onClick={undoEdit}
-                  disabled={!selectedSpecName || historyState[activeArtifact].undo === 0}
+                  disabled={
+                    !selectedSpecName ||
+                    isAtomicView ||
+                    historyState[activeArtifact].undo === 0
+                  }
                 >
                   撤销
                 </Button>
@@ -1087,7 +1359,11 @@ export default function App() {
                   variant="outline"
                   size="sm"
                   onClick={redoEdit}
-                  disabled={!selectedSpecName || historyState[activeArtifact].redo === 0}
+                  disabled={
+                    !selectedSpecName ||
+                    isAtomicView ||
+                    historyState[activeArtifact].redo === 0
+                  }
                 >
                   还原
                 </Button>
@@ -1095,7 +1371,7 @@ export default function App() {
                   variant="outline"
                   size="sm"
                   onClick={resetToBaseline}
-                  disabled={!selectedSpecName}
+                  disabled={!selectedSpecName || isAtomicView}
                 >
                   回到初始
                 </Button>
@@ -1104,9 +1380,10 @@ export default function App() {
 
             <textarea
               className="h-[520px] w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent"
-              value={artifactContent[activeArtifact] ?? ''}
+              value={displayContent}
               onChange={(e) =>
                 setArtifactContent((prev) => {
+                  if (isAtomicView) return prev;
                   const nextValue = e.target.value;
                   const currentValue = prev[activeArtifact] ?? '';
                   const next = { ...prev, [activeArtifact]: nextValue };
@@ -1136,6 +1413,7 @@ export default function App() {
                 })
               }
               disabled={!selectedSpecName}
+              readOnly={isAtomicView}
             />
           </div>
         </section>

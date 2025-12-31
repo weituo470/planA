@@ -46,13 +46,16 @@ const state = {
   logs: [],
 };
 
+const atomizeJobs = new Map();
+
 const fileSnapshots = new Map();
 let isPaused = false;
-const SPEC_ARTIFACTS = ['requirements', 'design', 'tasks'];
+const SPEC_ARTIFACTS = ['requirements', 'design', 'tasks', 'tasks_atomic'];
 const SPEC_TEMPLATES = {
   requirements: `# 需求（requirements）\n\n## 背景\n\n## 用户故事\n\n## 验收标准（EARS）\n- 当[条件/事件]时，系统应[期望行为]。\n`,
   design: `# 设计（design）\n\n## 架构概览\n\n## 关键流程/时序\n\n## 实现考虑\n`,
   tasks: `# 任务（tasks）\n\n## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务清单与执行记录入口。\n- AI IDE 应以此文件为唯一事实来源：逐条勾选任务、补充实现要点与验证结果，保持任务与代码同步。\n- 建议工作流：先完成 tasks.md → 再逐步实现代码 → 每完成一项就在此记录（类似 Kiro 的规范驱动开发）。\n\n## 任务清单\n\n- [ ] 1. \n- [ ] 2. \n- [ ] 3. \n`,
+  tasks_atomic: `# 任务原子化（tasks_atomic）\n\n## 使用说明\n- 本文件由 tasks.md 原子化拆解生成，任务粒度更细，适合 AI IDE 逐条执行。\n- 原子化过程会按条追加写入，若中断可再次“开始原子化”继续。\n\n## 原子任务清单\n\n- [ ] 1. \n- [ ] 2. \n- [ ] 3. \n`,
 };
 const DEFAULT_SPEC_STATUS = {
   requirementsConfirmed: false,
@@ -70,6 +73,7 @@ const DEFAULT_SPEC_STATUS = {
     updatedAt: null,
     confirmedAt: null,
   },
+  lastError: null,
 };
 
 const LLM_PROVIDERS = [
@@ -220,15 +224,74 @@ function hasLlmConfig() {
   return Boolean(baseUrl && apiKey && model);
 }
 
+
+function describeLlmConfig(config) {
+  return {
+    baseUrl: String(config?.baseUrl || ''),
+    model: String(config?.model || ''),
+    providerId: String(config?.providerId || ''),
+    responseFormat: String(config?.responseFormat || ''),
+  };
+}
+
+function assertValidLlmConfig(config) {
+  const missing = [];
+  if (!config?.baseUrl) missing.push('base_url');
+  if (!config?.apiKey) missing.push('api_key');
+  if (!config?.model) missing.push('model');
+  if (missing.length) {
+    const err = new Error(`LLM config missing: ${missing.join(', ')}`);
+    err.llmContext = describeLlmConfig(config);
+    throw err;
+  }
+  let parsed;
+  try {
+    parsed = new URL(String(config.baseUrl));
+  } catch (error) {
+    const err = new Error(`LLM base_url invalid: ${String(config.baseUrl)}`);
+    err.llmContext = describeLlmConfig(config);
+    throw err;
+  }
+  if (!/^https?:$/.test(parsed.protocol)) {
+    const err = new Error(`LLM base_url invalid protocol: ${parsed.protocol}`);
+    err.llmContext = describeLlmConfig(config);
+    throw err;
+  }
+}
+
+function recordSpecError(status, stage, error, extra = null) {
+  const now = new Date().toISOString();
+  const message = error?.message || String(error || '');
+  status.lastError = {
+    stage,
+    message,
+    at: now,
+    context: error?.llmContext || null,
+    ...(extra || {}),
+  };
+}
+
 async function callLlm(messages, overrideConfig = null) {
-  const { baseUrl, apiKey, model, responseFormat } = overrideConfig || getActiveLlmConfig();
-  const timeoutMsOverride = Number(overrideConfig?.timeoutMs || 0) || null;
+  const activeConfig = getActiveLlmConfig();
+  const mergedConfig = overrideConfig ? { ...activeConfig, ...overrideConfig } : activeConfig;
+  const { baseUrl, apiKey, model, responseFormat, providerId } = mergedConfig;
+  assertValidLlmConfig(mergedConfig);
+  const llmContext = describeLlmConfig(mergedConfig);
+  const timeoutMsOverride = Number(mergedConfig?.timeoutMs || 0) || null;
 
   const tryOnce = async (rootUrl) => {
     const url = `${String(rootUrl || '').replace(/\/$/, '')}/chat/completions`;
     const controller = new AbortController();
     const timeoutMs = timeoutMsOverride || Number(process.env.LLM_TIMEOUT_MS || 60000);
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let hardTimer = null;
+    const hardTimeout = new Promise((_, reject) => {
+      hardTimer = setTimeout(() => {
+        controller.abort();
+        const err = new Error(`LLM request timeout after ${timeoutMs}ms`);
+        err.llmContext = llmContext;
+        reject(err);
+      }, timeoutMs);
+    });
     const body = {
       model,
       temperature: 0.3,
@@ -238,7 +301,7 @@ async function callLlm(messages, overrideConfig = null) {
       body.response_format = { type: responseFormat };
     }
 
-    try {
+    const requestPromise = (async () => {
       const response = await fetch(url, {
         method: 'POST',
         headers: {
@@ -251,21 +314,31 @@ async function callLlm(messages, overrideConfig = null) {
       if (!response.ok) {
         const text = await response.text();
         const message = text ? `${response.status}: ${text}` : `${response.status}`;
-        throw new Error(`LLM request failed: ${message}`);
+        const err = new Error(`LLM request failed: ${message}`);
+        err.llmContext = llmContext;
+        throw err;
       }
       const data = await response.json();
       const content = data?.choices?.[0]?.message?.content;
       if (!content || typeof content !== 'string') {
-        throw new Error('LLM response empty');
+        const err = new Error('LLM response empty');
+        err.llmContext = llmContext;
+        throw err;
       }
       return content.trim();
+    })();
+
+    try {
+      return await Promise.race([requestPromise, hardTimeout]);
     } catch (error) {
       if (error?.name === 'AbortError') {
-        throw new Error(`LLM request timeout after ${timeoutMs}ms`);
+        const err = new Error(`LLM request timeout after ${timeoutMs}ms`);
+        err.llmContext = llmContext;
+        throw err;
       }
       throw error;
     } finally {
-      clearTimeout(timer);
+      if (hardTimer) clearTimeout(hardTimer);
     }
   };
 
@@ -292,7 +365,7 @@ async function callLlm(messages, overrideConfig = null) {
   try {
     return await withV1Fallback();
   } catch (error) {
-    console.error('LLM call failed:', error?.message || error);
+    console.error('LLM call failed:', error?.message || error, error?.llmContext || llmContext);
     throw error;
   }
 }
@@ -873,7 +946,7 @@ function buildDefaultClarificationQuestions(prompt) {
 }
 
 async function generateClarificationsWithModel(prompt) {
-  if (!hasLlmConfig()) throw new Error('LLM config missing');
+  assertValidLlmConfig(getActiveLlmConfig());
 
   const isBadQuestionText = (text) => {
     if (!text || typeof text !== 'string') return true;
@@ -981,7 +1054,7 @@ function generateTasksContent(design, prompt) {
   if (!summary) {
     return SPEC_TEMPLATES.tasks;
   }
-  return `# 任务（tasks）\n\n- [ ] 1. 搭建页面基础结构（header/正文/推荐阅读）。\n- [ ] 2. 编写与“${summary}”相关的文案内容与排版样式。\n- [ ] 3. 加入响应式布局与阅读优化（字体/行高/间距）。\n`;
+  return `# 任务（tasks）\n\n## 任务清单\n- [ ] 1. 梳理“${summary}”的模块清单与页面/服务边界。\n- [ ] 2. 明确最小可运行结构（入口、路由/页面、核心依赖）。\n- [ ] 3. 拆分关键流程并标注对应代码落点。\n- [ ] 4. 明确数据结构/接口草案（字段、命名、约束）。\n- [ ] 5. 记录需要的环境变量/配置项。\n- [ ] 6. 列出需要补齐的边界与异常场景。\n`;
 }
 
 function tryParseJson(text) {
@@ -1199,7 +1272,7 @@ function buildTasksMarkdown(prompt, payload) {
 }
 
 async function generateRequirementsWithModel(prompt) {
-  if (!hasLlmConfig()) throw new Error('LLM config missing');
+  assertValidLlmConfig(getActiveLlmConfig());
 
   const content = await callLlm([
     {
@@ -1249,7 +1322,7 @@ function resolveDesignPrompt(prompt, requirements) {
 }
 
 async function generateDesignWithModel(requirements, prompt) {
-  if (!hasLlmConfig()) throw new Error('LLM config missing');
+  assertValidLlmConfig(getActiveLlmConfig());
 
   const content = await callLlm([
     {
@@ -1272,13 +1345,431 @@ async function generateDesignWithModel(requirements, prompt) {
   return buildDesignMarkdown(designPrompt, payload);
 }
 
-async function generateTasksWithModel(design, prompt) {
-  if (!hasLlmConfig()) {
-    throw new Error('LLM config missing');
+function looksLikeChinese(text) {
+  return /[\u4e00-\u9fa5]/.test(String(text || ''));
+}
+
+function normalizeTaskObject(task) {
+  const obj = task && typeof task === 'object' ? task : null;
+  if (!obj) return null;
+  const title = String(obj.title || obj.task || obj.name || '').trim();
+  const core = String(obj.core || obj.logic || obj.coreLogic || '').trim();
+  const details = String(obj.details || obj.tech || obj.technical || obj.techDetails || '').trim();
+  const ac = String(obj.ac || obj.acceptance || obj.criteria || '').trim();
+  return { title, core, details, ac };
+}
+
+function truncateText(text, maxLen = 1600) {
+  if (!text) return '';
+  const value = String(text).trim();
+  if (value.length <= maxLen) return value;
+  return `${value.slice(0, maxLen)}…`;
+}
+
+function parseTaskSummaries(markdown) {
+  const lines = normalizeLineEndings(markdown || '').split('\n');
+  const summaries = [];
+  for (const line of lines) {
+    const match = line.match(/^- \[[ xX]\]\s*(.+)$/);
+    if (!match) continue;
+    let text = match[1].trim();
+    text = text.replace(/^\*\*Task\s*\d+\*\*:\s*/i, '');
+    text = text.replace(/^\d+\.\s*/, '');
+    if (text) summaries.push(text);
   }
+  return summaries;
+}
+
+function buildTasksAtomicHeader() {
+  const template = SPEC_TEMPLATES.tasks_atomic || '# 任务原子化（tasks_atomic）';
+  const lines = normalizeLineEndings(template).split('\n');
+  return lines
+    .filter((line) => !/^- \[ \]/.test(line))
+    .join('\n')
+    .trimEnd();
+}
+
+function parseAtomicDoneIndices(markdown) {
+  const done = new Set();
+  const text = normalizeLineEndings(markdown || '');
+  const regex = /^###\s*原始任务\s*(\d+)\s*:/gm;
+  let match;
+  while ((match = regex.exec(text))) {
+    const value = Number.parseInt(match[1], 10);
+    if (!Number.isNaN(value)) done.add(value);
+  }
+  return done;
+}
+
+function formatAtomicTaskBlock(indexLabel, task) {
+  const title = sanitizeModelText(task.title || task.task || task.name || '', 'TBD').trim();
+  const core = sanitizeModelText(task.core || task.logic || '', 'TBD').trim();
+  const details = sanitizeModelText(task.details || task.tech || '', 'TBD').trim();
+  const ac = sanitizeModelText(task.ac || task.acceptance || task.criteria || '', 'TBD').trim();
+  return [
+    `- [ ] **Task ${indexLabel}**: ${title || 'TBD'}`,
+    `  - **核心逻辑**: ${core || 'TBD'}`,
+    `  - **技术细节**: ${details || 'TBD'}`,
+    `  - **验收准则 (AC)**: ${ac || 'TBD'}`,
+  ].join('\n');
+}
+
+function buildAtomicSection(originalIndex, summary, tasks) {
+  const title = sanitizeModelText(summary, 'TBD');
+  const blocks = tasks
+    .map((task, idx) => formatAtomicTaskBlock(`${originalIndex}.${idx + 1}`, task))
+    .join('\n\n');
+  return `### 原始任务 ${originalIndex}: ${title || 'TBD'}\n\n${blocks}`;
+}
+
+function ensureAtomicFile(specName) {
+  const filePath = resolveSpecFile(specName, 'tasks_atomic');
+  if (!fs.existsSync(filePath)) {
+    const header = buildTasksAtomicHeader();
+    writeSpecFile(specName, 'tasks_atomic', `${header}\n`);
+    return filePath;
+  }
+  const existing = fs.readFileSync(filePath, 'utf8');
+  if (!existing.trim()) {
+    const header = buildTasksAtomicHeader();
+    fs.writeFileSync(filePath, `${header}\n`, 'utf8');
+  }
+  return filePath;
+}
+
+function validateAtomicTasks(tasks) {
+  if (!Array.isArray(tasks) || tasks.length === 0) return { ok: false, error: 'empty' };
+  const normalized = tasks.map(normalizeTaskObject).filter(Boolean);
+  if (!normalized.length) return { ok: false, error: 'invalid_shape' };
+  const missingFields = normalized.some((t) => !t.title || !t.core || !t.details || !t.ac);
+  if (missingFields) return { ok: false, error: 'missing_fields' };
+  const notChinese = normalized.some((t) => !looksLikeChinese(t.title + t.core + t.details + t.ac));
+  if (notChinese) return { ok: false, error: 'not_zh' };
+  const invalidAction = normalized.some((t) => !/^(创建|修改|删除)\s+\S+/.test(t.title));
+  if (invalidAction) return { ok: false, error: 'invalid_action' };
+  const invalidPath = normalized.some(
+    (t) =>
+      !(
+        /(TBD|待定)/i.test(t.title) ||
+        /[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/.test(t.title) ||
+        /\\/.test(t.title)
+      ),
+  );
+  if (invalidPath) return { ok: false, error: 'no_paths' };
+  return { ok: true, tasks: normalized };
+}
+
+
+function coerceAtomicTasks(tasks) {
+  const normalized = Array.isArray(tasks) ? tasks.map(normalizeTaskObject).filter(Boolean) : [];
+  if (!normalized.length) return [];
+  return normalized.map((task) => {
+    let title = sanitizeModelText(task.title || '', '').trim();
+    if (!/^(创建|修改|删除)\s+\S+/.test(title)) {
+      const hint = title ? `｜${title}` : '';
+      title = `修改 TBD${hint}`;
+    }
+    if (!/(TBD|待定)/i.test(title) && !/[\/]/.test(title)) {
+      const action = title.split(/\s+/)[0] || '修改';
+      const rest = title.replace(/^(创建|修改|删除)\s+\S+/, '').trim();
+      title = `${action} TBD${rest ? ` ${rest}` : ''}`.trim();
+    }
+    const core = sanitizeModelText(task.core || '', 'TBD').trim() || 'TBD';
+    const details = sanitizeModelText(task.details || '', 'TBD').trim() || 'TBD';
+    const ac = sanitizeModelText(task.ac || '', 'TBD').trim() || 'TBD';
+    return { title, core, details, ac };
+  });
+}
+
+function splitSummaryForAtomize(summary, maxParts = 3) {
+  const text = sanitizeModelText(summary || '', '').trim();
+  if (!text) return [];
+  const primary = text
+    .split(/[。；;\n]+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const baseParts = primary.length > 1
+    ? primary
+    : text.split(/[，,、]+/).map((part) => part.trim()).filter(Boolean);
+  if (baseParts.length <= 1) return [text];
+  const bucketCount = Math.min(maxParts, baseParts.length);
+  const buckets = Array.from({ length: bucketCount }, () => []);
+  baseParts.forEach((part, idx) => {
+    buckets[idx % bucketCount].push(part);
+  });
+  return buckets.map((parts) => parts.join('，').trim()).filter(Boolean);
+}
+
+function buildFallbackAtomicTasks(summary) {
+  const hint = sanitizeModelText(summary || '', '').trim();
+  const title = hint ? `修改 TBD｜${hint}` : '修改 TBD';
+  return [{ title, core: 'TBD', details: 'TBD', ac: 'TBD' }];
+}
+
+function shouldSplitFurther(tasks) {
+  const pattern = /(并且|以及|同时|随后|然后|步骤|流程)/;
+  return tasks.some((t) => pattern.test(`${t.title} ${t.core} ${t.details}`));
+}
+
+async function generateTasksWithModel(design, prompt) {
+  assertValidLlmConfig(getActiveLlmConfig());
+
+  const minTasks = Number(process.env.LLM_TASK_MIN || 8);
+  const maxTasks = Number(process.env.LLM_TASK_MAX || 16);
+  const timeoutMs = Math.min(Number(process.env.LLM_TASK_TIMEOUT_MS || 60000), 120000);
+
+  const content = await callLlm(
+    [
+      {
+        role: 'system',
+        content:
+          '你是项目任务拆解助手。请输出清晰但不必原子化的任务列表。只输出 JSON，不要解释。',
+      },
+      {
+        role: 'user',
+        content:
+          `设计内容如下：\n${design || ''}\n\n补充描述：${prompt || ''}\n\n` +
+          `请输出 ${minTasks}-${maxTasks} 条任务（不要求原子化）。` +
+          '每条任务必须包含 title/core/details/ac 四个字段，简体中文。\n' +
+          'title 写清任务名称与产出，允许是模块/流程级别，不要求文件路径。\n' +
+          '请严格输出 JSON：{"tasks":[{title,core,details,ac}]}。',
+      },
+    ],
+    { timeoutMs },
+  );
+
+  const payload = tryParseJson(content);
+  const rawTasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
+  const normalized = rawTasks.map(normalizeTaskObject).filter(Boolean);
+  const hasEnough = normalized.length >= Math.min(minTasks, maxTasks);
+  const isChinese = normalized.every((t) =>
+    looksLikeChinese(`${t.title} ${t.core} ${t.details} ${t.ac}`),
+  );
+  if (!hasEnough || !isChinese) {
+    return generateTasksContent(design, prompt);
+  }
+  const trimmed = normalized.slice(0, maxTasks);
+  return buildTasksMarkdown(prompt || design, { tasks: trimmed });
+}
+
+async function requestAtomicTasks(payload, designSnippet, timeoutMs, reason = '') {
+  const baseSystem =
+    'Role: 硬核工程架构师 (Hardcore Engineering Lead)。你擅长把任务拆解为“原子级执行指令”。只输出 JSON。';
+  const baseRequirement =
+    `要求：\n` +
+    `1) 输出为原子级任务，不要摘要，拆到无法再拆。\n` +
+    `2) 任务对象字段：title/core/details/ac。\n` +
+    `3) title 必须以“创建/修改/删除 <文件路径>”开头（路径不确定用 TBD）。\n` +
+    `4) core/details/ac 必须具体可执行，包含函数名/变量名/组件 Prop/CSS 类名；每条任务应在 15 分钟内可完成。\n` +
+    `5) 遵循定义先行：先 types/interfaces/schema，再业务逻辑。\n` +
+    `6) 禁止自由发挥，保持与上下文一致；若涉及样式，写清具体类名或布局方案。\n` +
+    `7) 任务顺序建议：Types/Interfaces -> Schema -> Utils/Storage -> UI 静态组件 -> 状态管理 -> 交互逻辑 -> 边界自愈。\n` +
+    `8) 简体中文。\n`;
+
+  const isList = Array.isArray(payload?.tasks);
+  const context = designSnippet ? `设计摘要：${designSnippet}\n\n` : '';
+  const main = isList
+    ? `当前任务列表（JSON）：\n${JSON.stringify(payload.tasks)}\n\n请进一步拆分为更原子任务；若已足够原子则保持。`
+    : `原始任务：${payload.summary}\n\n请拆分为无法再拆的原子任务。`;
+
+  const content = await callLlm(
+    [
+      { role: 'system', content: baseSystem },
+      {
+        role: 'user',
+        content:
+          `${context}${main}\n\n${reason ? `注意：${reason}\n` : ''}` +
+          baseRequirement +
+          '只输出 JSON：{"tasks":[...]}。',
+      },
+    ],
+    { timeoutMs },
+  );
+
+  const parsed = tryParseJson(content);
+  let candidateTasks = Array.isArray(parsed?.tasks) ? parsed.tasks : [];
+  let verdict = validateAtomicTasks(candidateTasks);
+  let lastError = verdict.error || null;
+  if (!verdict.ok) {
+    const repair = await callLlm(
+      [
+        { role: 'system', content: baseSystem },
+        {
+          role: 'user',
+          content:
+            `上一次输出不符合要求（原因：${verdict.error}）。请直接重做。
+` +
+            `${context}${main}
+
+` +
+            baseRequirement +
+            '只输出 JSON：{"tasks":[...]}。',
+        },
+      ],
+      { timeoutMs },
+    );
+    const repaired = tryParseJson(repair);
+    candidateTasks = Array.isArray(repaired?.tasks) ? repaired.tasks : [];
+    verdict = validateAtomicTasks(candidateTasks);
+    lastError = verdict.error || lastError;
+  }
+  if (!verdict.ok) {
+    const loose = coerceAtomicTasks(candidateTasks);
+    if (loose.length) {
+      const err = new Error('LLM tasks output invalid');
+      err.partialTasks = loose;
+      err.partialReason = lastError || verdict.error;
+      throw err;
+    }
+    throw new Error('LLM tasks output invalid');
+  }
+  return verdict.tasks;
+}
+
+async function atomizeTaskSummary(summary, designSnippet, maxRounds, timeoutMs) {
+  let currentTasks = null;
+  for (let round = 1; round <= maxRounds; round += 1) {
+    const tasks = await requestAtomicTasks(
+      currentTasks ? { tasks: currentTasks } : { summary },
+      designSnippet,
+      timeoutMs,
+      currentTasks ? `第 ${round} 轮进一步拆分` : '',
+    );
+    currentTasks = tasks;
+    if (!shouldSplitFurther(tasks) || round === maxRounds) {
+      return tasks;
+    }
+  }
+  return currentTasks || [];
+}
+
+function logAtomize(job, message) {
+  const entry = { at: new Date().toISOString(), message };
+  job.logs.push(entry);
+  if (job.logs.length > 200) job.logs.shift();
+  job.updatedAt = entry.at;
+}
+
+
+async function atomizeSummaryParts(parts, designSnippet, timeoutMs, job) {
+  const results = [];
+  for (const part of parts) {
+    try {
+      const subTasks = await atomizeTaskSummary(part, designSnippet, 1, timeoutMs);
+      results.push(...subTasks);
+    } catch (error) {
+      if (error?.partialTasks?.length) {
+        logAtomize(job, '子任务拆分输出不规范，已自动降级。');
+        results.push(...error.partialTasks);
+        continue;
+      }
+      logAtomize(job, '子任务拆分失败，已使用占位任务。');
+      results.push(...buildFallbackAtomicTasks(part));
+    }
+  }
+  return results;
+}
+
+async function atomizeTaskSummarySafe(summary, designSnippet, maxRounds, timeoutMs, job) {
+  const cleaned = sanitizeModelText(summary || '', '').trim();
+  if (!cleaned) return buildFallbackAtomicTasks(summary);
+  const needsSplit = cleaned.length > 180;
+  if (needsSplit) {
+    const parts = splitSummaryForAtomize(cleaned, 3);
+    if (parts.length > 1) {
+      logAtomize(job, `原始任务过长，拆分为 ${parts.length} 段处理。`);
+      const results = await atomizeSummaryParts(parts, designSnippet, timeoutMs, job);
+      if (results.length) return results;
+    }
+  }
+  try {
+    return await atomizeTaskSummary(cleaned, designSnippet, maxRounds, timeoutMs);
+  } catch (error) {
+    if (error?.partialTasks?.length) {
+      logAtomize(job, `原始任务输出不规范（${error.partialReason || 'invalid'}），已自动降级。`);
+      return error.partialTasks;
+    }
+    const parts = splitSummaryForAtomize(cleaned, 3);
+    if (parts.length > 1) {
+      logAtomize(job, `原始任务拆分为 ${parts.length} 段后重试。`);
+      const results = await atomizeSummaryParts(parts, designSnippet, timeoutMs, job);
+      if (results.length) return results;
+    }
+    logAtomize(job, '原子化失败，已生成占位任务。');
+    return buildFallbackAtomicTasks(cleaned);
+  }
+}
+
+function getAtomizeStatus(job) {
+  return {
+    running: job.running,
+    total: job.total,
+    completed: job.completed,
+    logs: job.logs,
+    error: job.error,
+    startedAt: job.startedAt,
+    updatedAt: job.updatedAt,
+  };
+}
+
+async function runAtomizeJob(specName, job) {
+  try {
+    assertValidLlmConfig(getActiveLlmConfig());
+
+    const tasksPath = resolveSpecFile(specName, 'tasks');
+    if (!fs.existsSync(tasksPath)) throw new Error('Spec file not found');
+    const tasksMarkdown = fs.readFileSync(tasksPath, 'utf8');
+    const summaries = parseTaskSummaries(tasksMarkdown);
+    if (!summaries.length) throw new Error('任务列表为空，无法原子化');
+
+    const designPath = resolveSpecFile(specName, 'design');
+    const designMarkdown = fs.existsSync(designPath)
+      ? fs.readFileSync(designPath, 'utf8')
+      : '';
+    const designSnippet = truncateText(designMarkdown, 1200);
+
+    const atomicPath = ensureAtomicFile(specName);
+    const atomicContent = fs.existsSync(atomicPath) ? fs.readFileSync(atomicPath, 'utf8') : '';
+    const doneIndices = parseAtomicDoneIndices(atomicContent);
+
+    job.total = summaries.length;
+    job.completed = doneIndices.size;
+    logAtomize(job, `检测到 ${summaries.length} 条任务，已完成 ${job.completed} 条。`);
+
+    const maxRounds = Number(process.env.LLM_TASK_ATOMIZE_ROUNDS || 3);
+    const timeoutMs = Number(process.env.LLM_TASK_ATOMIZE_TIMEOUT_MS || 60000);
+
+    for (let i = 0; i < summaries.length; i += 1) {
+      const index = i + 1;
+      if (doneIndices.has(index)) {
+        logAtomize(job, `跳过原始任务 ${index}（已完成）`);
+        continue;
+      }
+      const summary = summaries[i];
+      logAtomize(job, `开始原始任务 ${index}/${summaries.length}：${summary}`);
+      const atomized = await atomizeTaskSummarySafe(summary, designSnippet, maxRounds, timeoutMs, job);
+      const section = buildAtomicSection(index, summary, atomized);
+      fs.appendFileSync(atomicPath, `\n\n${section}\n`, 'utf8');
+      doneIndices.add(index);
+      job.completed = doneIndices.size;
+      logAtomize(job, `完成原始任务 ${index}/${summaries.length}`);
+    }
+
+    job.running = false;
+    logAtomize(job, '原子化完成');
+  } catch (error) {
+    job.running = false;
+    job.error = error?.message || String(error);
+    logAtomize(job, `原子化失败：${job.error}`);
+  }
+}
+
+async function generateTasksWithModelAtomicLegacy(design, prompt) {
+  assertValidLlmConfig(getActiveLlmConfig());
 
   const TARGET_MIN_TASKS = 40;
   const TARGET_MAX_TASKS = 160;
+  const TASK_TIMEOUT_MS = Number(process.env.LLM_TASK_TIMEOUT_MS || 120000);
 
   const parseTasksFromAny = (raw) => {
     const text = typeof raw === 'string' ? raw.trim() : '';
@@ -1301,84 +1792,194 @@ async function generateTasksWithModel(design, prompt) {
     return { title, core, details, ac };
   };
 
-  const validateTasks = (tasks) => {
-    if (!Array.isArray(tasks) || tasks.length < TARGET_MIN_TASKS) return { ok: false, error: 'too_few' };
+  const validateTasks = (tasks, minCount = TARGET_MIN_TASKS) => {
+    if (!Array.isArray(tasks) || tasks.length < minCount) return { ok: false, error: 'too_few' };
     const normalized = tasks.map(normalizeTaskObject).filter(Boolean);
-    if (normalized.length < TARGET_MIN_TASKS) return { ok: false, error: 'invalid_shape' };
-    const hasChinese = normalized.some((t) => looksLikeChinese(t.title + t.core + t.details + t.ac));
-    if (!hasChinese) return { ok: false, error: 'not_zh' };
-
-    // Enforce file-lock style hint in title: should contain a file path-ish token.
-    const hasPathish = normalized.some((t) => /[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/.test(t.title) || /\\/.test(t.title));
-    if (!hasPathish) return { ok: false, error: 'no_paths' };
-
-    // Each entry should have basic fields.
+    if (normalized.length < minCount) return { ok: false, error: 'invalid_shape' };
     const missingFields = normalized.some((t) => !t.title || !t.core || !t.details || !t.ac);
     if (missingFields) return { ok: false, error: 'missing_fields' };
+    const notChinese = normalized.some((t) => !looksLikeChinese(t.title + t.core + t.details + t.ac));
+    if (notChinese) return { ok: false, error: 'not_zh' };
+    const invalidAction = normalized.some((t) => !/^(创建|修改|删除)\s+\S+/.test(t.title));
+    if (invalidAction) return { ok: false, error: 'invalid_action' };
+    const invalidPath = normalized.some(
+      (t) =>
+        !(
+          /(TBD|待定)/i.test(t.title) ||
+          /[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/.test(t.title) ||
+          /\\/.test(t.title)
+        ),
+    );
+    if (invalidPath) return { ok: false, error: 'no_paths' };
 
     return { ok: true, tasks: normalized };
   };
 
-  const content = await callLlm([
-    {
-      role: 'system',
-      content:
-        'Role: 硬核工程架构师 (Hardcore Engineering Lead)。你擅长把设计文档拆解为 A计划的“原子级执行指令”。只输出 JSON，不要解释，不要包含分析或思考过程。',
-    },
-    {
-      role: 'user',
-      content:
-        `设计内容如下：\n${design || ''}\n\n补充描述：${prompt}\n\n` +
-        '请严格输出 JSON：{"tasks":[...]}。\n' +
-        `要求：\n` +
-        `1) 输出不再是“任务摘要”，而是“原子级执行指令”。严格遵守：定义 Types/Interfaces -> 数据库 Schema -> 基础 Utils/Storage -> UI 静态组件 -> 状态管理 -> 交互逻辑 -> 边界自愈。\n` +
-        `2) 数量：${TARGET_MIN_TASKS}-${TARGET_MAX_TASKS} 条。\n` +
-        `3) [文件锁定]：每个任务 title 必须以“创建/修改/删除 <文件路径>”开头，严禁模糊动词。\n` +
-        `4) [15分钟原则]：单任务保证 AI Agent 15 分钟内可完成；涉及两条以上逻辑分支必须拆分。\n` +
-        `5) [定义先行]：禁止在定义数据结构之前编写业务逻辑。\n` +
-        `6) [禁止自由发挥]：核心逻辑中必须写出函数名/变量名/组件 Prop 名称；涉及样式需写明 CSS 类名或布局方案。\n` +
-        `7) 每个任务必须是一个对象：\n` +
-        `   - title: 字符串，格式："<动作> <文件路径>｜<目的/产出>｜验证：<可执行验证>"\n` +
-        `   - core: 字符串，写清函数签名/步骤/变量名\n` +
-        `   - details: 字符串，写清依赖、API、命令、CSS 类名等\n` +
-        `   - ac: 字符串，写清验收标准（如何证明成功）\n` +
-        `8) 任务必须为简体中文。\n` +
-        `9) 如果某些文件路径不确定，用 TBD 占位，但仍必须以“创建/修改/删除”开头。\n` +
-        `示例（仅格式示例，不要照抄）：\n` +
-        `{ "title": "创建 src/types/note.ts｜产出：Note 类型定义｜验证：tsc 通过", "core": "export interface Note { id: string; ... }", "details": "字段：id/content/...；命名：Note；不引入外部依赖", "ac": "其他模块可 import { Note } 并通过编译" }\n` +
-        '不要输出除 JSON 以外的任何内容。',
-    },
-  ]);
+  const baseSystem =
+    'Role: 硬核工程架构师 (Hardcore Engineering Lead)。你擅长把设计文档拆解为 A计划的“原子级执行指令”。只输出 JSON，不要解释，不要包含分析或思考过程。';
 
-  let tasks = parseTasksFromAny(content);
-  let verdict = validateTasks(tasks);
-  if (!verdict.ok) {
-    const repair = await callLlm([
-      {
-        role: 'system',
-        content:
-          'Role: 硬核工程架构师 (Hardcore Engineering Lead)。你擅长把设计文档拆解为 A计划的“原子级执行指令”。只输出 JSON，不要解释，不要包含分析或思考过程。',
-      },
-      {
-        role: 'user',
-        content:
-          `你上一次输出不符合要求（原因：${verdict.error}）。请直接重做并严格输出 JSON：{"tasks":[...]}。\n` +
-          `数量：${TARGET_MIN_TASKS}-${TARGET_MAX_TASKS}。\n` +
-          `每个 tasks[i] 必须是对象：{title, core, details, ac}。\n` +
-          `title 必须以“创建/修改/删除 <文件路径>”开头，并包含“验证：...”。\n` +
-          `core/details/ac 必须是简体中文且具体可执行。\n\n` +
-          `原始输出：\n${content}\n`,
-      },
-    ]);
-    tasks = parseTasksFromAny(repair);
-    verdict = validateTasks(tasks);
+  const baseRequirement = (minCount, maxCount) =>
+    `要求：\n` +
+    `1) 输出不再是“任务摘要”，而是“原子级执行指令”。严格遵守：定义 Types/Interfaces -> 数据库 Schema -> 基础 Utils/Storage -> UI 静态组件 -> 状态管理 -> 交互逻辑 -> 边界自愈。\n` +
+    `2) 数量：${minCount}-${maxCount} 条。\n` +
+    `3) [文件锁定]：每个任务 title 必须以“创建/修改/删除 <文件路径>”开头，严禁模糊动词。\n` +
+    `4) [15分钟原则]：单任务保证 AI Agent 15 分钟内可完成；涉及两条以上逻辑分支必须拆分。\n` +
+    `5) [定义先行]：禁止在定义数据结构之前编写业务逻辑。\n` +
+    `6) [禁止自由发挥]：核心逻辑中必须写出函数名/变量名/组件 Prop 名称；涉及样式需写明 CSS 类名或布局方案。\n` +
+    `7) 每个任务必须是一个对象：\n` +
+    `   - title: 字符串，格式："<动作> <文件路径>｜<目的/产出>｜验证：<可执行验证>"\n` +
+    `   - core: 字符串，写清函数签名/步骤/变量名\n` +
+    `   - details: 字符串，写清依赖、API、命令、CSS 类名等\n` +
+    `   - ac: 字符串，写清验收标准（如何证明成功）\n` +
+    `8) 任务必须为简体中文。\n` +
+    `9) 如果某些文件路径不确定，用 TBD 占位，但仍必须以“创建/修改/删除”开头。\n`;
+
+  const PHASE_MIN_TASKS = Number(process.env.LLM_TASK_PHASE_MIN || 6);
+  const PHASE_MAX_TASKS = Number(process.env.LLM_TASK_PHASE_MAX || 18);
+  const phases = [
+    { key: 'types', label: '类型/接口定义', hint: 'Types/Interfaces/DTO/Schema 基础定义' },
+    { key: 'schema', label: '数据模型/Schema', hint: '数据库/Schema/迁移/实体定义（如有）' },
+    { key: 'utils', label: '基础工具与存储', hint: 'utils/storage/config/常量/校验' },
+    { key: 'ui', label: 'UI 静态组件', hint: '页面结构/组件拆分/样式/布局' },
+    { key: 'state', label: '状态管理', hint: '状态容器/数据流/缓存/派生数据' },
+    { key: 'interaction', label: '交互逻辑', hint: '事件处理/表单/交互流程' },
+    { key: 'edge', label: '边界与异常', hint: '错误处理/提示/兜底/可观测性' },
+    { key: 'test', label: '验证与自测', hint: '最小可执行的验证步骤/测试脚本' },
+  ];
+
+  const validateTasksWithMin = (tasks, minCount) => validateTasks(tasks, minCount);
+
+  const generatePhaseTasks = async (phase) => {
+    const content = await callLlm(
+      [
+        { role: 'system', content: baseSystem },
+        {
+          role: 'user',
+          content:
+            `设计内容如下：\n${design || ''}\n\n补充描述：${prompt}\n\n` +
+            `当前阶段：${phase.label}（${phase.hint}）。只输出该阶段的任务。\n` +
+            '请严格输出 JSON：{"tasks":[...]}。\n' +
+            baseRequirement(PHASE_MIN_TASKS, PHASE_MAX_TASKS) +
+            `示例（仅格式示例，不要照抄）：\n` +
+            `{ "title": "创建 src/types/note.ts｜产出：Note 类型定义｜验证：tsc 通过", "core": "export interface Note { id: string; ... }", "details": "字段：id/content/...；命名：Note；不引入外部依赖", "ac": "其他模块可 import { Note } 并通过编译" }\n` +
+            '不要输出除 JSON 以外的任何内容。',
+        },
+      ],
+      { timeoutMs: TASK_TIMEOUT_MS },
+    );
+
+    let tasks = parseTasksFromAny(content);
+    let verdict = validateTasksWithMin(tasks, PHASE_MIN_TASKS);
+    if (!verdict.ok) {
+      const repair = await callLlm(
+        [
+          { role: 'system', content: baseSystem },
+          {
+            role: 'user',
+            content:
+              `你上一次输出不符合要求（原因：${verdict.error}）。请直接重做并严格输出 JSON：{"tasks":[...]}。\n` +
+              `数量：${PHASE_MIN_TASKS}-${PHASE_MAX_TASKS}。\n` +
+              `每个 tasks[i] 必须是对象：{title, core, details, ac}。\n` +
+              `title 必须以“创建/修改/删除 <文件路径>”开头，并包含“验证：...”。\n` +
+              `core/details/ac 必须是简体中文且具体可执行。\n\n` +
+              baseRequirement(PHASE_MIN_TASKS, PHASE_MAX_TASKS) +
+              `原始输出：\n${content}\n`,
+          },
+        ],
+        { timeoutMs: TASK_TIMEOUT_MS },
+      );
+      tasks = parseTasksFromAny(repair);
+      verdict = validateTasksWithMin(tasks, PHASE_MIN_TASKS);
+    }
+
+    if (!verdict.ok) {
+      throw new Error('LLM tasks output invalid');
+    }
+
+    const firstPass = verdict.tasks;
+    const expandContent = await callLlm(
+      [
+        { role: 'system', content: baseSystem },
+        {
+          role: 'user',
+          content:
+            `以下是当前阶段的初版任务（JSON）：\n${JSON.stringify(firstPass)}\n\n` +
+            '请执行“二次展开”：将每条任务进一步拆分为 15 分钟内可完成的原子任务；若已足够原子则保留。\n' +
+            '要求：保持原有执行顺序，输出格式仍为 JSON：{"tasks":[...]}。\n' +
+            baseRequirement(PHASE_MIN_TASKS, PHASE_MAX_TASKS) +
+            '不要输出除 JSON 以外的任何内容。',
+        },
+      ],
+      { timeoutMs: TASK_TIMEOUT_MS },
+    );
+
+    let expanded = parseTasksFromAny(expandContent);
+    let expandVerdict = validateTasksWithMin(expanded, PHASE_MIN_TASKS);
+    if (!expandVerdict.ok) {
+      const repairExpand = await callLlm(
+        [
+          { role: 'system', content: baseSystem },
+          {
+            role: 'user',
+            content:
+              `你上一次二次展开输出不符合要求（原因：${expandVerdict.error}）。请直接重做并严格输出 JSON：{"tasks":[...]}。\n` +
+              `数量：${PHASE_MIN_TASKS}-${PHASE_MAX_TASKS}。\n` +
+              `每个 tasks[i] 必须是对象：{title, core, details, ac}。\n` +
+              `title 必须以“创建/修改/删除 <文件路径>”开头，并包含“验证：...”。\n` +
+              `core/details/ac 必须是简体中文且具体可执行。\n\n` +
+              baseRequirement(PHASE_MIN_TASKS, PHASE_MAX_TASKS) +
+              `原始输出：\n${expandContent}\n`,
+          },
+        ],
+        { timeoutMs: TASK_TIMEOUT_MS },
+      );
+      expanded = parseTasksFromAny(repairExpand);
+      expandVerdict = validateTasksWithMin(expanded, PHASE_MIN_TASKS);
+    }
+
+    if (!expandVerdict.ok) {
+      throw new Error('LLM tasks output invalid');
+    }
+
+    return expandVerdict.tasks;
+  };
+
+  const allTasks = [];
+  for (const phase of phases) {
+    const phaseTasks = await generatePhaseTasks(phase);
+    allTasks.push(...phaseTasks);
   }
 
-  if (!verdict.ok) {
+  if (allTasks.length < TARGET_MIN_TASKS) {
+    const needed = Math.max(6, TARGET_MIN_TASKS - allTasks.length);
+    const extra = await callLlm(
+      [
+        { role: 'system', content: baseSystem },
+        {
+          role: 'user',
+          content:
+            `当前任务数量不足（现有 ${allTasks.length}）。请补充 ${needed}-${Math.min(needed + 10, PHASE_MAX_TASKS)} 条遗漏任务。\n` +
+            `设计内容如下：\n${design || ''}\n\n补充描述：${prompt}\n\n` +
+            '请严格输出 JSON：{"tasks":[...]}。\n' +
+            baseRequirement(needed, Math.min(needed + 10, PHASE_MAX_TASKS)) +
+            '不要输出除 JSON 以外的任何内容。',
+        },
+      ],
+      { timeoutMs: TASK_TIMEOUT_MS },
+    );
+    const extraTasks = parseTasksFromAny(extra);
+    const extraVerdict = validateTasksWithMin(extraTasks, needed);
+    if (extraVerdict.ok) {
+      allTasks.push(...extraVerdict.tasks);
+    }
+  }
+
+  const finalVerdict = validateTasksWithMin(allTasks, TARGET_MIN_TASKS);
+  if (!finalVerdict.ok) {
     throw new Error('LLM tasks output invalid');
   }
 
-  return buildTasksMarkdown(prompt || design, { tasks: verdict.tasks });
+  return buildTasksMarkdown(prompt || design, { tasks: finalVerdict.tasks });
 }
 
 function ensureSpecTemplate(name, artifact) {
@@ -1992,7 +2593,11 @@ app.post('/specs/:name/confirm', async (req, res) => {
           .join('\n\n');
         const content = await generateDesignWithModel(requirementsContent, supplementalPrompt);
         writeSpecFile(specName, 'design', content);
+        status.lastError = null;
+
       } catch (error) {
+        recordSpecError(status, 'design', error, null);
+        writeSpecStatus(specName, status);
         console.error('Design generation failed:', error?.message || error);
         return res.status(502).json({ error: error?.message || 'Design generation failed' });
       }
@@ -2013,7 +2618,11 @@ app.post('/specs/:name/confirm', async (req, res) => {
       try {
         const content = await generateTasksWithModel(designContent, status.prompt);
         writeSpecFile(specName, 'tasks', content);
+        status.lastError = null;
+
       } catch (error) {
+        recordSpecError(status, 'tasks', error, { timeoutMs: Number(process.env.LLM_TASK_TIMEOUT_MS || 0) || null });
+        writeSpecStatus(specName, status);
         console.error('Tasks generation failed:', error?.message || error);
         return res.status(502).json({ error: error?.message || 'Tasks generation failed' });
       }
@@ -2033,6 +2642,49 @@ app.post('/specs/:name/confirm', async (req, res) => {
     message: `[spec] confirmed ${specName}/${artifact}`,
   });
   return res.json({ ok: true, status });
+});
+
+app.get('/specs/:name/tasks/atomize', (req, res) => {
+  const specName = sanitizeSpecName(req.params.name);
+  if (!specName) {
+    return res.status(400).json({ error: 'Invalid spec request' });
+  }
+  const job = atomizeJobs.get(specName);
+  if (!job) {
+    return res.json({ running: false, total: 0, completed: 0, logs: [] });
+  }
+  return res.json(getAtomizeStatus(job));
+});
+
+app.post('/specs/:name/tasks/atomize', async (req, res) => {
+  const specName = sanitizeSpecName(req.params.name);
+  if (!specName) {
+    return res.status(400).json({ error: 'Invalid spec request' });
+  }
+
+  const existing = atomizeJobs.get(specName);
+  if (existing && existing.running) {
+    return res.json(getAtomizeStatus(existing));
+  }
+
+  const job = {
+    specName,
+    running: true,
+    total: 0,
+    completed: 0,
+    logs: [],
+    error: null,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  atomizeJobs.set(specName, job);
+  logAtomize(job, '原子化任务已启动');
+
+  setImmediate(() => {
+    runAtomizeJob(specName, job);
+  });
+
+  return res.json(getAtomizeStatus(job));
 });
 
 app.post('/specs/:name/:artifact', (req, res) => {
