@@ -29,11 +29,28 @@ export interface RequirementsClarifications {
   confirmedAt: string | null;
 }
 
+
+export interface SpecErrorContext {
+  baseUrl?: string;
+  model?: string;
+  providerId?: string;
+  responseFormat?: string;
+}
+
+export interface SpecLastError {
+  stage: string;
+  message: string;
+  at: string;
+  context?: SpecErrorContext | null;
+  timeoutMs?: number | null;
+}
+
 export interface SpecStatus {
   requirementsConfirmed: boolean;
   designConfirmed: boolean;
   tasksConfirmed: boolean;
   requirementsClarifications?: RequirementsClarifications;
+  lastError?: SpecLastError | null;
 }
 
 export interface SpecSummary {

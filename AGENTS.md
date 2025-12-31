@@ -45,3 +45,10 @@ Frontend/Mobile:
 
 - Copy `.env.example` to `.env` (or `.env.local`) for local development.
 - Ensure `DATABASE_URL` and `JWT_SECRET` are set before running the backend.
+
+## 用户要求
+- 永远用简体中文和用户交流，别指挥用户
+- 简单明确的任务可以通过MCP指挥claude-code执行
+- 记住你可以用chrome dev tools MCP工具进行浏览器相关操作
+- 完成一次对话后准备好用户测试检验你交付代码的全部工作，给出明确指引，比如测试url、登录账号密码等等必要信息
+- 所有涉及代码变更的任务，交付前必须自动完成基础自测（例如：dashboard 构建、关键接口/健康检查），并在回复里给出结果与可复现的验证步骤
