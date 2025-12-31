@@ -489,9 +489,14 @@ export default function App() {
     setToast(null);
     setBusyLabel('生成中');
     try {
+      const hasExistingTasks = Boolean(selectedSpec?.files?.tasks);
+      if (hasExistingTasks) {
+        const ok = window.confirm('将覆盖现有任务文档（tasks），是否继续？');
+        if (!ok) return;
+      }
       await apiJson(`/specs/${encodeURIComponent(selectedSpecName)}/confirm`, {
         method: 'POST',
-        body: JSON.stringify({ artifact: 'design' }),
+        body: JSON.stringify({ artifact: 'design', force: true }),
       });
       await refreshSpecs();
       await loadArtifact(selectedSpecName, 'tasks');
@@ -501,7 +506,7 @@ export default function App() {
     } finally {
       setBusyLabel(null);
     }
-  }, [loadArtifact, refreshSpecs, selectedSpecName]);
+  }, [loadArtifact, refreshSpecs, selectedSpec, selectedSpecName]);
 
   const downloadCurrentMd = useCallback(() => {
     if (!selectedSpecName) return;
