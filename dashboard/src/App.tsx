@@ -162,6 +162,32 @@ function upsertClarificationsSection(markdown: string, questions: ClarificationQ
   return `${text.trimEnd()}\n\n${section}\n`.trimEnd();
 }
 
+function buildTechStackMarkdown(questions: ClarificationQuestion[]) {
+  const lines: string[] = [];
+  lines.push('## 技术栈确认', '');
+  questions.forEach((q, i) => {
+    const selectedIds = q.answer?.selectedOptionIds ?? [];
+    const selectedLabels = q.options
+      .filter((opt) => selectedIds.includes(opt.id))
+      .map((opt) => opt.label)
+      .filter(Boolean);
+    const otherText = (q.answer?.otherText ?? '').trim();
+    lines.push(`### Q${i + 1}. ${q.question}`);
+    lines.push(`- 选择：${selectedLabels.length ? selectedLabels.join('、') : '（未选择）'}`);
+    if (q.allowOther) lines.push(`- 补充：${otherText ? otherText : '（无）'}`);
+    lines.push('');
+  });
+  return lines.join('\n').trimEnd();
+}
+
+function upsertTechStackSection(markdown: string, questions: ClarificationQuestion[]) {
+  const section = buildTechStackMarkdown(questions);
+  const text = markdown ?? '';
+  const re = /^## 技术栈确认[\s\S]*?(?=\n## |\n# |$)/m;
+  if (re.test(text)) return text.replace(re, section).trimEnd();
+  return `${text.trimEnd()}\n\n${section}\n`.trimEnd();
+}
+
 async function apiJson<T>(path: string, init?: RequestInit, timeoutMsOverride?: number): Promise<T> {
   const controller = new AbortController();
   const timeoutMs = Number(timeoutMsOverride ?? API_TIMEOUT_MS);
@@ -208,6 +234,7 @@ function humanizeError(e: any) {
   if (!msg) return '发生未知错误';
   if (status === 409 && /Design not confirmed/i.test(msg)) return '设计尚未生成，请先生成设计。';
   if (status === 409 && /Requirements not confirmed/i.test(msg)) return '需求尚未确认，请先完成需求确认并生成设计。';
+  if (status === 409 && /Tech stack clarifications incomplete/i.test(msg)) return '技术栈确认未完成，请先完成必填项。';
   if (status === 409 && /clarifications incomplete/i.test(msg)) return '需求确认未完成，请先完成必填项。';
   if (status === 404 && /Spec file not found/i.test(msg)) return '文档尚未生成。';
   if (/Failed to fetch/i.test(msg)) return '无法连接到服务，请检查 bridge 地址/反代配置。';
@@ -269,6 +296,7 @@ export default function App() {
   const [taskView, setTaskView] = useState<TaskView>('tasks');
   const [tasksAtomicContent, setTasksAtomicContent] = useState('');
   const [atomizeStatus, setAtomizeStatus] = useState<AtomizeStatus | null>(null);
+  const [atomizeBatchSizeText, setAtomizeBatchSizeText] = useState('3');
   const baselineContentRef = useRef<Record<SpecArtifact, string>>({
     requirements: '',
     design: '',
@@ -290,6 +318,7 @@ export default function App() {
     tasks: { undo: 0, redo: 0 },
   });
   const [clarifications, setClarifications] = useState<ClarificationQuestion[]>([]);
+  const [techStackClarifications, setTechStackClarifications] = useState<ClarificationQuestion[]>([]);
   const [llm, setLlm] = useState<LlmInfo | null>(null);
   const [modelPing, setModelPing] = useState<
     Record<
@@ -466,6 +495,7 @@ export default function App() {
   useEffect(() => {
     if (!selectedSpec) return;
     setClarifications(selectedSpec.status?.requirementsClarifications?.questions ?? []);
+    setTechStackClarifications(selectedSpec.status?.techStackClarifications?.questions ?? []);
   }, [selectedSpec]);
 
   useEffect(() => {
@@ -536,12 +566,16 @@ export default function App() {
   }, [loadArtifact, rawPrompt, refreshSpecs]);
 
   const saveArtifact = useCallback(
-    async (artifact: SpecArtifact) => {
+    async (artifact: SpecArtifact, contentOverride?: string) => {
       if (!selectedSpecName) return;
       try {
+        const content =
+          typeof contentOverride === 'string'
+            ? contentOverride
+            : (artifactContent[artifact] ?? '');
         await apiJson(`/specs/${encodeURIComponent(selectedSpecName)}/${artifact}`, {
           method: 'POST',
-          body: JSON.stringify({ content: artifactContent[artifact] ?? '' }),
+          body: JSON.stringify({ content }),
         });
         await refreshSpecs();
       } catch (e: any) {
@@ -571,8 +605,27 @@ export default function App() {
   const applyClarificationsToRequirements = useCallback(async () => {
     const next = upsertClarificationsSection(artifactContent.requirements ?? '', clarifications);
     setArtifactContent((prev) => ({ ...prev, requirements: next }));
-    await saveArtifact('requirements');
+    await saveArtifact('requirements', next);
   }, [artifactContent.requirements, clarifications, saveArtifact]);
+
+  const saveTechStackClarifications = useCallback(async () => {
+    if (!selectedSpecName) return;
+    try {
+      await apiJson(`/specs/${encodeURIComponent(selectedSpecName)}/tech-stack/clarifications`, {
+        method: 'POST',
+        body: JSON.stringify({ questions: techStackClarifications }),
+      });
+      await refreshSpecs();
+    } catch (e: any) {
+      showToast(humanizeError(e));
+    }
+  }, [refreshSpecs, selectedSpecName, showToast, techStackClarifications]);
+
+  const applyTechStackToDesign = useCallback(async () => {
+    const next = upsertTechStackSection(artifactContent.design ?? '', techStackClarifications);
+    setArtifactContent((prev) => ({ ...prev, design: next }));
+    await saveArtifact('design', next);
+  }, [artifactContent.design, saveArtifact, techStackClarifications]);
 
   const confirmRequirementsAndGenerateDesign = useCallback(async () => {
     if (!selectedSpecName) return;
@@ -616,9 +669,18 @@ export default function App() {
         const ok = window.confirm('将覆盖现有任务文档（tasks），是否继续？');
         if (!ok) return;
       }
+      if (!areClarificationsComplete(techStackClarifications)) {
+        throw new Error('请先完成所有必填的技术栈确认');
+      }
+      await saveTechStackClarifications();
+      await applyTechStackToDesign();
       await apiJson(`/specs/${encodeURIComponent(selectedSpecName)}/confirm`, {
         method: 'POST',
-        body: JSON.stringify({ artifact: 'design', force: true }),
+        body: JSON.stringify({
+          artifact: 'design',
+          force: true,
+          techStackClarifications: { questions: techStackClarifications },
+        }),
       }, TASK_TIMEOUT_MS);
       await refreshSpecs();
       await loadArtifact(selectedSpecName, 'tasks');
@@ -636,21 +698,33 @@ export default function App() {
     } finally {
       setBusyLabel(null);
     }
-  }, [loadArtifact, refreshSpecs, selectedSpec, selectedSpecName]);
+  }, [
+    applyTechStackToDesign,
+    loadArtifact,
+    refreshSpecs,
+    saveTechStackClarifications,
+    selectedSpec,
+    selectedSpecName,
+    techStackClarifications,
+  ]);
 
   const startAtomizeTasks = useCallback(async () => {
     if (!selectedSpecName) return;
     setToast(null);
     try {
+      const batchSize = Math.min(
+        20,
+        Math.max(1, Number.parseInt(atomizeBatchSizeText || '3', 10) || 3),
+      );
       const data = await apiJson<AtomizeStatus>(
         `/specs/${encodeURIComponent(selectedSpecName)}/tasks/atomize`,
-        { method: 'POST' },
+        { method: 'POST', body: JSON.stringify({ batchSize }) },
       );
       setAtomizeStatus(data);
     } catch (e: any) {
       showToast(humanizeError(e));
     }
-  }, [selectedSpecName, showToast]);
+  }, [atomizeBatchSizeText, selectedSpecName, showToast]);
 
   const downloadCurrentMd = useCallback(() => {
     if (!selectedSpecName) return;
@@ -1244,16 +1318,138 @@ export default function App() {
               </div>
             )}
 
+            {selectedSpecName && activeArtifact === 'design' && (
+              <div className="mb-4 space-y-3 rounded-md border border-slate-800 bg-slate-900/30 p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="text-sm font-semibold text-slate-200">技术栈确认</div>
+                  <div className="text-xs text-slate-400">
+                    {areClarificationsComplete(techStackClarifications)
+                      ? '已完成'
+                      : '未完成'}
+                  </div>
+                </div>
+
+                {techStackClarifications.length ? (
+                  <div className="space-y-3">
+                    {techStackClarifications.map((q, idx) => (
+                      <div
+                        key={q.id}
+                        className="rounded-md border border-slate-800 bg-slate-950/40 p-3"
+                      >
+                        <div className="flex flex-wrap items-start justify-between gap-2">
+                          <div className="text-sm text-slate-100">
+                            {idx + 1}. {q.question}
+                            {q.mode === 'multi' && (
+                              <span className="text-slate-400">（可多选）</span>
+                            )}{' '}
+                            {q.required && <span className="text-red-300">*</span>}
+                          </div>
+                          <div className="text-xs text-slate-400">
+                            {isClarificationComplete(q) ? '✔' : '—'}
+                          </div>
+                        </div>
+
+                        <div className="mt-2 space-y-2">
+                          {(q.options ?? []).map((opt) => {
+                            const selected = q.answer?.selectedOptionIds ?? [];
+                            const checked = selected.includes(opt.id);
+                            return (
+                              <label
+                                key={opt.id}
+                                className="flex items-start gap-2 text-sm leading-5 text-slate-200"
+                              >
+                                <input
+                                  type="checkbox"
+                                  name={`q-${q.id}`}
+                                  checked={checked}
+                                  className="mt-0.5 h-4 w-4 shrink-0"
+                                  onChange={() => {
+                                    const nextSelected =
+                                      q.mode === 'single'
+                                        ? checked
+                                          ? []
+                                          : [opt.id]
+                                        : checked
+                                          ? selected.filter((id) => id !== opt.id)
+                                          : Array.from(new Set([...selected, opt.id]));
+                                    setTechStackClarifications((prev) =>
+                                      prev.map((qq) =>
+                                        qq.id === q.id
+                                          ? {
+                                              ...qq,
+                                              answer: {
+                                                ...(qq.answer ?? {
+                                                  selectedOptionIds: [],
+                                                  otherText: '',
+                                                }),
+                                                selectedOptionIds: nextSelected,
+                                              },
+                                            }
+                                          : qq,
+                                      ),
+                                    );
+                                  }}
+                                />
+                                <span>{opt.label}</span>
+                              </label>
+                            );
+                          })}
+
+                          {q.allowOther && (
+                            <label className="block space-y-1 text-xs text-slate-300">
+                              <div>补充</div>
+                              <input
+                                className="h-9 w-full rounded-md border border-slate-700 bg-slate-950 px-2 text-sm text-slate-100"
+                                value={q.answer?.otherText ?? ''}
+                                onChange={(e) =>
+                                  setTechStackClarifications((prev) =>
+                                    prev.map((qq) =>
+                                      qq.id === q.id
+                                        ? {
+                                            ...qq,
+                                            answer: {
+                                              ...(qq.answer ?? {
+                                                selectedOptionIds: [],
+                                                otherText: '',
+                                              }),
+                                              otherText: e.target.value,
+                                            },
+                                          }
+                                        : qq,
+                                    ),
+                                  )
+                                }
+                                placeholder="选填"
+                              />
+                            </label>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-sm text-slate-400">暂无技术栈确认问题</div>
+                )}
+
+                <div className="flex justify-end gap-2 pt-1">
+                  <Button
+                    size="sm"
+                    onClick={() => void generateTasksFromDesign()}
+                    disabled={
+                      !selectedSpecName ||
+                      Boolean(busyLabel) ||
+                      !artifactContent.design.trim() ||
+                      !techStackClarifications.length ||
+                      !areClarificationsComplete(techStackClarifications)
+                    }
+                  >
+                    确认技术栈并生成任务
+                  </Button>
+                </div>
+              </div>
+            )}
+
             <div className="mb-2 flex flex-wrap items-center gap-2">
-              {activeArtifact === 'design' && (
-                <Button
-                  size="sm"
-                  onClick={() => void generateTasksFromDesign()}
-                  disabled={!selectedSpecName || Boolean(busyLabel)}
-                >
-                  生成任务
-                </Button>
-              )}
               {activeArtifact === 'tasks' && (
                 <>
                   <div className="flex flex-wrap items-center gap-2">
@@ -1283,8 +1479,25 @@ export default function App() {
                         atomizeStatus?.running
                       }
                     >
-                      {atomizeStatus?.running ? '原子化中' : '开始原子化'}
+                      {atomizeStatus?.running
+                        ? '原子化中'
+                        : atomizeStatus?.total &&
+                            atomizeStatus.completed > 0 &&
+                            atomizeStatus.completed < atomizeStatus.total
+                          ? '继续原子化（下一段）'
+                          : '开始原子化'}
                     </Button>
+                    <label className="flex items-center gap-2 rounded-md border border-slate-800 bg-slate-950/40 px-2 py-1 text-xs text-slate-300">
+                      <span className="text-slate-400">分段</span>
+                      <input
+                        className="h-7 w-12 rounded-md border border-slate-700 bg-slate-950 px-2 text-xs text-slate-100 outline-none focus:ring-2 focus:ring-accent"
+                        value={atomizeBatchSizeText}
+                        onChange={(e) => setAtomizeBatchSizeText(e.target.value.replace(/[^\d]/g, '').slice(0, 2))}
+                        placeholder="3"
+                        inputMode="numeric"
+                      />
+                      <span className="text-slate-400">条/次</span>
+                    </label>
                   </div>
                   <Button
                     size="sm"

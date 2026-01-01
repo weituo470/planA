@@ -49,7 +49,9 @@ export interface SpecStatus {
   requirementsConfirmed: boolean;
   designConfirmed: boolean;
   tasksConfirmed: boolean;
+  techStackConfirmed?: boolean;
   requirementsClarifications?: RequirementsClarifications;
+  techStackClarifications?: RequirementsClarifications;
   lastError?: SpecLastError | null;
 }
 
