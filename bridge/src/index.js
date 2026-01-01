@@ -61,6 +61,7 @@ const DEFAULT_SPEC_STATUS = {
   requirementsConfirmed: false,
   designConfirmed: false,
   tasksConfirmed: false,
+  techStackConfirmed: false,
   prompt: '',
   requirementsReview: {
     notes: '',
@@ -69,6 +70,11 @@ const DEFAULT_SPEC_STATUS = {
     confirmedAt: null,
   },
   requirementsClarifications: {
+    questions: [],
+    updatedAt: null,
+    confirmedAt: null,
+  },
+  techStackClarifications: {
     questions: [],
     updatedAt: null,
     confirmedAt: null,
@@ -666,6 +672,25 @@ function buildClarificationsSummary(clarifications) {
   return `需求澄清结论：\n${lines.join('\n')}`.trim();
 }
 
+function buildTechStackSummary(clarifications) {
+  const normalized = normalizeRequirementsClarifications(clarifications || {});
+  if (!normalized.questions.length) return '';
+  const lines = normalized.questions.map((q) => {
+    const selected = Array.isArray(q.answer?.selectedOptionIds)
+      ? q.answer.selectedOptionIds
+      : [];
+    const selectedLabels = q.options
+      .filter((opt) => selected.includes(opt.id))
+      .map((opt) => opt.label);
+    const other = sanitizeReviewText(q.answer?.otherText, 2000);
+    const parts = [];
+    if (selectedLabels.length) parts.push(`选择：${selectedLabels.join('、')}`);
+    if (other) parts.push(`补充：${other}`);
+    return `- ${q.question}${parts.length ? `（${parts.join('；')}）` : ''}`;
+  });
+  return `技术栈确认结论：\n${lines.join('\n')}`.trim();
+}
+
 function buildReviewSummary(review) {
   const normalized = normalizeRequirementsReview(review || {});
   const notes = sanitizeReviewText(normalized.notes, 6000);
@@ -943,6 +968,142 @@ function buildDefaultClarificationQuestions(prompt) {
 
   questions.push(usersQuestion, nonFunctionalQuestion);
   return questions.map(normalizeClarificationQuestion).filter(Boolean);
+}
+
+function buildDefaultTechStackQuestions(prompt, designMarkdown) {
+  const now = new Date().toISOString();
+  const normalizedPrompt = normalizePrompt(prompt);
+  const normalizedDesign = sanitizeReviewText(designMarkdown, 1200);
+
+  const isFrontendOnly = /不需要后端|无后端|静态站|静态页面/i.test(
+    `${normalizedPrompt}\n${normalizedDesign}`,
+  );
+  const isBackendOnly = /仅接口|只做接口|后端服务|API/i.test(
+    `${normalizedPrompt}\n${normalizedDesign}`,
+  );
+
+  const frontendQuestion = {
+    id: 'frontend',
+    question: '前端/客户端技术栈倾向是什么？',
+    mode: 'single',
+    required: true,
+    allowOther: true,
+    options: [
+      { id: 'keep', label: '沿用现有项目技术栈（推荐）' },
+      { id: 'react-vite', label: 'React + Vite' },
+      { id: 'nextjs', label: 'Next.js (React)' },
+      { id: 'vue-vite', label: 'Vue + Vite' },
+      { id: 'vanilla', label: '纯 HTML/CSS/JS' },
+      { id: 'none', label: '不需要前端' },
+    ],
+    answer: { selectedOptionIds: [], otherText: '' },
+    createdAt: now,
+  };
+
+  const backendQuestion = {
+    id: 'backend',
+    question: '后端技术栈倾向是什么？',
+    mode: 'single',
+    required: true,
+    allowOther: true,
+    options: [
+      { id: 'keep', label: '沿用现有项目技术栈（推荐）' },
+      { id: 'nest', label: 'Node.js + NestJS' },
+      { id: 'express', label: 'Node.js + Express' },
+      { id: 'fastapi', label: 'Python + FastAPI' },
+      { id: 'spring', label: 'Java + Spring Boot' },
+      { id: 'none', label: '不需要后端' },
+    ],
+    answer: { selectedOptionIds: [], otherText: '' },
+    createdAt: now,
+  };
+
+  const databaseQuestion = {
+    id: 'database',
+    question: '数据存储倾向是什么？',
+    mode: 'single',
+    required: true,
+    allowOther: true,
+    options: [
+      { id: 'keep', label: '沿用现有项目技术栈（推荐）' },
+      { id: 'postgres', label: 'PostgreSQL' },
+      { id: 'mysql', label: 'MySQL' },
+      { id: 'sqlite', label: 'SQLite' },
+      { id: 'mongo', label: 'MongoDB' },
+      { id: 'none', label: '不需要数据库/文件存储即可' },
+    ],
+    answer: { selectedOptionIds: [], otherText: '' },
+    createdAt: now,
+  };
+
+  const authQuestion = {
+    id: 'auth',
+    question: '登录/鉴权方案倾向是什么？',
+    mode: 'single',
+    required: true,
+    allowOther: true,
+    options: [
+      { id: 'keep', label: '沿用现有项目技术栈（推荐）' },
+      { id: 'jwt', label: 'JWT' },
+      { id: 'session', label: 'Session + Cookie' },
+      { id: 'oauth', label: 'OAuth2 / 第三方登录' },
+      { id: 'none', label: '无登录/公开访问' },
+    ],
+    answer: { selectedOptionIds: [], otherText: '' },
+    createdAt: now,
+  };
+
+  const deployQuestion = {
+    id: 'deploy',
+    question: '部署方式倾向是什么？',
+    mode: 'single',
+    required: true,
+    allowOther: true,
+    options: [
+      { id: 'keep', label: '沿用现有项目技术栈（推荐）' },
+      { id: 'docker', label: 'Docker' },
+      { id: 'pm2', label: 'PM2/进程守护' },
+      { id: 'serverless', label: 'Serverless' },
+      { id: 'static', label: '静态托管' },
+      { id: 'local', label: '本地运行即可' },
+    ],
+    answer: { selectedOptionIds: [], otherText: '' },
+    createdAt: now,
+  };
+
+  const questions = [];
+  if (!isBackendOnly) questions.push(frontendQuestion);
+  if (!isFrontendOnly) questions.push(backendQuestion);
+  questions.push(databaseQuestion, authQuestion, deployQuestion);
+  return questions.map(normalizeClarificationQuestion).filter(Boolean);
+}
+
+function ensureTechStackClarificationsSeeded(specName, status, prompt, designMarkdown) {
+  const normalized = { ...DEFAULT_SPEC_STATUS, ...(status || {}) };
+  const current = normalizeRequirementsClarifications(
+    normalized.techStackClarifications || {},
+  );
+  if (!normalized.requirementsConfirmed) return { changed: false, status: normalized };
+  if (normalized.techStackConfirmed) return { changed: false, status: normalized };
+  if (current.questions.length > 0) return { changed: false, status: normalized };
+
+  const questions = buildDefaultTechStackQuestions(prompt, designMarkdown);
+  if (questions.length === 0) return { changed: false, status: normalized };
+
+  const now = new Date().toISOString();
+  const next = {
+    ...normalized,
+    techStackClarifications: {
+      ...current,
+      questions,
+      updatedAt: now,
+      confirmedAt: normalized.techStackClarifications?.confirmedAt ?? null,
+      generatedBy: 'default',
+      generationError: null,
+    },
+  };
+  writeSpecStatus(specName, next);
+  return { changed: true, status: next };
 }
 
 async function generateClarificationsWithModel(prompt) {
@@ -1707,12 +1868,20 @@ function getAtomizeStatus(job) {
     completed: job.completed,
     logs: job.logs,
     error: job.error,
+    batchSize: job.batchSize ?? null,
     startedAt: job.startedAt,
     updatedAt: job.updatedAt,
   };
 }
 
-async function runAtomizeJob(specName, job) {
+function normalizeAtomizeBatchSize(input) {
+  const value = Number.parseInt(String(input ?? ''), 10);
+  if (!Number.isFinite(value) || Number.isNaN(value)) return null;
+  if (value < 1) return null;
+  return Math.min(20, value);
+}
+
+async function runAtomizeJob(specName, job, options = {}) {
   try {
     assertValidLlmConfig(getActiveLlmConfig());
 
@@ -1736,8 +1905,17 @@ async function runAtomizeJob(specName, job) {
     job.completed = doneIndices.size;
     logAtomize(job, `检测到 ${summaries.length} 条任务，已完成 ${job.completed} 条。`);
 
+    const requestedBatchSize = normalizeAtomizeBatchSize(options.batchSize);
+    const defaultBatchSize = normalizeAtomizeBatchSize(
+      process.env.LLM_TASK_ATOMIZE_BATCH_SIZE || 0,
+    );
+    const batchSize = requestedBatchSize || defaultBatchSize || 3;
+    job.batchSize = batchSize;
+
     const maxRounds = Number(process.env.LLM_TASK_ATOMIZE_ROUNDS || 3);
     const timeoutMs = Number(process.env.LLM_TASK_ATOMIZE_TIMEOUT_MS || 60000);
+
+    let processedThisRun = 0;
 
     for (let i = 0; i < summaries.length; i += 1) {
       const index = i + 1;
@@ -1745,6 +1923,7 @@ async function runAtomizeJob(specName, job) {
         logAtomize(job, `跳过原始任务 ${index}（已完成）`);
         continue;
       }
+      if (processedThisRun >= batchSize) break;
       const summary = summaries[i];
       logAtomize(job, `开始原始任务 ${index}/${summaries.length}：${summary}`);
       const atomized = await atomizeTaskSummarySafe(summary, designSnippet, maxRounds, timeoutMs, job);
@@ -1752,11 +1931,23 @@ async function runAtomizeJob(specName, job) {
       fs.appendFileSync(atomicPath, `\n\n${section}\n`, 'utf8');
       doneIndices.add(index);
       job.completed = doneIndices.size;
+      processedThisRun += 1;
       logAtomize(job, `完成原始任务 ${index}/${summaries.length}`);
     }
 
     job.running = false;
-    logAtomize(job, '原子化完成');
+    job.error = null;
+
+    if (doneIndices.size >= summaries.length) {
+      logAtomize(job, '原子化完成');
+      return;
+    }
+
+    const remaining = Math.max(0, summaries.length - doneIndices.size);
+    logAtomize(
+      job,
+      `本次分段完成（处理 ${processedThisRun} 条），已完成 ${doneIndices.size}/${summaries.length}，剩余 ${remaining} 条。`,
+    );
   } catch (error) {
     job.running = false;
     job.error = error?.message || String(error);
@@ -2004,6 +2195,14 @@ function listSpecs() {
         try {
           const requirementsMarkdown = fs.readFileSync(resolveSpecFile(specName, 'requirements'), 'utf8');
           status = ensureRequirementsReviewSeeded(specName, status, requirementsMarkdown).status;
+        } catch {
+          // ignore seeding failures
+        }
+      }
+      if (files.design) {
+        try {
+          const designMarkdown = fs.readFileSync(resolveSpecFile(specName, 'design'), 'utf8');
+          status = ensureTechStackClarificationsSeeded(specName, status, status.prompt, designMarkdown).status;
         } catch {
           // ignore seeding failures
         }
@@ -2494,6 +2693,10 @@ app.get('/specs/:name/:artifact', (req, res) => {
     ensureRequirementsReviewSeeded(specName, status, content);
     ensureRequirementsClarificationsSeeded(specName, status, status.prompt);
   }
+  if (artifact === 'design') {
+    const status = readSpecStatus(specName);
+    ensureTechStackClarificationsSeeded(specName, status, status.prompt, content);
+  }
   return res.json({ content });
 });
 
@@ -2522,7 +2725,7 @@ app.post('/specs/:name/requirements/clarifications', (req, res) => {
   if (!specName) {
     return res.status(400).json({ error: 'Invalid spec request' });
   }
-  const status = readSpecStatus(specName);
+  let status = readSpecStatus(specName);
   const nextClarifications = normalizeRequirementsClarifications(req.body || {});
   status.requirementsClarifications = {
     ...nextClarifications,
@@ -2537,6 +2740,26 @@ app.post('/specs/:name/requirements/clarifications', (req, res) => {
   return res.json({ ok: true, status });
 });
 
+app.post('/specs/:name/tech-stack/clarifications', (req, res) => {
+  const specName = sanitizeSpecName(req.params.name);
+  if (!specName) {
+    return res.status(400).json({ error: 'Invalid spec request' });
+  }
+  const status = readSpecStatus(specName);
+  const nextClarifications = normalizeRequirementsClarifications(req.body || {});
+  status.techStackClarifications = {
+    ...nextClarifications,
+    updatedAt: new Date().toISOString(),
+    confirmedAt: status.techStackClarifications?.confirmedAt ?? null,
+  };
+  writeSpecStatus(specName, status);
+  emitEvent('log:append', {
+    source: 'spec',
+    message: `[spec] saved ${specName}/tech-stack-clarifications`,
+  });
+  return res.json({ ok: true, status });
+});
+
 app.post('/specs/:name/confirm', async (req, res) => {
   const specName = sanitizeSpecName(req.params.name);
   const artifact = req.body?.artifact;
@@ -2545,7 +2768,7 @@ app.post('/specs/:name/confirm', async (req, res) => {
     return res.status(400).json({ error: 'Invalid spec request' });
   }
 
-  const status = readSpecStatus(specName);
+  let status = readSpecStatus(specName);
 
   if (artifact === 'requirements') {
     const incomingReview = req.body?.review || req.body?.requirementsReview || null;
@@ -2608,15 +2831,48 @@ app.post('/specs/:name/confirm', async (req, res) => {
     if (!status.requirementsConfirmed) {
       return res.status(409).json({ error: 'Requirements not confirmed' });
     }
-    status.designConfirmed = true;
     const designPath = resolveSpecFile(specName, 'design');
     const designContent = fs.existsSync(designPath) ? fs.readFileSync(designPath, 'utf8') : '';
+
+    // Ensure tech stack confirmation questions exist before generating tasks.
+    status = ensureTechStackClarificationsSeeded(
+      specName,
+      status,
+      status.prompt,
+      designContent,
+    ).status;
+
+    const incomingTechStackClarifications =
+      req.body?.techStackClarifications || req.body?.techStack || null;
+    if (incomingTechStackClarifications) {
+      status.techStackClarifications = mergeRequirementsClarifications(
+        status.techStackClarifications,
+        incomingTechStackClarifications,
+      );
+    }
+
+    if (!areClarificationsComplete(status.techStackClarifications)) {
+      writeSpecStatus(specName, status);
+      return res.status(409).json({ error: 'Tech stack clarifications incomplete' });
+    }
+
+    const now = new Date().toISOString();
+    status.techStackClarifications = {
+      ...normalizeRequirementsClarifications(status.techStackClarifications || {}),
+      updatedAt: now,
+      confirmedAt: now,
+    };
+    status.techStackConfirmed = true;
+    status.designConfirmed = true;
     const tasksPath = resolveSpecFile(specName, 'tasks');
     const shouldGenerate =
       force || !fs.existsSync(tasksPath) || fs.readFileSync(tasksPath, 'utf8').trim() === '';
     if (shouldGenerate) {
       try {
-        const content = await generateTasksWithModel(designContent, status.prompt);
+        const supplementalPrompt = [status.prompt, buildTechStackSummary(status.techStackClarifications)]
+          .filter(Boolean)
+          .join('\n\n');
+        const content = await generateTasksWithModel(designContent, supplementalPrompt);
         writeSpecFile(specName, 'tasks', content);
         status.lastError = null;
 
@@ -2667,21 +2923,32 @@ app.post('/specs/:name/tasks/atomize', async (req, res) => {
     return res.json(getAtomizeStatus(existing));
   }
 
-  const job = {
+  const batchSize = normalizeAtomizeBatchSize(
+    req.body?.batchSize ?? req.body?.segmentSize ?? req.query?.batchSize,
+  );
+
+  const now = new Date().toISOString();
+  const job = existing || {
     specName,
-    running: true,
+    running: false,
     total: 0,
     completed: 0,
     logs: [],
     error: null,
-    startedAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    startedAt: now,
+    updatedAt: now,
   };
+  job.running = true;
+  job.error = null;
+  job.updatedAt = now;
   atomizeJobs.set(specName, job);
-  logAtomize(job, '原子化任务已启动');
+  logAtomize(
+    job,
+    `原子化任务已启动${batchSize ? `（分段：${batchSize} 条）` : '（分段：默认）'}`,
+  );
 
   setImmediate(() => {
-    runAtomizeJob(specName, job);
+    runAtomizeJob(specName, job, { batchSize });
   });
 
   return res.json(getAtomizeStatus(job));
