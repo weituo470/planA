@@ -639,29 +639,6 @@ export default function App() {
     }
   }, [activeArtifact, atomizeStatus?.running, loadTasksAtomic, selectedSpecName, showToast, taskView]);
 
-  useEffect(() => {
-    if (!selectedSpecName) {
-      atomizePrevRef.current = null;
-      return;
-    }
-
-    const prev = atomizePrevRef.current;
-    const currentRunning = Boolean(atomizeStatus?.running);
-    const currentCompleted = atomizeStatus?.completed ?? 0;
-    const currentTotal = atomizeStatus?.total ?? 0;
-    const currentError = atomizeStatus?.error ?? null;
-
-    atomizePrevRef.current = { specName: selectedSpecName, running: currentRunning };
-
-    if (!prev || prev.specName !== selectedSpecName) return;
-    if (!atomizeAutoContinue) return;
-    if (!prev.running || currentRunning) return;
-    if (currentError) return;
-    if (currentTotal > 0 && currentCompleted < currentTotal) {
-      void startAtomizeTasks();
-    }
-  }, [atomizeAutoContinue, atomizeStatus, selectedSpecName, startAtomizeTasks]);
-
   const createSpec = useCallback(async () => {
     setToast(null);
     setBusyLabel('生成中');
@@ -849,6 +826,29 @@ export default function App() {
     }
   }, [atomizeBatchSizeText, selectedSpecName, showToast]);
 
+  useEffect(() => {
+    if (!selectedSpecName) {
+      atomizePrevRef.current = null;
+      return;
+    }
+
+    const prev = atomizePrevRef.current;
+    const currentRunning = Boolean(atomizeStatus?.running);
+    const currentCompleted = atomizeStatus?.completed ?? 0;
+    const currentTotal = atomizeStatus?.total ?? 0;
+    const currentError = atomizeStatus?.error ?? null;
+
+    atomizePrevRef.current = { specName: selectedSpecName, running: currentRunning };
+
+    if (!prev || prev.specName !== selectedSpecName) return;
+    if (!atomizeAutoContinue) return;
+    if (!prev.running || currentRunning) return;
+    if (currentError) return;
+    if (currentTotal > 0 && currentCompleted < currentTotal) {
+      void startAtomizeTasks();
+    }
+  }, [atomizeAutoContinue, atomizeStatus, selectedSpecName, startAtomizeTasks]);
+
   const downloadCurrentMd = useCallback(() => {
     if (!selectedSpecName) return;
     const isAtomicView = activeArtifact === 'tasks' && taskView === 'atomic';
@@ -906,27 +906,27 @@ export default function App() {
           '- 建议：让 AI IDE 在编码前先阅读 design.md，确保实现方向一致。',
           '',
           '3) tasks.md（任务）',
-          '- 用途：可执行的任务清单与执行记录入口（强烈建议 AI IDE 以此文件驱动实现）。',
+          '- 用途：任务总览、范围约束与回写入口（与 tasks_atomic.md 保持同步）。',
           '- 工作方式：',
-          '  a) AI IDE 读取 tasks.md，逐条实现任务；',
-          '  b) 每完成一项就勾选（- [x]）并在任务下补充“实现说明/变更文件/验证结果”；',
-          '  c) 如发现遗漏，先更新 tasks.md 再写代码，保持任务与代码同步。',
+          '  a) 保持 tasks.md 覆盖所有待办与范围边界；',
+          '  b) AI IDE 实施时优先按 tasks_atomic.md 执行，并将完成情况/关键变更回写到 tasks.md；',
+          '  c) 如发现遗漏或范围变化，先更新 tasks.md，再重新生成 tasks_atomic.md 后继续。',
           '',
-          '4) tasks_atomic.md（任务原子化）',
-          '- 用途：基于 tasks.md 自动拆解的原子任务列表，适合精细执行与逐条验收。',
-          '- 建议：当 tasks.md 过于粗略时，先生成 tasks_atomic.md，再要求 AI IDE 按原子任务逐条实现。',
+          '4) tasks_atomic.md（原子化任务表单）',
+          '- 用途：AI IDE 开发的首选执行清单（原子任务粒度，便于逐条验收与并行推进）。',
+          '- 建议：交付给 AI IDE 时，默认以 tasks_atomic.md 为执行单元逐条实现；完成后勾选（- [x]）并补充“实现说明/变更文件/验证结果”。',
           '',
           '推荐流程（类似 Kiro）：',
           '1. 写原始需求 → 生成 requirements',
           '2. 完成“需求确认” → 生成 design',
           '3. 从 design 生成 tasks',
-          '4. 需要更细粒度时，生成 tasks_atomic',
+          '4. 生成 tasks_atomic（推荐，交付 AI IDE 前完成）',
           '5. 将 requirements/design/tasks/tasks_atomic 提供给你的 AI 编程工具/IDE，要求它：',
           '   - 以 requirements/design 作为约束与上下文',
-          '   - 以 tasks.md 作为执行计划与完成记录',
-          '   - 只在 tasks.md 明确的范围内改代码，并持续回写 tasks.md',
+          '   - 优先以 tasks_atomic.md（原子化任务表单）逐条执行并回写完成记录',
+          '   - tasks.md 用于同步范围与里程碑；如需变更先改 tasks.md 再继续',
           '',
-          '提示：当你要加功能或改需求时，先更新 requirements/design/tasks，再让 AI IDE 继续执行。',
+          '提示：当你要加功能或改需求时，先更新 requirements/design/tasks（必要时重新生成 tasks_atomic），再让 AI IDE 继续执行。',
           '',
         ].join('\n'),
       );
