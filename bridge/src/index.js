@@ -17,6 +17,8 @@ const PORT = process.env.WORKFLOW_BRIDGE_PORT || 4100;
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const EVENT_LOG = path.join(DATA_DIR, 'events.jsonl');
 const LLM_CONFIG_FILE = path.join(DATA_DIR, 'llm-config.json');
+const PROMPT_CONFIG_FILE = path.join(DATA_DIR, 'prompt-config.json');
+const PROMPT_PRESETS_FILE = path.join(DATA_DIR, 'prompt-presets.json');
 const ROOT_DIR = path.resolve(__dirname, '..', '..', '..');
 const WATCH_DIRS =
   process.env.WORKFLOW_WATCH_DIRS || '.codex,task,workflow';
@@ -100,6 +102,176 @@ const LLM_MODEL_ALIASES = {
   'gemini-3-pro': 'gemini-3-pro-preview[x6]',
   'claude-4.5-opus': 'claude-opus-4-5-20251101',
 };
+
+const PROMPT_STAGE_KEYS = [
+  'requirements',
+  'requirementsClarifications',
+  'design',
+  'tasks',
+  'atomize',
+];
+
+const DEFAULT_PROMPT_CONFIG = {
+  version: 1,
+  stages: {
+    requirements: {
+      label: '需求生成',
+      variables: ['prompt'],
+      system:
+        '你是产品需求助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
+      user:
+        `需求描述：{{prompt}}\n\n` +
+        '请只输出 JSON，必须包含字段：background（字符串）, user_stories（字符串数组）, acceptance（字符串数组）。\n' +
+        '要求：所有内容必须为简体中文；acceptance 每条为“当...时，系统应...”风格的可验证语句。\n' +
+        '不要输出除 JSON 以外的任何内容。',
+    },
+    requirementsClarifications: {
+      label: '需求确认问题生成',
+      variables: ['prompt'],
+      system:
+        '你是需求澄清助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
+      user:
+        `原始需求：{{prompt}}\n\n` +
+        '请生成 5-8 个“需求确认问题”，用于对齐开发口径：\n' +
+        '- 必须结合原始需求的领域/关键词（至少 2 题需要直接引用关键词）\n' +
+        '- 每题都要给出 3-6 个可点击选项，并允许“其他（用户输入）”\n' +
+        '- 避免泛泛而谈（例如“还有什么需求？”、“预算多少？”）\n\n' +
+        '仅输出 JSON，结构如下（示例字段，不要输出示例说明文字）：\n' +
+        '{"questions":[{"id":"q1","question":"...","mode":"single","required":true,"allowOther":true,"options":[{"id":"a","label":"..."}]}]}',
+    },
+    design: {
+      label: '设计生成',
+      variables: ['requirements', 'prompt'],
+      system:
+        '你是软件设计助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
+      user:
+        `需求内容如下：\n{{requirements}}\n\n补充描述：{{prompt}}\n\n` +
+        '请只输出 JSON，字段：overview（字符串）, flows（字符串数组）, considerations（字符串数组）。不要输出除 JSON 以外的任何内容。',
+    },
+    tasks: {
+      label: '任务生成',
+      variables: ['design', 'prompt', 'minTasks', 'maxTasks'],
+      system:
+        '你是项目任务拆解助手。请输出清晰但不必原子化的任务列表。只输出 JSON，不要解释。',
+      user:
+        `设计内容如下：\n{{design}}\n\n补充描述：{{prompt}}\n\n` +
+        '请输出 {{minTasks}}-{{maxTasks}} 条任务（不要求原子化）。' +
+        '每条任务必须包含 title/core/details/ac 四个字段，简体中文。\n' +
+        'title 写清任务名称与产出，允许是模块/流程级别，不要求文件路径。\n' +
+        '请严格输出 JSON：{"tasks":[{title,core,details,ac}]}。',
+    },
+    atomize: {
+      label: '任务原子化',
+      variables: ['context', 'main', 'reasonBlock'],
+      system:
+        'Role: 硬核工程架构师 (Hardcore Engineering Lead)。你擅长把任务拆解为“原子级执行指令”。只输出 JSON。',
+      user:
+        `{{context}}{{main}}\n\n{{reasonBlock}}` +
+        '要求：\n' +
+        '1) 输出为原子级任务，不要摘要，拆到无法再拆。\n' +
+        '2) 任务对象字段：title/core/details/ac。\n' +
+        '3) title 必须以“创建/修改/删除 <文件路径>”开头（路径不确定用 TBD）。\n' +
+        '4) core/details/ac 必须具体可执行，包含函数名/变量名/组件 Prop/CSS 类名；每条任务应在 15 分钟内可完成。\n' +
+        '5) 遵循定义先行：先 types/interfaces/schema，再业务逻辑。\n' +
+        '6) 禁止自由发挥，保持与上下文一致；若涉及样式，写清具体类名或布局方案。\n' +
+        '7) 任务顺序建议：Types/Interfaces -> Schema -> Utils/Storage -> UI 静态组件 -> 状态管理 -> 交互逻辑 -> 边界自愈。\n' +
+        '8) 简体中文。\n' +
+        '只输出 JSON：{"tasks":[...]}。',
+    },
+  },
+};
+
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function applyPromptTemplate(template, vars = {}) {
+  const raw = typeof template === 'string' ? template : '';
+  return raw.replace(/{{\s*([a-zA-Z0-9_.-]+)\s*}}/g, (match, key) => {
+    if (!Object.prototype.hasOwnProperty.call(vars, key)) return '';
+    const value = vars[key];
+    if (value === null || value === undefined) return '';
+    return String(value);
+  });
+}
+
+function normalizePromptConfig(input) {
+  const defaults = cloneJson(DEFAULT_PROMPT_CONFIG);
+  const raw = input && typeof input === 'object' ? input : {};
+  const rawStages = raw?.stages && typeof raw.stages === 'object' ? raw.stages : {};
+
+  const stages = {};
+  for (const key of PROMPT_STAGE_KEYS) {
+    const fallback = defaults.stages[key];
+    const candidate =
+      rawStages && rawStages[key] && typeof rawStages[key] === 'object'
+        ? rawStages[key]
+        : {};
+    stages[key] = {
+      label:
+        typeof candidate.label === 'string' && candidate.label.trim()
+          ? candidate.label.trim()
+          : fallback.label,
+      variables: Array.isArray(candidate.variables)
+        ? candidate.variables.map((v) => String(v)).filter(Boolean)
+        : fallback.variables,
+      system: typeof candidate.system === 'string' ? candidate.system : fallback.system,
+      user: typeof candidate.user === 'string' ? candidate.user : fallback.user,
+    };
+  }
+
+  const updatedAt =
+    typeof raw.updatedAt === 'string' && raw.updatedAt.trim() ? raw.updatedAt : null;
+
+  return {
+    version: defaults.version,
+    updatedAt,
+    stages,
+  };
+}
+
+function loadPromptConfig() {
+  if (!fs.existsSync(PROMPT_CONFIG_FILE)) return normalizePromptConfig({});
+  try {
+    const raw = JSON.parse(fs.readFileSync(PROMPT_CONFIG_FILE, 'utf8'));
+    return normalizePromptConfig(raw);
+  } catch {
+    return normalizePromptConfig({});
+  }
+}
+
+function persistPromptConfig(nextConfig) {
+  const normalized = normalizePromptConfig(nextConfig);
+  const persisted = { ...normalized, updatedAt: new Date().toISOString() };
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(PROMPT_CONFIG_FILE, JSON.stringify(persisted, null, 2), 'utf8');
+  return persisted;
+}
+
+function loadPromptPresets() {
+  if (!fs.existsSync(PROMPT_PRESETS_FILE)) return [];
+  try {
+    const raw = JSON.parse(fs.readFileSync(PROMPT_PRESETS_FILE, 'utf8'));
+    return Array.isArray(raw) ? raw : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistPromptPresets(presets) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(
+    PROMPT_PRESETS_FILE,
+    JSON.stringify(presets || [], null, 2),
+    'utf8',
+  );
+}
+
+function normalizePresetName(name) {
+  const normalized = typeof name === 'string' ? name.trim() : '';
+  if (!normalized) return '';
+  return normalized.slice(0, 48);
+}
 
 function loadLocalEnv() {
   const envPath = path.join(ROOT_DIR, 'workflow', 'task', 'mvp2', '.mvp2env');
@@ -1131,22 +1303,16 @@ async function generateClarificationsWithModel(prompt) {
   };
 
   try {
+    const promptConfig = loadPromptConfig();
+    const stage = promptConfig.stages.requirementsClarifications;
     const content = await callLlm([
       {
         role: 'system',
-        content:
-          '你是需求澄清助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
+        content: applyPromptTemplate(stage.system, { prompt }),
       },
       {
         role: 'user',
-        content:
-          `原始需求：${prompt}\n\n` +
-          '请生成 5-8 个“需求确认问题”，用于对齐开发口径：\n' +
-          '- 必须结合原始需求的领域/关键词（至少 2 题需要直接引用关键词）\n' +
-          '- 每题都要给出 3-6 个可点击选项，并允许“其他（用户输入）”\n' +
-          '- 避免泛泛而谈（例如“还有什么需求？”、“预算多少？”）\n\n' +
-          '仅输出 JSON，结构如下（示例字段，不要输出示例说明文字）：\n' +
-          '{\"questions\":[{\"id\":\"q1\",\"question\":\"...\",\"mode\":\"single\",\"required\":true,\"allowOther\":true,\"options\":[{\"id\":\"a\",\"label\":\"...\"}]}]}',
+        content: applyPromptTemplate(stage.user, { prompt }),
       },
     ]);
     const payload = tryParseJson(content);
@@ -1435,18 +1601,16 @@ function buildTasksMarkdown(prompt, payload) {
 async function generateRequirementsWithModel(prompt) {
   assertValidLlmConfig(getActiveLlmConfig());
 
+  const promptConfig = loadPromptConfig();
+  const stage = promptConfig.stages.requirements;
   const content = await callLlm([
     {
       role: 'system',
-      content: '你是产品需求助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
+      content: applyPromptTemplate(stage.system, { prompt }),
     },
     {
       role: 'user',
-      content:
-        `需求描述：${prompt}\n\n` +
-        '请只输出 JSON，必须包含字段：background（字符串）, user_stories（字符串数组）, acceptance（字符串数组）。\n' +
-        '要求：所有内容必须为简体中文；acceptance 每条为“当...时，系统应...”风格的可验证语句。\n' +
-        '不要输出除 JSON 以外的任何内容。',
+      content: applyPromptTemplate(stage.user, { prompt }),
     },
   ]);
 
@@ -1485,17 +1649,16 @@ function resolveDesignPrompt(prompt, requirements) {
 async function generateDesignWithModel(requirements, prompt) {
   assertValidLlmConfig(getActiveLlmConfig());
 
+  const promptConfig = loadPromptConfig();
+  const stage = promptConfig.stages.design;
   const content = await callLlm([
     {
       role: 'system',
-      content:
-        '你是软件设计助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
+      content: applyPromptTemplate(stage.system, { requirements, prompt }),
     },
     {
       role: 'user',
-      content:
-        `需求内容如下：\n${requirements || ''}\n\n补充描述：${prompt}\n\n` +
-        '请只输出 JSON，字段：overview（字符串）, flows（字符串数组）, considerations（字符串数组）。不要输出除 JSON 以外的任何内容。',
+      content: applyPromptTemplate(stage.user, { requirements, prompt }),
     },
   ]);
   const payload = tryParseJson(content);
@@ -1679,21 +1842,18 @@ async function generateTasksWithModel(design, prompt) {
   const maxTasks = Number(process.env.LLM_TASK_MAX || 16);
   const timeoutMs = Math.min(Number(process.env.LLM_TASK_TIMEOUT_MS || 60000), 120000);
 
+  const promptConfig = loadPromptConfig();
+  const stage = promptConfig.stages.tasks;
+
   const content = await callLlm(
     [
       {
         role: 'system',
-        content:
-          '你是项目任务拆解助手。请输出清晰但不必原子化的任务列表。只输出 JSON，不要解释。',
+        content: applyPromptTemplate(stage.system, { design, prompt, minTasks, maxTasks }),
       },
       {
         role: 'user',
-        content:
-          `设计内容如下：\n${design || ''}\n\n补充描述：${prompt || ''}\n\n` +
-          `请输出 ${minTasks}-${maxTasks} 条任务（不要求原子化）。` +
-          '每条任务必须包含 title/core/details/ac 四个字段，简体中文。\n' +
-          'title 写清任务名称与产出，允许是模块/流程级别，不要求文件路径。\n' +
-          '请严格输出 JSON：{"tasks":[{title,core,details,ac}]}。',
+        content: applyPromptTemplate(stage.user, { design, prompt, minTasks, maxTasks }),
       },
     ],
     { timeoutMs },
@@ -1714,18 +1874,8 @@ async function generateTasksWithModel(design, prompt) {
 }
 
 async function requestAtomicTasks(payload, designSnippet, timeoutMs, reason = '') {
-  const baseSystem =
-    'Role: 硬核工程架构师 (Hardcore Engineering Lead)。你擅长把任务拆解为“原子级执行指令”。只输出 JSON。';
-  const baseRequirement =
-    `要求：\n` +
-    `1) 输出为原子级任务，不要摘要，拆到无法再拆。\n` +
-    `2) 任务对象字段：title/core/details/ac。\n` +
-    `3) title 必须以“创建/修改/删除 <文件路径>”开头（路径不确定用 TBD）。\n` +
-    `4) core/details/ac 必须具体可执行，包含函数名/变量名/组件 Prop/CSS 类名；每条任务应在 15 分钟内可完成。\n` +
-    `5) 遵循定义先行：先 types/interfaces/schema，再业务逻辑。\n` +
-    `6) 禁止自由发挥，保持与上下文一致；若涉及样式，写清具体类名或布局方案。\n` +
-    `7) 任务顺序建议：Types/Interfaces -> Schema -> Utils/Storage -> UI 静态组件 -> 状态管理 -> 交互逻辑 -> 边界自愈。\n` +
-    `8) 简体中文。\n`;
+  const promptConfig = loadPromptConfig();
+  const stage = promptConfig.stages.atomize;
 
   const isList = Array.isArray(payload?.tasks);
   const context = designSnippet ? `设计摘要：${designSnippet}\n\n` : '';
@@ -1733,15 +1883,17 @@ async function requestAtomicTasks(payload, designSnippet, timeoutMs, reason = ''
     ? `当前任务列表（JSON）：\n${JSON.stringify(payload.tasks)}\n\n请进一步拆分为更原子任务；若已足够原子则保持。`
     : `原始任务：${payload.summary}\n\n请拆分为无法再拆的原子任务。`;
 
+  const reasonBlock = reason ? `注意：${reason}\n` : '';
+
   const content = await callLlm(
     [
-      { role: 'system', content: baseSystem },
+      {
+        role: 'system',
+        content: applyPromptTemplate(stage.system, { context, main, reasonBlock }),
+      },
       {
         role: 'user',
-        content:
-          `${context}${main}\n\n${reason ? `注意：${reason}\n` : ''}` +
-          baseRequirement +
-          '只输出 JSON：{"tasks":[...]}。',
+        content: applyPromptTemplate(stage.user, { context, main, reasonBlock }),
       },
     ],
     { timeoutMs },
@@ -1754,17 +1906,15 @@ async function requestAtomicTasks(payload, designSnippet, timeoutMs, reason = ''
   if (!verdict.ok) {
     const repair = await callLlm(
       [
-        { role: 'system', content: baseSystem },
+        {
+          role: 'system',
+          content: applyPromptTemplate(stage.system, { context, main, reasonBlock }),
+        },
         {
           role: 'user',
           content:
-            `上一次输出不符合要求（原因：${verdict.error}）。请直接重做。
-` +
-            `${context}${main}
-
-` +
-            baseRequirement +
-            '只输出 JSON：{"tasks":[...]}。',
+            `上一次输出不符合要求（原因：${verdict.error}）。请直接重做。\n\n` +
+            applyPromptTemplate(stage.user, { context, main, reasonBlock }),
         },
       ],
       { timeoutMs },
@@ -2623,6 +2773,80 @@ app.post('/llm/model', (req, res) => {
     });
   } catch (error) {
     return res.status(400).json({ error: error?.message || 'Invalid model' });
+  }
+});
+
+app.get('/prompts', (req, res) => {
+  const current = loadPromptConfig();
+  const defaults = normalizePromptConfig(DEFAULT_PROMPT_CONFIG);
+  const presets = loadPromptPresets().filter((item) => item && typeof item === 'object');
+  return res.json({ current, defaults, presets });
+});
+
+app.post('/prompts', (req, res) => {
+  try {
+    const incoming = req.body?.config ?? req.body ?? {};
+    const saved = persistPromptConfig(incoming);
+    emitEvent('log:append', { source: 'prompt', message: '[prompt] config updated' });
+    const defaults = normalizePromptConfig(DEFAULT_PROMPT_CONFIG);
+    const presets = loadPromptPresets().filter((item) => item && typeof item === 'object');
+    return res.json({ current: saved, defaults, presets });
+  } catch (error) {
+    return res.status(400).json({ error: error?.message || 'Invalid prompt config' });
+  }
+});
+
+app.post('/prompts/reset', (req, res) => {
+  try {
+    const saved = persistPromptConfig(DEFAULT_PROMPT_CONFIG);
+    emitEvent('log:append', { source: 'prompt', message: '[prompt] config reset' });
+    const defaults = normalizePromptConfig(DEFAULT_PROMPT_CONFIG);
+    const presets = loadPromptPresets().filter((item) => item && typeof item === 'object');
+    return res.json({ current: saved, defaults, presets });
+  } catch (error) {
+    return res.status(400).json({ error: error?.message || 'Reset failed' });
+  }
+});
+
+app.post('/prompts/presets', (req, res) => {
+  try {
+    const name = normalizePresetName(req.body?.name);
+    if (!name) return res.status(400).json({ error: 'Invalid preset name' });
+    const config = normalizePromptConfig(req.body?.config ?? loadPromptConfig());
+    const existing = loadPromptPresets().filter((item) => item && typeof item === 'object');
+    const savedAt = new Date().toISOString();
+    const next = existing.filter((p) => String(p?.name || '') !== name);
+    next.unshift({ name, savedAt, config });
+    if (next.length > 30) next.length = 30;
+    persistPromptPresets(next);
+    emitEvent('log:append', {
+      source: 'prompt',
+      message: `[prompt] preset saved: ${name}`,
+    });
+    const current = loadPromptConfig();
+    const defaults = normalizePromptConfig(DEFAULT_PROMPT_CONFIG);
+    return res.json({ current, defaults, presets: next });
+  } catch (error) {
+    return res.status(400).json({ error: error?.message || 'Preset save failed' });
+  }
+});
+
+app.post('/prompts/presets/apply', (req, res) => {
+  try {
+    const name = normalizePresetName(req.body?.name);
+    if (!name) return res.status(400).json({ error: 'Invalid preset name' });
+    const presets = loadPromptPresets().filter((item) => item && typeof item === 'object');
+    const hit = presets.find((p) => String(p?.name || '') === name);
+    if (!hit) return res.status(404).json({ error: 'Preset not found' });
+    const saved = persistPromptConfig(hit.config);
+    emitEvent('log:append', {
+      source: 'prompt',
+      message: `[prompt] preset applied: ${name}`,
+    });
+    const defaults = normalizePromptConfig(DEFAULT_PROMPT_CONFIG);
+    return res.json({ current: saved, defaults, presets });
+  } catch (error) {
+    return res.status(400).json({ error: error?.message || 'Preset apply failed' });
   }
 });
 

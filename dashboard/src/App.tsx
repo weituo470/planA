@@ -2,7 +2,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import JSZip from 'jszip';
 
 import { Button } from './components/ui/button';
-import type { ClarificationQuestion, LlmInfo, LlmPingResult, SpecArtifact, SpecSummary } from './types';
+import type {
+  ClarificationQuestion,
+  LlmInfo,
+  LlmPingResult,
+  PromptConfig,
+  PromptConfigResponse,
+  SpecArtifact,
+  SpecSummary,
+} from './types';
 
 const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
 const API_TIMEOUT_MS = Number(import.meta.env.VITE_API_TIMEOUT_MS || 90000);
@@ -25,6 +33,14 @@ type AtomizeStatus = {
   startedAt?: string | null;
   updatedAt?: string | null;
 };
+
+const PROMPT_STAGE_ORDER = [
+  { key: 'requirements', label: '需求生成' },
+  { key: 'requirementsClarifications', label: '需求确认问题生成' },
+  { key: 'design', label: '设计生成' },
+  { key: 'tasks', label: '任务生成' },
+  { key: 'atomize', label: '任务原子化' },
+] as const;
 
 function sanitizeFilePart(input: string) {
   return String(input || '')
@@ -297,6 +313,11 @@ export default function App() {
   const [tasksAtomicContent, setTasksAtomicContent] = useState('');
   const [atomizeStatus, setAtomizeStatus] = useState<AtomizeStatus | null>(null);
   const [atomizeBatchSizeText, setAtomizeBatchSizeText] = useState('3');
+  const [atomizeAutoContinue, setAtomizeAutoContinue] = useState(true);
+  const atomizePrevRef = useRef<{
+    specName: string | null;
+    running: boolean;
+  } | null>(null);
   const baselineContentRef = useRef<Record<SpecArtifact, string>>({
     requirements: '',
     design: '',
@@ -319,6 +340,9 @@ export default function App() {
   });
   const [clarifications, setClarifications] = useState<ClarificationQuestion[]>([]);
   const [techStackClarifications, setTechStackClarifications] = useState<ClarificationQuestion[]>([]);
+  const [promptConfig, setPromptConfig] = useState<PromptConfigResponse | null>(null);
+  const [promptDraft, setPromptDraft] = useState<PromptConfig | null>(null);
+  const [promptPresetToApply, setPromptPresetToApply] = useState('');
   const [llm, setLlm] = useState<LlmInfo | null>(null);
   const [modelPing, setModelPing] = useState<
     Record<
@@ -411,6 +435,81 @@ export default function App() {
     }
   }, []);
 
+  const refreshPrompts = useCallback(async () => {
+    const data = await apiJson<PromptConfigResponse>('/prompts');
+    setPromptConfig(data);
+    setPromptDraft(data.current ?? null);
+    setPromptPresetToApply('');
+  }, []);
+
+  const savePromptDraftToServer = useCallback(async () => {
+    if (!promptDraft) return;
+    setToast(null);
+    try {
+      const data = await apiJson<PromptConfigResponse>('/prompts', {
+        method: 'POST',
+        body: JSON.stringify({ config: promptDraft }),
+      });
+      setPromptConfig(data);
+      setPromptDraft(data.current ?? null);
+      showToast('提示词已保存', 'info');
+    } catch (e: any) {
+      showToast(humanizeError(e));
+    }
+  }, [promptDraft, showToast]);
+
+  const resetPromptDraftToDefault = useCallback(async () => {
+    setToast(null);
+    try {
+      const data = await apiJson<PromptConfigResponse>('/prompts/reset', { method: 'POST' });
+      setPromptConfig(data);
+      setPromptDraft(data.current ?? null);
+      setPromptPresetToApply('');
+      showToast('提示词已还原为默认配置', 'info');
+    } catch (e: any) {
+      showToast(humanizeError(e));
+    }
+  }, [showToast]);
+
+  const savePromptPreset = useCallback(async () => {
+    if (!promptDraft) return;
+    const name = window.prompt('存档名称（用于以后快速切换）');
+    if (name === null) return;
+    const trimmed = name.trim();
+    if (!trimmed) {
+      showToast('存档名称不能为空');
+      return;
+    }
+    setToast(null);
+    try {
+      const data = await apiJson<PromptConfigResponse>('/prompts/presets', {
+        method: 'POST',
+        body: JSON.stringify({ name: trimmed, config: promptDraft }),
+      });
+      setPromptConfig(data);
+      showToast('存档已保存', 'info');
+    } catch (e: any) {
+      showToast(humanizeError(e));
+    }
+  }, [promptDraft, showToast]);
+
+  const applyPromptPreset = useCallback(async () => {
+    const name = promptPresetToApply.trim();
+    if (!name) return;
+    setToast(null);
+    try {
+      const data = await apiJson<PromptConfigResponse>('/prompts/presets/apply', {
+        method: 'POST',
+        body: JSON.stringify({ name }),
+      });
+      setPromptConfig(data);
+      setPromptDraft(data.current ?? null);
+      showToast('存档已应用', 'info');
+    } catch (e: any) {
+      showToast(humanizeError(e));
+    }
+  }, [promptPresetToApply, showToast]);
+
   const loadArtifact = useCallback(
     async (specName: string, artifact: SpecArtifact) => {
       try {
@@ -470,7 +569,8 @@ export default function App() {
   useEffect(() => {
     void refreshSpecs().catch((e) => showToast(humanizeError(e)));
     void refreshLlm().catch((e) => showToast(humanizeError(e)));
-  }, [refreshLlm, refreshSpecs]);
+    void refreshPrompts().catch((e) => showToast(humanizeError(e)));
+  }, [refreshLlm, refreshPrompts, refreshSpecs, showToast]);
 
   useEffect(() => {
     if (!busyLabel) {
@@ -538,6 +638,29 @@ export default function App() {
       void loadTasksAtomic(selectedSpecName).catch((e) => showToast(humanizeError(e)));
     }
   }, [activeArtifact, atomizeStatus?.running, loadTasksAtomic, selectedSpecName, showToast, taskView]);
+
+  useEffect(() => {
+    if (!selectedSpecName) {
+      atomizePrevRef.current = null;
+      return;
+    }
+
+    const prev = atomizePrevRef.current;
+    const currentRunning = Boolean(atomizeStatus?.running);
+    const currentCompleted = atomizeStatus?.completed ?? 0;
+    const currentTotal = atomizeStatus?.total ?? 0;
+    const currentError = atomizeStatus?.error ?? null;
+
+    atomizePrevRef.current = { specName: selectedSpecName, running: currentRunning };
+
+    if (!prev || prev.specName !== selectedSpecName) return;
+    if (!atomizeAutoContinue) return;
+    if (!prev.running || currentRunning) return;
+    if (currentError) return;
+    if (currentTotal > 0 && currentCompleted < currentTotal) {
+      void startAtomizeTasks();
+    }
+  }, [atomizeAutoContinue, atomizeStatus, selectedSpecName, startAtomizeTasks]);
 
   const createSpec = useCallback(async () => {
     setToast(null);
@@ -970,6 +1093,24 @@ export default function App() {
     [modelPing, normalizeModelLabel],
   );
 
+  const updatePromptStageField = useCallback((stageKey: string, field: 'system' | 'user', value: string) => {
+    setPromptDraft((prev) => {
+      if (!prev) return prev;
+      const currentStage = prev.stages?.[stageKey];
+      if (!currentStage) return prev;
+      return {
+        ...prev,
+        stages: {
+          ...prev.stages,
+          [stageKey]: {
+            ...currentStage,
+            [field]: value,
+          },
+        },
+      };
+    });
+  }, []);
+
   const activeModelId = llm?.model ?? '';
   const activePing = activeModelId ? modelPing[activeModelId] : null;
   const isAtomicView = activeArtifact === 'tasks' && taskView === 'atomic';
@@ -1102,6 +1243,219 @@ export default function App() {
               );
             })}
           </div>
+
+          <details className="rounded-md border border-slate-800 bg-slate-900/30 p-3">
+            <summary className="cursor-pointer select-none text-sm font-semibold text-slate-200">
+              使用说明（点击展开）
+            </summary>
+            <div className="mt-2 space-y-3">
+              <div className="text-xs text-slate-400">
+                流程：原始需求 → 需求确认 → 设计 → 技术栈确认 → 任务 → 分段原子化 → 下载交付
+              </div>
+
+              <div className="overflow-x-auto rounded-md border border-slate-800 bg-slate-950/40 p-3">
+                <svg
+                  viewBox="0 0 1060 120"
+                  className="h-[110px] min-w-[1060px]"
+                  role="img"
+                  aria-label="工作流示意图"
+                >
+                  <defs>
+                    <marker
+                      id="arrowHead"
+                      markerWidth="10"
+                      markerHeight="10"
+                      refX="8"
+                      refY="3"
+                      orient="auto"
+                    >
+                      <path d="M0,0 L0,6 L9,3 z" fill="#64748b" />
+                    </marker>
+                  </defs>
+
+                  {[
+                    { x: 10, text: '原始需求' },
+                    { x: 160, text: '需求 + 确认' },
+                    { x: 310, text: '设计' },
+                    { x: 460, text: '技术栈确认' },
+                    { x: 610, text: '任务' },
+                    { x: 760, text: '分段原子化' },
+                    { x: 910, text: '下载 ZIP' },
+                  ].map((node) => (
+                    <g key={node.x}>
+                      <rect
+                        x={node.x}
+                        y={30}
+                        width={130}
+                        height={44}
+                        rx={10}
+                        fill="#0b1220"
+                        stroke="#334155"
+                        strokeWidth={1.2}
+                      />
+                      <text
+                        x={node.x + 65}
+                        y={56}
+                        textAnchor="middle"
+                        fontSize={14}
+                        fill="#e2e8f0"
+                        dominantBaseline="middle"
+                      >
+                        {node.text}
+                      </text>
+                    </g>
+                  ))}
+
+                  {[10, 160, 310, 460, 610, 760].map((x) => (
+                    <line
+                      key={x}
+                      x1={x + 130}
+                      y1={52}
+                      x2={x + 150}
+                      y2={52}
+                      stroke="#64748b"
+                      strokeWidth={2}
+                      markerEnd="url(#arrowHead)"
+                    />
+                  ))}
+                </svg>
+              </div>
+
+              <ol className="list-decimal space-y-1 pl-5 text-sm text-slate-200">
+                <li>在“原始需求”输入内容，点“生成需求”创建一个新的 Spec。</li>
+                <li>切到“需求”，完成“需求确认”，点“确认需求并生成设计”。</li>
+                <li>切到“设计”，完成“技术栈确认”，点“确认技术栈并生成任务”。</li>
+                <li>
+                  切到“任务”，点“开始原子化”。可设置“分段 N 条/次”，默认开启“自动续段”，失败时可点“重试本段”。
+                </li>
+                <li>需要交付给 AI IDE 时，点“一键下载（ZIP）”。</li>
+              </ol>
+
+              <div className="text-xs text-slate-400">
+                默认地址：Bridge {BRIDGE_URL} · Dashboard 一般为 http://localhost:5173/
+              </div>
+            </div>
+          </details>
+
+          <details className="rounded-md border border-slate-800 bg-slate-900/30 p-3">
+            <summary className="cursor-pointer select-none text-sm font-semibold text-slate-200">
+              提示词配置（可手动修改/还原/存档）
+            </summary>
+            <div className="mt-2 space-y-3">
+              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                <div>
+                  当前更新时间：
+                  {promptConfig?.current?.updatedAt ? ` ${new Date(promptConfig.current.updatedAt).toLocaleString()}` : '（未知）'}
+                </div>
+                <div className="ml-auto flex flex-wrap items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void refreshPrompts().catch((e) => showToast(humanizeError(e)))}
+                    disabled={Boolean(busyLabel)}
+                  >
+                    重新加载
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={resetPromptDraftToDefault}
+                    disabled={Boolean(busyLabel)}
+                  >
+                    还原默认
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={savePromptPreset}
+                    disabled={!promptDraft || Boolean(busyLabel)}
+                  >
+                    存档
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={savePromptDraftToServer}
+                    disabled={!promptDraft || Boolean(busyLabel)}
+                  >
+                    保存提示词
+                  </Button>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <select
+                  className="h-9 rounded-md border border-slate-700 bg-slate-950 px-2 text-sm text-slate-100"
+                  value={promptPresetToApply}
+                  onChange={(e) => setPromptPresetToApply(e.target.value)}
+                  disabled={Boolean(busyLabel) || !(promptConfig?.presets?.length)}
+                >
+                  <option value="">选择存档以应用</option>
+                  {(promptConfig?.presets ?? []).map((p) => (
+                    <option key={p.name} value={p.name}>
+                      {p.name}
+                    </option>
+                  ))}
+                </select>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={applyPromptPreset}
+                  disabled={Boolean(busyLabel) || !promptPresetToApply.trim()}
+                >
+                  应用存档
+                </Button>
+                {promptPresetToApply.trim() && (
+                  <div className="text-xs text-slate-400">
+                    {(() => {
+                      const hit = (promptConfig?.presets ?? []).find((p) => p.name === promptPresetToApply.trim());
+                      return hit?.savedAt ? `存档时间：${new Date(hit.savedAt).toLocaleString()}` : '';
+                    })()}
+                  </div>
+                )}
+              </div>
+
+              {!promptDraft ? (
+                <div className="text-xs text-slate-400">提示词配置加载中…</div>
+              ) : (
+                <div className="grid grid-cols-1 gap-3">
+                  {PROMPT_STAGE_ORDER.map(({ key, label }) => {
+                    const stage = promptDraft.stages?.[key];
+                    if (!stage) return null;
+                    const vars = Array.isArray(stage.variables) ? stage.variables : [];
+                    return (
+                      <div key={key} className="rounded-md border border-slate-800 bg-slate-950/40 p-3">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <div className="text-sm font-semibold text-slate-200">{stage.label || label}</div>
+                          <div className="text-xs text-slate-400">key: {key}</div>
+                          <div className="ml-auto text-xs text-slate-400">
+                            变量：{vars.length ? vars.map((v) => `{{${v}}}`).join(' ') : '（无）'}
+                          </div>
+                        </div>
+                        <div className="mt-2 grid grid-cols-1 gap-3 md:grid-cols-2">
+                          <label className="space-y-1 text-xs text-slate-300">
+                            <div>System</div>
+                            <textarea
+                              className="h-36 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent"
+                              value={stage.system ?? ''}
+                              onChange={(e) => updatePromptStageField(key, 'system', e.target.value)}
+                            />
+                          </label>
+                          <label className="space-y-1 text-xs text-slate-300">
+                            <div>User</div>
+                            <textarea
+                              className="h-36 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent"
+                              value={stage.user ?? ''}
+                              onChange={(e) => updatePromptStageField(key, 'user', e.target.value)}
+                            />
+                          </label>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </details>
 
           {showLlmConfig && llm && (
             <div className="grid grid-cols-1 gap-3 pt-2">
@@ -1487,6 +1841,21 @@ export default function App() {
                           ? '继续原子化（下一段）'
                           : '开始原子化'}
                     </Button>
+                    {atomizeStatus?.error && !atomizeStatus?.running && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => void startAtomizeTasks()}
+                        disabled={
+                          !selectedSpecName ||
+                          Boolean(busyLabel) ||
+                          !artifactContent.tasks.trim() ||
+                          atomizeStatus?.running
+                        }
+                      >
+                        重试本段
+                      </Button>
+                    )}
                     <label className="flex items-center gap-2 rounded-md border border-slate-800 bg-slate-950/40 px-2 py-1 text-xs text-slate-300">
                       <span className="text-slate-400">分段</span>
                       <input
@@ -1497,6 +1866,15 @@ export default function App() {
                         inputMode="numeric"
                       />
                       <span className="text-slate-400">条/次</span>
+                    </label>
+                    <label className="flex items-center gap-2 rounded-md border border-slate-800 bg-slate-950/40 px-2 py-1 text-xs text-slate-300">
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4"
+                        checked={atomizeAutoContinue}
+                        onChange={(e) => setAtomizeAutoContinue(e.target.checked)}
+                      />
+                      <span className="text-slate-400">自动续段</span>
                     </label>
                   </div>
                   <Button
