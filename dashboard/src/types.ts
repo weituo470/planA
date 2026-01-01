@@ -92,3 +92,28 @@ export interface LlmPingResult {
   latencyMs?: number;
   error?: string;
 }
+
+export interface PromptStageTemplate {
+  label: string;
+  variables: string[];
+  system: string;
+  user: string;
+}
+
+export interface PromptConfig {
+  version: number;
+  updatedAt: string | null;
+  stages: Record<string, PromptStageTemplate>;
+}
+
+export interface PromptPreset {
+  name: string;
+  savedAt: string;
+  config: PromptConfig;
+}
+
+export interface PromptConfigResponse {
+  current: PromptConfig;
+  defaults: PromptConfig;
+  presets: PromptPreset[];
+}
