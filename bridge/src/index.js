@@ -20,6 +20,8 @@ const LLM_CONFIG_FILE = path.join(DATA_DIR, 'llm-config.json');
 const PROMPT_CONFIG_FILE = path.join(DATA_DIR, 'prompt-config.json');
 const PROMPT_PRESETS_FILE = path.join(DATA_DIR, 'prompt-presets.json');
 const ROOT_DIR = path.resolve(__dirname, '..', '..', '..');
+const REPO_DIR = path.resolve(__dirname, '..', '..');
+const DOCS_DIR = path.join(REPO_DIR, 'docs');
 const WATCH_DIRS =
   process.env.WORKFLOW_WATCH_DIRS || '.codex,task,workflow';
 const MAX_DIFF_CHARS = 8000;
@@ -82,6 +84,10 @@ const DEFAULT_SPEC_STATUS = {
     confirmedAt: null,
   },
   lastError: null,
+  flowReport: {
+    activeRunId: null,
+    history: [],
+  },
 };
 
 const LLM_PROVIDERS = [
@@ -449,13 +455,34 @@ function recordSpecError(status, stage, error, extra = null) {
   };
 }
 
-async function callLlm(messages, overrideConfig = null) {
+function normalizeLlmUsage(usage) {
+  const obj = usage && typeof usage === 'object' ? usage : null;
+  if (!obj) return null;
+  const toInt = (value) => {
+    const num = Number.parseInt(String(value ?? ''), 10);
+    return Number.isFinite(num) ? num : null;
+  };
+  const promptTokens = toInt(obj.prompt_tokens ?? obj.promptTokens ?? obj.input_tokens ?? obj.inputTokens);
+  const completionTokens = toInt(
+    obj.completion_tokens ?? obj.completionTokens ?? obj.output_tokens ?? obj.outputTokens,
+  );
+  const totalTokens = toInt(
+    obj.total_tokens ??
+      obj.totalTokens ??
+      (promptTokens != null && completionTokens != null ? promptTokens + completionTokens : null),
+  );
+  if (promptTokens == null && completionTokens == null && totalTokens == null) return null;
+  return { promptTokens, completionTokens, totalTokens };
+}
+
+async function callLlm(messages, overrideConfig = null, handlers = {}) {
   const activeConfig = getActiveLlmConfig();
   const mergedConfig = overrideConfig ? { ...activeConfig, ...overrideConfig } : activeConfig;
   const { baseUrl, apiKey, model, responseFormat, providerId } = mergedConfig;
   assertValidLlmConfig(mergedConfig);
   const llmContext = describeLlmConfig(mergedConfig);
   const timeoutMsOverride = Number(mergedConfig?.timeoutMs || 0) || null;
+  const onUsage = typeof handlers?.onUsage === 'function' ? handlers.onUsage : null;
 
   const tryOnce = async (rootUrl) => {
     const url = `${String(rootUrl || '').replace(/\/$/, '')}/chat/completions`;
@@ -497,6 +524,7 @@ async function callLlm(messages, overrideConfig = null) {
         throw err;
       }
       const data = await response.json();
+      onUsage?.(normalizeLlmUsage(data?.usage));
       const content = data?.choices?.[0]?.message?.content;
       if (!content || typeof content !== 'string') {
         const err = new Error('LLM response empty');
@@ -556,6 +584,7 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
   const llmContext = describeLlmConfig(mergedConfig);
   const timeoutMsOverride = Number(mergedConfig?.timeoutMs || 0) || null;
   const onToken = typeof handlers?.onToken === 'function' ? handlers.onToken : null;
+  const onUsage = typeof handlers?.onUsage === 'function' ? handlers.onUsage : null;
 
   const readResponseTextStream = async (response, onTextChunk) => {
     const body = response.body;
@@ -599,7 +628,7 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
       temperature: 0.3,
       messages,
       stream: true,
-      stream_options: { include_usage: false },
+      stream_options: { include_usage: Boolean(onUsage) },
     };
     if (responseFormat && responseFormat !== 'none' && responseFormat !== 'text') {
       body.response_format = { type: responseFormat };
@@ -628,6 +657,7 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
       const contentType = String(response.headers.get('content-type') || '');
       if (/application\/json/i.test(contentType)) {
         const data = await response.json();
+        onUsage?.(normalizeLlmUsage(data?.usage));
         const content = data?.choices?.[0]?.message?.content;
         if (!content || typeof content !== 'string') {
           const err = new Error('LLM response empty');
@@ -666,6 +696,9 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
             payload = JSON.parse(dataText);
           } catch {
             continue;
+          }
+          if (payload?.usage) {
+            onUsage?.(normalizeLlmUsage(payload.usage));
           }
           const delta = payload?.choices?.[0]?.delta?.content;
           emitDelta(delta);
@@ -826,6 +859,411 @@ function ensureSpecStatus(name, overrides = null) {
 function writeSpecFile(name, artifact, content) {
   fs.mkdirSync(resolveSpecDir(name), { recursive: true });
   fs.writeFileSync(resolveSpecFile(name, artifact), content, 'utf8');
+}
+
+function normalizeFlowReportMeta(input) {
+  const obj = input && typeof input === 'object' ? input : {};
+  const activeRunId =
+    typeof obj.activeRunId === 'string' && obj.activeRunId.trim()
+      ? obj.activeRunId.trim()
+      : null;
+  const history = Array.isArray(obj.history)
+    ? obj.history.filter((item) => item && typeof item === 'object')
+    : [];
+  return { activeRunId, history };
+}
+
+function resolveFlowRunDir(specName) {
+  return path.join(resolveSpecDir(specName), 'flow-runs');
+}
+
+function resolveFlowRunFile(specName, runId) {
+  return path.join(resolveFlowRunDir(specName), `${runId}.json`);
+}
+
+function readFlowRun(specName, runId) {
+  if (!runId) return null;
+  const filePath = resolveFlowRunFile(specName, runId);
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '');
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (String(parsed.runId || '') !== String(runId)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeFlowRun(specName, run) {
+  if (!run || typeof run !== 'object') return;
+  const runId = String(run.runId || '').trim();
+  if (!runId) return;
+  const dir = resolveFlowRunDir(specName);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(resolveFlowRunFile(specName, runId), JSON.stringify(run, null, 2), 'utf8');
+}
+
+function createFlowRun(specName, status, reason = '') {
+  const now = new Date().toISOString();
+  const runId = `${formatTimestamp(new Date())}-${nanoid(6)}`;
+  const run = {
+    runId,
+    specName,
+    prompt: String(status?.prompt || ''),
+    createdAt: now,
+    updatedAt: now,
+    reason: String(reason || ''),
+    stages: {},
+    report: null,
+  };
+  writeFlowRun(specName, run);
+  return run;
+}
+
+function ensureActiveFlowRun(specName, status, options = {}) {
+  const normalizedStatus = { ...DEFAULT_SPEC_STATUS, ...(status || {}) };
+  const flowReport = normalizeFlowReportMeta(normalizedStatus.flowReport);
+  const forceNew = options?.forceNew === true;
+  const reason = String(options?.reason || '');
+
+  if (!forceNew && flowReport.activeRunId) {
+    const existing = readFlowRun(specName, flowReport.activeRunId);
+    if (existing) {
+      return { status: { ...normalizedStatus, flowReport }, run: existing };
+    }
+  }
+
+  const run = createFlowRun(specName, normalizedStatus, reason);
+  const nextStatus = {
+    ...normalizedStatus,
+    flowReport: {
+      ...flowReport,
+      activeRunId: run.runId,
+    },
+  };
+  writeSpecStatus(specName, nextStatus);
+  return { status: nextStatus, run };
+}
+
+function appendFlowRunStageAttempt(specName, stageKey, attempt, options = {}) {
+  const key = String(stageKey || '').trim();
+  if (!key) return null;
+  const status = readSpecStatus(specName);
+  const { status: nextStatus, run } = ensureActiveFlowRun(specName, status, {
+    forceNew: options?.forceNew === true,
+    reason: options?.reason || '',
+  });
+  const now = new Date().toISOString();
+  const attemptRecord =
+    attempt && typeof attempt === 'object'
+      ? { ...attempt }
+      : { value: String(attempt || '') };
+  if (!attemptRecord.id) attemptRecord.id = nanoid();
+  attemptRecord.stageKey = key;
+  attemptRecord.recordedAt = now;
+
+  const existingStage =
+    run.stages && typeof run.stages === 'object' && run.stages[key]
+      ? run.stages[key]
+      : {};
+  const attempts = Array.isArray(existingStage.attempts) ? existingStage.attempts : [];
+  attempts.push(attemptRecord);
+
+  const nextRun = {
+    ...run,
+    updatedAt: now,
+    stages: {
+      ...(run.stages && typeof run.stages === 'object' ? run.stages : {}),
+      [key]: {
+        ...existingStage,
+        attempts,
+        last: attemptRecord,
+      },
+    },
+  };
+  writeFlowRun(specName, nextRun);
+  // Persist flowReport in case it was missing.
+  if (nextStatus.flowReport?.activeRunId !== run.runId) {
+    writeSpecStatus(specName, nextStatus);
+  }
+  return attemptRecord;
+}
+
+function sanitizeFilenamePart(value, fallback = 'spec') {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  const cleaned = raw
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_')
+    .replace(/\s+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return cleaned.slice(0, 80) || fallback;
+}
+
+function formatDurationMs(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value < 0) return 'n/a';
+  if (value < 1000) return `${Math.round(value)}ms`;
+  const seconds = value / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds - minutes * 60;
+  return `${minutes}m${rest.toFixed(0)}s`;
+}
+
+function sumUsage(usages) {
+  const out = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  let hasAny = false;
+  for (const u of usages) {
+    if (!u || typeof u !== 'object') continue;
+    const pt = Number(u.promptTokens);
+    const ct = Number(u.completionTokens);
+    const tt = Number(u.totalTokens);
+    if (Number.isFinite(pt)) out.promptTokens += pt;
+    if (Number.isFinite(ct)) out.completionTokens += ct;
+    if (Number.isFinite(tt)) out.totalTokens += tt;
+    hasAny = true;
+  }
+  if (!hasAny) return null;
+  return out;
+}
+
+function renderClarificationQuestions(questions) {
+  if (!Array.isArray(questions) || questions.length === 0) return '（无）';
+  const lines = [];
+  questions.forEach((q, idx) => {
+    const title = String(q?.question || '').trim() || `问题 ${idx + 1}`;
+    lines.push(`${idx + 1}. ${title}`);
+    const opts = Array.isArray(q?.options) ? q.options : [];
+    if (opts.length) {
+      lines.push('   - 选项：');
+      opts.forEach((opt) => {
+        const label = String(opt?.label || '').trim();
+        if (label) lines.push(`     - ${label}`);
+      });
+    }
+    const ans = q?.answer && typeof q.answer === 'object' ? q.answer : null;
+    if (ans) {
+      const selected = Array.isArray(ans.selectedOptionIds) ? ans.selectedOptionIds : [];
+      const other = String(ans.otherText || '').trim();
+      const selectedLabels = selected
+        .map((id) => opts.find((o) => String(o?.id) === String(id))?.label)
+        .filter(Boolean);
+      if (selectedLabels.length) {
+        lines.push(`   - 已选：${selectedLabels.join(' / ')}`);
+      }
+      if (other) {
+        lines.push(`   - 其他：${other}`);
+      }
+      if (!selectedLabels.length && !other) {
+        lines.push('   - 已选：（未填写）');
+      }
+    }
+  });
+  return lines.join('\n');
+}
+
+function renderStageAttempts(stage) {
+  const attempts = Array.isArray(stage?.attempts) ? stage.attempts : [];
+  if (!attempts.length) return '（无记录）';
+  const blocks = [];
+  for (const attempt of attempts) {
+    const startedAt = attempt?.startedAt || null;
+    const endedAt = attempt?.endedAt || null;
+    const durationMs = attempt?.durationMs ?? null;
+    const stream = attempt?.stream === true;
+    const llm = attempt?.llmContext || attempt?.llm || null;
+    const usage = attempt?.usage || null;
+    const header = [
+      `- attemptId: ${attempt?.id || ''}`,
+      startedAt ? `  - startedAt: ${startedAt}` : null,
+      endedAt ? `  - endedAt: ${endedAt}` : null,
+      durationMs != null ? `  - duration: ${formatDurationMs(durationMs)}` : null,
+      `  - stream: ${stream ? 'true' : 'false'}`,
+      llm ? `  - llm: ${JSON.stringify(llm)}` : null,
+      usage ? `  - usage: ${JSON.stringify(usage)}` : null,
+      attempt?.error ? `  - error: ${JSON.stringify(attempt.error)}` : null,
+    ]
+      .filter(Boolean)
+      .join('\n');
+    blocks.push(header);
+
+    const prompt = attempt?.prompt && typeof attempt.prompt === 'object' ? attempt.prompt : null;
+    if (prompt) {
+      if (typeof prompt.templates?.system === 'string') {
+        blocks.push(`\n  - prompt.system(template):\n\n\`\`\`text\n${prompt.templates.system}\n\`\`\``);
+      }
+      if (typeof prompt.templates?.user === 'string') {
+        blocks.push(`\n  - prompt.user(template):\n\n\`\`\`text\n${prompt.templates.user}\n\`\`\``);
+      }
+      if (typeof prompt.rendered?.system === 'string') {
+        blocks.push(`\n  - prompt.system(rendered):\n\n\`\`\`text\n${prompt.rendered.system}\n\`\`\``);
+      }
+      if (typeof prompt.rendered?.user === 'string') {
+        blocks.push(`\n  - prompt.user(rendered):\n\n\`\`\`text\n${prompt.rendered.user}\n\`\`\``);
+      }
+    }
+  }
+  return blocks.join('\n\n');
+}
+
+function buildFlowReportMarkdown(specName, status, run, artifacts) {
+  const now = new Date().toISOString();
+  const requirements = artifacts?.requirements || '';
+  const design = artifacts?.design || '';
+  const tasks = artifacts?.tasks || '';
+  const tasksAtomic = artifacts?.tasks_atomic || '';
+
+  const requirementsReview = status?.requirementsReview || {};
+  const requirementsClarifications = status?.requirementsClarifications || {};
+  const techStackClarifications = status?.techStackClarifications || {};
+
+  const stages = run?.stages && typeof run.stages === 'object' ? run.stages : {};
+  const stageKeys = PROMPT_STAGE_KEYS;
+
+  const usageByStage = {};
+  const durationByStage = {};
+  for (const key of stageKeys) {
+    const attempts = Array.isArray(stages?.[key]?.attempts) ? stages[key].attempts : [];
+    usageByStage[key] = sumUsage(attempts.map((a) => a?.usage).filter(Boolean));
+    const durationMs = attempts
+      .map((a) => Number(a?.durationMs))
+      .filter((n) => Number.isFinite(n) && n >= 0)
+      .reduce((acc, n) => acc + n, 0);
+    durationByStage[key] = durationMs || null;
+  }
+
+  const totalUsage = sumUsage(Object.values(usageByStage).filter(Boolean));
+  const totalDurationMs = Object.values(durationByStage)
+    .map((n) => Number(n))
+    .filter((n) => Number.isFinite(n) && n >= 0)
+    .reduce((acc, n) => acc + n, 0);
+
+  return [
+    `# planA 流程报告：${specName}`,
+    '',
+    `- 生成时间：${now}`,
+    `- runId：${run?.runId || ''}`,
+    `- SpecRoot：${SPEC_ROOT}`,
+    `- SpecDir：${resolveSpecDir(specName)}`,
+    `- DocsDir：${DOCS_DIR}`,
+    '',
+    '## 0) 原始需求（prompt）',
+    '',
+    status?.prompt ? status.prompt : '（空）',
+    '',
+    '## 1) 需求确认（requirementsReview）',
+    '',
+    '```json',
+    JSON.stringify(requirementsReview, null, 2),
+    '```',
+    '',
+    '## 2) 需求澄清（requirementsClarifications）',
+    '',
+    renderClarificationQuestions(requirementsClarifications?.questions),
+    '',
+    '## 3) 技术栈澄清（techStackClarifications）',
+    '',
+    renderClarificationQuestions(techStackClarifications?.questions),
+    '',
+    '## 4) 阶段指标（耗时 / Token / 模型 / 提示词）',
+    '',
+    `- 总耗时：${totalDurationMs ? formatDurationMs(totalDurationMs) : 'n/a'}`,
+    `- 总 Token：${totalUsage ? JSON.stringify(totalUsage) : 'n/a（网关未返回 usage 或未调用模型）'}`,
+    '',
+    ...stageKeys.flatMap((key) => [
+      `### ${key}`,
+      '',
+      `- 累计耗时：${durationByStage[key] ? formatDurationMs(durationByStage[key]) : 'n/a'}`,
+      `- 累计 Token：${usageByStage[key] ? JSON.stringify(usageByStage[key]) : 'n/a'}`,
+      '',
+      renderStageAttempts(stages?.[key]),
+      '',
+    ]),
+    '## 5) 产物快照',
+    '',
+    '### requirements.md',
+    '',
+    '```markdown',
+    requirements,
+    '```',
+    '',
+    '### design.md',
+    '',
+    '```markdown',
+    design,
+    '```',
+    '',
+    '### tasks.md',
+    '',
+    '```markdown',
+    tasks,
+    '```',
+    '',
+    '### tasks_atomic.md',
+    '',
+    '```markdown',
+    tasksAtomic,
+    '```',
+    '',
+  ].join('\n');
+}
+
+function finalizeFlowReport(specName, options = {}) {
+  const status = readSpecStatus(specName);
+  const flowReport = normalizeFlowReportMeta(status.flowReport);
+  const runId = String(options?.runId || flowReport.activeRunId || '').trim();
+  if (!runId) return null;
+
+  const run = readFlowRun(specName, runId);
+  if (!run) return null;
+
+  if (run.report && typeof run.report === 'object' && run.report.path) {
+    return run.report.path;
+  }
+
+  const artifacts = {};
+  for (const key of SPEC_ARTIFACTS) {
+    const filePath = resolveSpecFile(specName, key);
+    artifacts[key] = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
+  }
+
+  const markdown = buildFlowReportMarkdown(specName, status, run, artifacts);
+
+  fs.mkdirSync(DOCS_DIR, { recursive: true });
+  const safeSpec = sanitizeFilenamePart(specName, 'spec');
+  const fileName = `flow_${safeSpec}_${runId}.md`;
+  const reportPath = path.join(DOCS_DIR, fileName);
+  fs.writeFileSync(reportPath, markdown, 'utf8');
+
+  const now = new Date().toISOString();
+  const updatedRun = {
+    ...run,
+    updatedAt: now,
+    report: {
+      path: reportPath,
+      createdAt: now,
+    },
+  };
+  writeFlowRun(specName, updatedRun);
+
+  const nextHistory = flowReport.history.slice(0, 49);
+  nextHistory.unshift({
+    runId,
+    reportPath,
+    createdAt: now,
+  });
+  const nextStatus = {
+    ...status,
+    flowReport: {
+      ...flowReport,
+      activeRunId: null,
+      history: nextHistory,
+    },
+  };
+  writeSpecStatus(specName, nextStatus);
+  return reportPath;
 }
 
 function normalizePrompt(prompt) {
@@ -1572,38 +2010,66 @@ async function generateClarificationsWithModel(prompt, options = {}) {
     const promptConfig = loadPromptConfig();
     const stage = promptConfig.stages.requirementsClarifications;
     const onToken = typeof options?.onToken === 'function' ? options.onToken : null;
-    const content = onToken
-      ? await callLlmStream(
-          [
-            {
-              role: 'system',
-              content: applyPromptTemplate(stage.system, { prompt }),
+    const onTelemetry = typeof options?.onTelemetry === 'function' ? options.onTelemetry : null;
+
+    const stageKey = 'requirementsClarifications';
+    const variables = { prompt };
+    const promptTemplates = { system: stage.system, user: stage.user };
+    const promptRendered = {
+      system: applyPromptTemplate(stage.system, variables),
+      user: applyPromptTemplate(stage.user, variables),
+    };
+    const messages = [
+      { role: 'system', content: promptRendered.system },
+      { role: 'user', content: promptRendered.user },
+    ];
+
+    const startedAt = new Date().toISOString();
+    const startedMs = Date.now();
+    let usage = null;
+    const recordTelemetry = (error) => {
+      const endedAt = new Date().toISOString();
+      onTelemetry?.({
+        stageKey,
+        stream: Boolean(onToken),
+        startedAt,
+        endedAt,
+        durationMs: Date.now() - startedMs,
+        usage,
+        llmContext: describeLlmConfig(getActiveLlmConfig()),
+        prompt: { templates: promptTemplates, rendered: promptRendered, variables },
+        error: error
+          ? { message: error?.message || String(error || ''), context: error?.llmContext || null }
+          : null,
+      });
+    };
+
+    try {
+      const content = onToken
+        ? await callLlmStream(messages, null, {
+            onToken,
+            onUsage: (u) => {
+              usage = u;
             },
-            {
-              role: 'user',
-              content: applyPromptTemplate(stage.user, { prompt }),
+          })
+        : await callLlm(messages, null, {
+            onUsage: (u) => {
+              usage = u;
             },
-          ],
-          null,
-          { onToken },
-        )
-      : await callLlm([
-          {
-            role: 'system',
-            content: applyPromptTemplate(stage.system, { prompt }),
-          },
-          {
-            role: 'user',
-            content: applyPromptTemplate(stage.user, { prompt }),
-          },
-        ]);
-    const payload = tryParseJson(content);
-    if (!payload) throw new Error(`LLM output not JSON: ${String(content).slice(0, 200)}`);
-    const normalized = normalizeRequirementsClarifications(payload);
-    if (!isValidClarifications(normalized)) {
-      throw new Error(`LLM questions invalid: ${String(content).slice(0, 200)}`);
+          });
+
+      const payload = tryParseJson(content);
+      if (!payload) throw new Error(`LLM output not JSON: ${String(content).slice(0, 200)}`);
+      const normalized = normalizeRequirementsClarifications(payload);
+      if (!isValidClarifications(normalized)) {
+        throw new Error(`LLM questions invalid: ${String(content).slice(0, 200)}`);
+      }
+      recordTelemetry(null);
+      return { questions: normalized.questions, generatedBy: 'llm', generationError: null };
+    } catch (error) {
+      recordTelemetry(error);
+      throw error;
     }
-    return { questions: normalized.questions, generatedBy: 'llm', generationError: null };
   } catch (error) {
     console.error('Clarifications generation failed:', error?.message || error);
     throw error;
@@ -1670,6 +2136,50 @@ function tryParseJson(text) {
   if (!text || typeof text !== 'string') return null;
   const trimmed = text.trim();
 
+  const extractFirstJson = (value) => {
+    const src = String(value || '');
+    const start = src.search(/[{\[]/);
+    if (start < 0) return null;
+    const stack = [];
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < src.length; i += 1) {
+      const ch = src[i];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+        if (ch === '\\') {
+          escaped = true;
+          continue;
+        }
+        if (ch === '"') inString = false;
+        continue;
+      }
+
+      if (ch === '"') {
+        inString = true;
+        continue;
+      }
+      if (ch === '{') {
+        stack.push('}');
+        continue;
+      }
+      if (ch === '[') {
+        stack.push(']');
+        continue;
+      }
+      if (stack.length && ch === stack[stack.length - 1]) {
+        stack.pop();
+        if (stack.length === 0) {
+          return src.slice(start, i + 1);
+        }
+      }
+    }
+    return null;
+  };
+
   // Handle fenced JSON blocks (common for Gemini/Claude).
   const fenceMatch = trimmed.match(/```[a-zA-Z]*\s*([\s\S]*?)\s*```/);
   if (fenceMatch && fenceMatch[1]) {
@@ -1677,16 +2187,25 @@ function tryParseJson(text) {
     try {
       return JSON.parse(inner);
     } catch {
-      // continue with fallback strategies below
+      const extracted = extractFirstJson(inner);
+      if (!extracted) {
+        // continue with fallback strategies below
+      } else {
+        try {
+          return JSON.parse(extracted);
+        } catch {
+          // continue with fallback strategies below
+        }
+      }
     }
   }
   try {
     return JSON.parse(trimmed);
   } catch {
-    const match = trimmed.match(/\{[\s\S]*\}/);
-    if (!match) return null;
+    const extracted = extractFirstJson(trimmed);
+    if (!extracted) return null;
     try {
-      return JSON.parse(match[0]);
+      return JSON.parse(extracted);
     } catch {
       return null;
     }
@@ -1886,47 +2405,81 @@ async function generateRequirementsWithModel(prompt, options = {}) {
   const promptConfig = loadPromptConfig();
   const stage = promptConfig.stages.requirements;
   const onToken = typeof options?.onToken === 'function' ? options.onToken : null;
-  const content = onToken
-    ? await callLlmStream(
-        [
-          {
-            role: 'system',
-            content: applyPromptTemplate(stage.system, { prompt }),
-          },
-          {
-            role: 'user',
-            content: applyPromptTemplate(stage.user, { prompt }),
-          },
-        ],
-        null,
-        { onToken },
-      )
-    : await callLlm([
-        {
-          role: 'system',
-          content: applyPromptTemplate(stage.system, { prompt }),
-        },
-        {
-          role: 'user',
-          content: applyPromptTemplate(stage.user, { prompt }),
-        },
-      ]);
+  const onTelemetry = typeof options?.onTelemetry === 'function' ? options.onTelemetry : null;
 
-  const payload = tryParseJson(content);
-  if (!payload) {
-    throw new Error(`LLM output not JSON: ${String(content).slice(0, 200)}`);
+  const stageKey = 'requirements';
+  const variables = { prompt };
+  const promptTemplates = { system: stage.system, user: stage.user };
+  const promptRendered = {
+    system: applyPromptTemplate(stage.system, variables),
+    user: applyPromptTemplate(stage.user, variables),
+  };
+  const messages = [
+    { role: 'system', content: promptRendered.system },
+    { role: 'user', content: promptRendered.user },
+  ];
+
+  const startedAt = new Date().toISOString();
+  const startedMs = Date.now();
+  let usage = null;
+  let content = '';
+  const recordTelemetry = (error) => {
+    const endedAt = new Date().toISOString();
+    onTelemetry?.({
+      stageKey,
+      stream: Boolean(onToken),
+      startedAt,
+      endedAt,
+      durationMs: Date.now() - startedMs,
+      usage,
+      llmContext: describeLlmConfig(getActiveLlmConfig()),
+      prompt: { templates: promptTemplates, rendered: promptRendered, variables },
+      error: error
+        ? { message: error?.message || String(error || ''), context: error?.llmContext || null }
+        : null,
+    });
+  };
+
+  try {
+    content = onToken
+      ? await callLlmStream(messages, null, {
+          onToken,
+          onUsage: (u) => {
+            usage = u;
+          },
+        })
+      : await callLlm(messages, null, {
+          onUsage: (u) => {
+            usage = u;
+          },
+        });
+
+    const payload = tryParseJson(content);
+    if (!payload) {
+      throw new Error(`LLM output not JSON: ${String(content).slice(0, 200)}`);
+    }
+    if (typeof payload.background !== 'string' || !payload.background.trim()) {
+      throw new Error(
+        `LLM requirements missing background: ${JSON.stringify(payload).slice(0, 200)}`,
+      );
+    }
+    if (!Array.isArray(payload.user_stories) || payload.user_stories.length === 0) {
+      throw new Error(
+        `LLM requirements missing user_stories: ${JSON.stringify(payload).slice(0, 200)}`,
+      );
+    }
+    const acceptance = filterAcceptanceLines(payload.acceptance);
+    if (!acceptance || acceptance.length === 0) {
+      throw new Error(
+        `LLM requirements acceptance invalid: ${JSON.stringify(payload).slice(0, 200)}`,
+      );
+    }
+    recordTelemetry(null);
+    return buildRequirementsMarkdown(prompt, { ...payload, acceptance });
+  } catch (error) {
+    recordTelemetry(error);
+    throw error;
   }
-  if (typeof payload.background !== 'string' || !payload.background.trim()) {
-    throw new Error(`LLM requirements missing background: ${JSON.stringify(payload).slice(0, 200)}`);
-  }
-  if (!Array.isArray(payload.user_stories) || payload.user_stories.length === 0) {
-    throw new Error(`LLM requirements missing user_stories: ${JSON.stringify(payload).slice(0, 200)}`);
-  }
-  const acceptance = filterAcceptanceLines(payload.acceptance);
-  if (!acceptance || acceptance.length === 0) {
-    throw new Error(`LLM requirements acceptance invalid: ${JSON.stringify(payload).slice(0, 200)}`);
-  }
-  return buildRequirementsMarkdown(prompt, { ...payload, acceptance });
 }
 
 function extractOriginalRequirement(markdown) {
@@ -1950,37 +2503,64 @@ async function generateDesignWithModel(requirements, prompt, options = {}) {
   const promptConfig = loadPromptConfig();
   const stage = promptConfig.stages.design;
   const onToken = typeof options?.onToken === 'function' ? options.onToken : null;
-  const content = onToken
-    ? await callLlmStream(
-        [
-          {
-            role: 'system',
-            content: applyPromptTemplate(stage.system, { requirements, prompt }),
+  const onTelemetry = typeof options?.onTelemetry === 'function' ? options.onTelemetry : null;
+
+  const stageKey = 'design';
+  const variables = { requirements, prompt };
+  const promptTemplates = { system: stage.system, user: stage.user };
+  const promptRendered = {
+    system: applyPromptTemplate(stage.system, variables),
+    user: applyPromptTemplate(stage.user, variables),
+  };
+  const messages = [
+    { role: 'system', content: promptRendered.system },
+    { role: 'user', content: promptRendered.user },
+  ];
+
+  const startedAt = new Date().toISOString();
+  const startedMs = Date.now();
+  let usage = null;
+  const recordTelemetry = (error) => {
+    const endedAt = new Date().toISOString();
+    onTelemetry?.({
+      stageKey,
+      stream: Boolean(onToken),
+      startedAt,
+      endedAt,
+      durationMs: Date.now() - startedMs,
+      usage,
+      llmContext: describeLlmConfig(getActiveLlmConfig()),
+      prompt: { templates: promptTemplates, rendered: promptRendered, variables },
+      error: error
+        ? { message: error?.message || String(error || ''), context: error?.llmContext || null }
+        : null,
+    });
+  };
+
+  try {
+    const content = onToken
+      ? await callLlmStream(messages, null, {
+          onToken,
+          onUsage: (u) => {
+            usage = u;
           },
-          {
-            role: 'user',
-            content: applyPromptTemplate(stage.user, { requirements, prompt }),
+        })
+      : await callLlm(messages, null, {
+          onUsage: (u) => {
+            usage = u;
           },
-        ],
-        null,
-        { onToken },
-      )
-    : await callLlm([
-        {
-          role: 'system',
-          content: applyPromptTemplate(stage.system, { requirements, prompt }),
-        },
-        {
-          role: 'user',
-          content: applyPromptTemplate(stage.user, { requirements, prompt }),
-        },
-      ]);
-  const payload = tryParseJson(content);
-  if (!payload) {
-    throw new Error(`LLM design output not JSON: ${String(content).slice(0, 200)}`);
+        });
+    const payload = tryParseJson(content);
+    if (!payload) {
+      throw new Error(`LLM design output not JSON: ${String(content).slice(0, 200)}`);
+    }
+    const designPrompt = resolveDesignPrompt(prompt, requirements);
+    recordTelemetry(null);
+    return buildDesignMarkdown(designPrompt, payload);
+  } catch (error) {
+    recordTelemetry(error);
+    throw error;
   }
-  const designPrompt = resolveDesignPrompt(prompt, requirements);
-  return buildDesignMarkdown(designPrompt, payload);
 }
 
 function looksLikeChinese(text) {
@@ -2006,14 +2586,61 @@ function truncateText(text, maxLen = 1600) {
 
 function parseTaskSummaries(markdown) {
   const lines = normalizeLineEndings(markdown || '').split('\n');
-  const summaries = [];
-  for (const line of lines) {
-    const match = line.match(/^- \[[ xX]\]\s*(.+)$/);
-    if (!match) continue;
-    let text = match[1].trim();
+
+  const stripPrefix = (value) => {
+    let text = String(value || '').trim();
     text = text.replace(/^\*\*Task\s*\d+\*\*:\s*/i, '');
-    text = text.replace(/^\d+\.\s*/, '');
-    if (text) summaries.push(text);
+    text = text.replace(/^\d+[\.)]\s*/, '');
+    return text.trim();
+  };
+
+  let inTaskList = false;
+  let hasTaskListHeader = false;
+  const scoped = [];
+
+  for (const rawLine of lines) {
+    const line = String(rawLine || '').trimEnd();
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (/^##\s*任务清单\b/.test(trimmed)) {
+      inTaskList = true;
+      hasTaskListHeader = true;
+      continue;
+    }
+    if (hasTaskListHeader && inTaskList && /^##\s+/.test(trimmed)) {
+      inTaskList = false;
+    }
+    if (!hasTaskListHeader || inTaskList) {
+      scoped.push(trimmed);
+    }
+  }
+
+  const pool = scoped.length ? scoped : lines.map((l) => String(l || '').trim()).filter(Boolean);
+  const summaries = [];
+  for (const line of pool) {
+    // Preferred format: checklist items.
+    let match = line.match(/^- \[[ xX]\]\s*(.+)$/);
+    if (match) {
+      const text = stripPrefix(match[1]);
+      if (text) summaries.push(text);
+      continue;
+    }
+
+    // Fallback formats within task list section.
+    match = line.match(/^\s*\d+[\.)]\s*(.+)$/);
+    if (match) {
+      const text = stripPrefix(match[1]);
+      if (text) summaries.push(text);
+      continue;
+    }
+
+    if (hasTaskListHeader) {
+      match = line.match(/^-+\s*(.+)$/);
+      if (match) {
+        const text = stripPrefix(match[1]);
+        if (text) summaries.push(text);
+      }
+    }
   }
   return summaries;
 }
@@ -2160,50 +2787,75 @@ async function generateTasksWithModel(design, prompt, options = {}) {
   const stage = promptConfig.stages.tasks;
 
   const onToken = typeof options?.onToken === 'function' ? options.onToken : null;
-  const content = onToken
-    ? await callLlmStream(
-        [
-          {
-            role: 'system',
-            content: applyPromptTemplate(stage.system, { design, prompt, minTasks, maxTasks }),
-          },
-          {
-            role: 'user',
-            content: applyPromptTemplate(stage.user, { design, prompt, minTasks, maxTasks }),
-          },
-        ],
-        { timeoutMs },
-        { onToken },
-      )
-    : await callLlm(
-        [
-          {
-            role: 'system',
-            content: applyPromptTemplate(stage.system, { design, prompt, minTasks, maxTasks }),
-          },
-          {
-            role: 'user',
-            content: applyPromptTemplate(stage.user, { design, prompt, minTasks, maxTasks }),
-          },
-        ],
-        { timeoutMs },
-      );
+  const onTelemetry = typeof options?.onTelemetry === 'function' ? options.onTelemetry : null;
 
-  const payload = tryParseJson(content);
-  const rawTasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
-  const normalized = rawTasks.map(normalizeTaskObject).filter(Boolean);
-  const hasEnough = normalized.length >= Math.min(minTasks, maxTasks);
-  const isChinese = normalized.every((t) =>
-    looksLikeChinese(`${t.title} ${t.core} ${t.details} ${t.ac}`),
-  );
-  if (!hasEnough || !isChinese) {
-    return generateTasksContent(design, prompt);
+  const stageKey = 'tasks';
+  const variables = { design, prompt, minTasks, maxTasks };
+  const promptTemplates = { system: stage.system, user: stage.user };
+  const promptRendered = {
+    system: applyPromptTemplate(stage.system, variables),
+    user: applyPromptTemplate(stage.user, variables),
+  };
+  const messages = [
+    { role: 'system', content: promptRendered.system },
+    { role: 'user', content: promptRendered.user },
+  ];
+
+  const startedAt = new Date().toISOString();
+  const startedMs = Date.now();
+  let usage = null;
+  const recordTelemetry = (error) => {
+    const endedAt = new Date().toISOString();
+    onTelemetry?.({
+      stageKey,
+      stream: Boolean(onToken),
+      startedAt,
+      endedAt,
+      durationMs: Date.now() - startedMs,
+      usage,
+      llmContext: describeLlmConfig(getActiveLlmConfig()),
+      prompt: { templates: promptTemplates, rendered: promptRendered, variables },
+      error: error
+        ? { message: error?.message || String(error || ''), context: error?.llmContext || null }
+        : null,
+    });
+  };
+
+  try {
+    const content = onToken
+      ? await callLlmStream(messages, { timeoutMs }, {
+          onToken,
+          onUsage: (u) => {
+            usage = u;
+          },
+        })
+      : await callLlm(messages, { timeoutMs }, {
+          onUsage: (u) => {
+            usage = u;
+          },
+        });
+
+    const payload = tryParseJson(content);
+    const rawTasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
+    const normalized = rawTasks.map(normalizeTaskObject).filter(Boolean);
+    const hasEnough = normalized.length >= Math.min(minTasks, maxTasks);
+    const isChinese = normalized.every((t) =>
+      looksLikeChinese(`${t.title} ${t.core} ${t.details} ${t.ac}`),
+    );
+    if (!hasEnough || !isChinese) {
+      recordTelemetry(null);
+      return generateTasksContent(design, prompt);
+    }
+    const trimmed = normalized.slice(0, maxTasks);
+    recordTelemetry(null);
+    return buildTasksMarkdown(prompt || design, { tasks: trimmed });
+  } catch (error) {
+    recordTelemetry(error);
+    throw error;
   }
-  const trimmed = normalized.slice(0, maxTasks);
-  return buildTasksMarkdown(prompt || design, { tasks: trimmed });
 }
 
-async function requestAtomicTasks(payload, designSnippet, timeoutMs, reason = '') {
+async function requestAtomicTasks(payload, designSnippet, timeoutMs, reason = '', telemetry = null) {
   const promptConfig = loadPromptConfig();
   const stage = promptConfig.stages.atomize;
 
@@ -2215,40 +2867,81 @@ async function requestAtomicTasks(payload, designSnippet, timeoutMs, reason = ''
 
   const reasonBlock = reason ? `注意：${reason}\n` : '';
 
-  const content = await callLlm(
-    [
-      {
-        role: 'system',
-        content: applyPromptTemplate(stage.system, { context, main, reasonBlock }),
-      },
-      {
-        role: 'user',
-        content: applyPromptTemplate(stage.user, { context, main, reasonBlock }),
-      },
-    ],
-    { timeoutMs },
-  );
+  const stageKey = 'atomize';
+  const variables = { context, main, reasonBlock };
+  const promptTemplates = { system: stage.system, user: stage.user };
+
+  const recordAttempt =
+    typeof telemetry === 'function'
+      ? telemetry
+      : typeof telemetry?.recordAttempt === 'function'
+        ? telemetry.recordAttempt
+        : null;
+  const meta = telemetry?.meta && typeof telemetry.meta === 'object' ? telemetry.meta : null;
+
+  const callOnce = async ({ userPrefix = '', label = 'primary' }) => {
+    const promptRendered = {
+      system: applyPromptTemplate(stage.system, variables),
+      user: `${userPrefix}${applyPromptTemplate(stage.user, variables)}`,
+    };
+    const messages = [
+      { role: 'system', content: promptRendered.system },
+      { role: 'user', content: promptRendered.user },
+    ];
+    const startedAt = new Date().toISOString();
+    const startedMs = Date.now();
+    let usage = null;
+    try {
+      const content = await callLlm(messages, { timeoutMs }, {
+        onUsage: (u) => {
+          usage = u;
+        },
+      });
+      const endedAt = new Date().toISOString();
+      recordAttempt?.({
+        ...(meta || {}),
+        stageKey,
+        label,
+        stream: false,
+        startedAt,
+        endedAt,
+        durationMs: Date.now() - startedMs,
+        usage,
+        llmContext: describeLlmConfig(getActiveLlmConfig()),
+        prompt: { templates: promptTemplates, rendered: promptRendered, variables },
+        error: null,
+      });
+      return { content, promptRendered, usage };
+    } catch (error) {
+      const endedAt = new Date().toISOString();
+      recordAttempt?.({
+        ...(meta || {}),
+        stageKey,
+        label,
+        stream: false,
+        startedAt,
+        endedAt,
+        durationMs: Date.now() - startedMs,
+        usage,
+        llmContext: describeLlmConfig(getActiveLlmConfig()),
+        prompt: { templates: promptTemplates, rendered: { system: applyPromptTemplate(stage.system, variables), user: `${userPrefix}${applyPromptTemplate(stage.user, variables)}` }, variables },
+        error: { message: error?.message || String(error || ''), context: error?.llmContext || null },
+      });
+      throw error;
+    }
+  };
+
+  const first = await callOnce({ label: 'primary' });
+  const content = first.content;
 
   const parsed = tryParseJson(content);
   let candidateTasks = Array.isArray(parsed?.tasks) ? parsed.tasks : [];
   let verdict = validateAtomicTasks(candidateTasks);
   let lastError = verdict.error || null;
   if (!verdict.ok) {
-    const repair = await callLlm(
-      [
-        {
-          role: 'system',
-          content: applyPromptTemplate(stage.system, { context, main, reasonBlock }),
-        },
-        {
-          role: 'user',
-          content:
-            `上一次输出不符合要求（原因：${verdict.error}）。请直接重做。\n\n` +
-            applyPromptTemplate(stage.user, { context, main, reasonBlock }),
-        },
-      ],
-      { timeoutMs },
-    );
+    const repairPrefix = `上一次输出不符合要求（原因：${verdict.error}）。请直接重做。\n\n`;
+    const repairedCall = await callOnce({ label: 'repair', userPrefix: repairPrefix });
+    const repair = repairedCall.content;
     const repaired = tryParseJson(repair);
     candidateTasks = Array.isArray(repaired?.tasks) ? repaired.tasks : [];
     verdict = validateAtomicTasks(candidateTasks);
@@ -2267,14 +2960,19 @@ async function requestAtomicTasks(payload, designSnippet, timeoutMs, reason = ''
   return verdict.tasks;
 }
 
-async function atomizeTaskSummary(summary, designSnippet, maxRounds, timeoutMs) {
+async function atomizeTaskSummary(summary, designSnippet, maxRounds, timeoutMs, telemetry = null) {
   let currentTasks = null;
   for (let round = 1; round <= maxRounds; round += 1) {
+    const roundTelemetry =
+      telemetry && typeof telemetry === 'object'
+        ? { ...telemetry, meta: { ...(telemetry.meta || {}), round } }
+        : telemetry;
     const tasks = await requestAtomicTasks(
       currentTasks ? { tasks: currentTasks } : { summary },
       designSnippet,
       timeoutMs,
       currentTasks ? `第 ${round} 轮进一步拆分` : '',
+      roundTelemetry,
     );
     currentTasks = tasks;
     if (!shouldSplitFurther(tasks) || round === maxRounds) {
@@ -2292,11 +2990,16 @@ function logAtomize(job, message) {
 }
 
 
-async function atomizeSummaryParts(parts, designSnippet, timeoutMs, job) {
+async function atomizeSummaryParts(parts, designSnippet, timeoutMs, job, telemetry = null) {
   const results = [];
-  for (const part of parts) {
+  for (let idx = 0; idx < parts.length; idx += 1) {
+    const part = parts[idx];
+    const partTelemetry =
+      telemetry && typeof telemetry === 'object'
+        ? { ...telemetry, meta: { ...(telemetry.meta || {}), splitPart: idx + 1, splitParts: parts.length } }
+        : telemetry;
     try {
-      const subTasks = await atomizeTaskSummary(part, designSnippet, 1, timeoutMs);
+      const subTasks = await atomizeTaskSummary(part, designSnippet, 1, timeoutMs, partTelemetry);
       results.push(...subTasks);
     } catch (error) {
       if (error?.partialTasks?.length) {
@@ -2311,7 +3014,7 @@ async function atomizeSummaryParts(parts, designSnippet, timeoutMs, job) {
   return results;
 }
 
-async function atomizeTaskSummarySafe(summary, designSnippet, maxRounds, timeoutMs, job) {
+async function atomizeTaskSummarySafe(summary, designSnippet, maxRounds, timeoutMs, job, telemetry = null) {
   const cleaned = sanitizeModelText(summary || '', '').trim();
   if (!cleaned) return buildFallbackAtomicTasks(summary);
   const needsSplit = cleaned.length > 180;
@@ -2319,12 +3022,12 @@ async function atomizeTaskSummarySafe(summary, designSnippet, maxRounds, timeout
     const parts = splitSummaryForAtomize(cleaned, 3);
     if (parts.length > 1) {
       logAtomize(job, `原始任务过长，拆分为 ${parts.length} 段处理。`);
-      const results = await atomizeSummaryParts(parts, designSnippet, timeoutMs, job);
+      const results = await atomizeSummaryParts(parts, designSnippet, timeoutMs, job, telemetry);
       if (results.length) return results;
     }
   }
   try {
-    return await atomizeTaskSummary(cleaned, designSnippet, maxRounds, timeoutMs);
+    return await atomizeTaskSummary(cleaned, designSnippet, maxRounds, timeoutMs, telemetry);
   } catch (error) {
     if (error?.partialTasks?.length) {
       logAtomize(job, `原始任务输出不规范（${error.partialReason || 'invalid'}），已自动降级。`);
@@ -2333,10 +3036,11 @@ async function atomizeTaskSummarySafe(summary, designSnippet, maxRounds, timeout
     const parts = splitSummaryForAtomize(cleaned, 3);
     if (parts.length > 1) {
       logAtomize(job, `原始任务拆分为 ${parts.length} 段后重试。`);
-      const results = await atomizeSummaryParts(parts, designSnippet, timeoutMs, job);
+      const results = await atomizeSummaryParts(parts, designSnippet, timeoutMs, job, telemetry);
       if (results.length) return results;
     }
-    logAtomize(job, '原子化失败，已生成占位任务。');
+    const reason = truncateText(error?.message || String(error || ''), 180);
+    logAtomize(job, `原子化失败${reason ? `（${reason}）` : ''}，已生成占位任务。`);
     return buildFallbackAtomicTasks(cleaned);
   }
 }
@@ -2363,18 +3067,66 @@ function normalizeAtomizeBatchSize(input) {
 
 async function runAtomizeJob(specName, job, options = {}) {
   try {
-    assertValidLlmConfig(getActiveLlmConfig());
+    const specDir = resolveSpecDir(specName);
+    if (!fs.existsSync(specDir)) throw new Error('Spec not found');
 
-    const tasksPath = resolveSpecFile(specName, 'tasks');
-    if (!fs.existsSync(tasksPath)) throw new Error('Spec file not found');
-    const tasksMarkdown = fs.readFileSync(tasksPath, 'utf8');
-    const summaries = parseTaskSummaries(tasksMarkdown);
-    if (!summaries.length) throw new Error('任务列表为空，无法原子化');
+    const status = readSpecStatus(specName);
+    ensureActiveFlowRun(specName, status, { reason: 'atomize' });
+
+    let canUseModel = true;
+    try {
+      assertValidLlmConfig(getActiveLlmConfig());
+    } catch (error) {
+      canUseModel = false;
+      const message = truncateText(error?.message || String(error || ''), 180);
+      logAtomize(job, `模型配置不可用${message ? `（${message}）` : ''}，本次将生成占位任务。`);
+      appendFlowRunStageAttempt(
+        specName,
+        'atomize',
+        {
+          label: 'llm_unavailable',
+          startedAt: job.startedAt || new Date().toISOString(),
+          endedAt: new Date().toISOString(),
+          durationMs: 0,
+          stream: false,
+          usage: null,
+          llmContext: describeLlmConfig(getActiveLlmConfig()),
+          error: { message: message || 'LLM config unavailable', context: error?.llmContext || null },
+        },
+        { reason: 'atomize' },
+      );
+    }
+
+    const requirementsPath = resolveSpecFile(specName, 'requirements');
+    const requirementsContent = fs.existsSync(requirementsPath)
+      ? fs.readFileSync(requirementsPath, 'utf8')
+      : '';
 
     const designPath = resolveSpecFile(specName, 'design');
-    const designMarkdown = fs.existsSync(designPath)
+    let designMarkdown = fs.existsSync(designPath)
       ? fs.readFileSync(designPath, 'utf8')
       : '';
+    if (!designMarkdown.trim() && (requirementsContent.trim() || status.prompt)) {
+      designMarkdown = generateDesignContent(requirementsContent, status.prompt);
+      writeSpecFile(specName, 'design', designMarkdown);
+      logAtomize(job, 'design.md 缺失，已自动生成模板。');
+    }
+
+    const tasksPath = resolveSpecFile(specName, 'tasks');
+    let tasksMarkdown = fs.existsSync(tasksPath) ? fs.readFileSync(tasksPath, 'utf8') : '';
+    let summaries = parseTaskSummaries(tasksMarkdown);
+    if (!summaries.length && (designMarkdown.trim() || status.prompt)) {
+      const fallbackTasksMarkdown = generateTasksContent(designMarkdown, status.prompt);
+      writeSpecFile(specName, 'tasks', fallbackTasksMarkdown);
+      tasksMarkdown = fallbackTasksMarkdown;
+      summaries = parseTaskSummaries(tasksMarkdown);
+      if (summaries.length) {
+        logAtomize(job, 'tasks.md 缺失/格式不兼容，已自动生成模板任务清单。');
+      }
+    }
+
+    if (!summaries.length) throw new Error('任务列表为空，无法原子化');
+
     const designSnippet = truncateText(designMarkdown, 1200);
 
     const atomicPath = ensureAtomicFile(specName);
@@ -2384,6 +3136,26 @@ async function runAtomizeJob(specName, job, options = {}) {
     job.total = summaries.length;
     job.completed = doneIndices.size;
     logAtomize(job, `检测到 ${summaries.length} 条任务，已完成 ${job.completed} 条。`);
+    appendFlowRunStageAttempt(
+      specName,
+      'atomize',
+      {
+        label: 'job_start',
+        startedAt: job.startedAt || new Date().toISOString(),
+        endedAt: new Date().toISOString(),
+        durationMs: 0,
+        stream: false,
+        usage: null,
+        llmContext: describeLlmConfig(getActiveLlmConfig()),
+        meta: {
+          total: summaries.length,
+          completed: doneIndices.size,
+          batchSize: options?.batchSize ?? null,
+        },
+        error: null,
+      },
+      { reason: 'atomize' },
+    );
 
     const requestedBatchSize = normalizeAtomizeBatchSize(options.batchSize);
     const defaultBatchSize = normalizeAtomizeBatchSize(
@@ -2406,7 +3178,14 @@ async function runAtomizeJob(specName, job, options = {}) {
       if (processedThisRun >= batchSize) break;
       const summary = summaries[i];
       logAtomize(job, `开始原始任务 ${index}/${summaries.length}：${summary}`);
-      const atomized = await atomizeTaskSummarySafe(summary, designSnippet, maxRounds, timeoutMs, job);
+      const telemetry = {
+        meta: { originalIndex: index, originalTask: summary },
+        recordAttempt: (attempt) =>
+          appendFlowRunStageAttempt(specName, 'atomize', attempt, { reason: 'atomize' }),
+      };
+      const atomized = canUseModel
+        ? await atomizeTaskSummarySafe(summary, designSnippet, maxRounds, timeoutMs, job, telemetry)
+        : buildFallbackAtomicTasks(summary);
       const section = buildAtomicSection(index, summary, atomized);
       fs.appendFileSync(atomicPath, `\n\n${section}\n`, 'utf8');
       doneIndices.add(index);
@@ -2420,6 +3199,34 @@ async function runAtomizeJob(specName, job, options = {}) {
 
     if (doneIndices.size >= summaries.length) {
       logAtomize(job, '原子化完成');
+      appendFlowRunStageAttempt(
+        specName,
+        'atomize',
+        {
+          label: 'job_complete',
+          startedAt: job.startedAt || new Date().toISOString(),
+          endedAt: new Date().toISOString(),
+          durationMs: 0,
+          stream: false,
+          usage: null,
+          llmContext: describeLlmConfig(getActiveLlmConfig()),
+          meta: {
+            total: summaries.length,
+            completed: doneIndices.size,
+          },
+          error: null,
+        },
+        { reason: 'atomize' },
+      );
+      try {
+        const reportPath = finalizeFlowReport(specName);
+        if (reportPath) {
+          logAtomize(job, `流程报告已生成：${reportPath}`);
+        }
+      } catch (error) {
+        const message = truncateText(error?.message || String(error || ''), 240);
+        logAtomize(job, `流程报告生成失败：${message}`);
+      }
       return;
     }
 
@@ -2694,14 +3501,24 @@ function listSpecs() {
 async function createSpecTemplates(name, artifacts = ['requirements'], prompt = '', options = {}) {
   fs.mkdirSync(resolveSpecDir(name), { recursive: true });
   ensureSpecStatus(name, prompt ? { prompt } : null);
+  if (prompt) {
+    const status = readSpecStatus(name);
+    ensureActiveFlowRun(name, status, { forceNew: true, reason: 'spec:create' });
+  }
   const onLlmToken = typeof options?.onLlmToken === 'function' ? options.onLlmToken : null;
   const onStage = typeof options?.onStage === 'function' ? options.onStage : null;
+  const onTelemetry = (attempt) => {
+    const stageKey = String(attempt?.stageKey || '').trim();
+    if (!stageKey) return;
+    appendFlowRunStageAttempt(name, stageKey, attempt, { reason: 'spec:create' });
+  };
   for (const artifact of artifacts) {
     if (SPEC_ARTIFACTS.includes(artifact)) {
       if (artifact === 'requirements') {
         onStage?.('requirements', 'start');
         const content = await generateRequirementsWithModel(prompt, {
           onToken: onLlmToken ? (delta) => onLlmToken('requirements', delta) : null,
+          onTelemetry,
         });
         onStage?.('requirements', 'end');
         writeSpecFile(name, artifact, content);
@@ -2712,6 +3529,7 @@ async function createSpecTemplates(name, artifacts = ['requirements'], prompt = 
           onToken: onLlmToken
             ? (delta) => onLlmToken('requirementsClarifications', delta)
             : null,
+          onTelemetry,
         });
         onStage?.('requirementsClarifications', 'end');
         const normalizedClarifications = normalizeRequirementsClarifications(clarifications);
@@ -3453,6 +4271,7 @@ app.post('/specs/:name/confirm', async (req, res) => {
       !fs.existsSync(designPath) || fs.readFileSync(designPath, 'utf8').trim() === '';
     if (shouldGenerate) {
       try {
+        ensureActiveFlowRun(specName, status, { reason: 'confirm:requirements' });
         const supplementalPrompt = [
           status.prompt,
           buildClarificationsSummary(status.requirementsClarifications),
@@ -3468,8 +4287,17 @@ app.post('/specs/:name/confirm', async (req, res) => {
             ? {
                 onToken: (delta) =>
                   stream.write({ type: 'delta', stage: 'design', delta }),
+                onTelemetry: (attempt) =>
+                  appendFlowRunStageAttempt(specName, 'design', attempt, {
+                    reason: 'confirm:requirements',
+                  }),
               }
-            : null,
+            : {
+                onTelemetry: (attempt) =>
+                  appendFlowRunStageAttempt(specName, 'design', attempt, {
+                    reason: 'confirm:requirements',
+                  }),
+              },
         );
         stream?.write({ type: 'stage', stage: 'design', state: 'end' });
         writeSpecFile(specName, 'design', content);
@@ -3529,6 +4357,7 @@ app.post('/specs/:name/confirm', async (req, res) => {
       force || !fs.existsSync(tasksPath) || fs.readFileSync(tasksPath, 'utf8').trim() === '';
     if (shouldGenerate) {
       try {
+        ensureActiveFlowRun(specName, status, { reason: 'confirm:design' });
         const supplementalPrompt = [status.prompt, buildTechStackSummary(status.techStackClarifications)]
           .filter(Boolean)
           .join('\n\n');
@@ -3539,8 +4368,17 @@ app.post('/specs/:name/confirm', async (req, res) => {
           stream
             ? {
                 onToken: (delta) => stream.write({ type: 'delta', stage: 'tasks', delta }),
+                onTelemetry: (attempt) =>
+                  appendFlowRunStageAttempt(specName, 'tasks', attempt, {
+                    reason: 'confirm:design',
+                  }),
               }
-            : null,
+            : {
+                onTelemetry: (attempt) =>
+                  appendFlowRunStageAttempt(specName, 'tasks', attempt, {
+                    reason: 'confirm:design',
+                  }),
+              },
         );
         stream?.write({ type: 'stage', stage: 'tasks', state: 'end' });
         writeSpecFile(specName, 'tasks', content);
