@@ -88,6 +88,7 @@ const PROMPT_STAGE_ORDER = [
   { key: 'design', label: '设计生成' },
   { key: 'tasks', label: '任务生成' },
   { key: 'atomize', label: '任务原子化' },
+  { key: 'reportScore', label: '流程报告评分' },
 ] as const;
 
 function sanitizeFilePart(input: string) {
@@ -165,6 +166,38 @@ function computeThroughputEtaSeconds(input: {
   const remainingMs = (total - completed) / rate;
   if (!Number.isFinite(remainingMs) || remainingMs < 0) return null;
   return Math.ceil(remainingMs / 1000);
+}
+
+const MATRIX_GLYPHS =
+  'ﾊﾐﾋｰｳｼﾅﾓﾆｻﾜﾂｵﾘｱﾎﾃﾏｹﾒｴｦｧｨｩｪｫｬｭｮｯ' +
+  '0123456789' +
+  'ABCDEFGHIJKLMNOPQRSTUVWXYZ' +
+  '#$%&*+-<>/\\|=';
+
+function matrixScrambleSegment(segment: string, phase: number) {
+  const len = segment.length;
+  if (!len) return '';
+  const glyphs = MATRIX_GLYPHS;
+  const glyphLen = glyphs.length;
+  let out = '';
+  for (let i = 0; i < len; i += 1) {
+    const ch = segment[i];
+    if (ch === '\n' || ch === '\r' || ch === '\t') {
+      out += ch;
+      continue;
+    }
+    const t = len <= 1 ? 0 : i / (len - 1);
+    const revealProb = clampNumber(0.92 - t * 0.86, 0.04, 0.98);
+    const seed = (phase * 9301 + i * 49297 + ch.charCodeAt(0) * 17) % 233280;
+    const r = seed / 233280;
+    if (r < revealProb) {
+      out += ch;
+      continue;
+    }
+    const glyphIndex = Math.abs((seed + phase * 37 + i * 11) % glyphLen);
+    out += glyphs[glyphIndex] ?? '#';
+  }
+  return out;
 }
 
 async function renderTextToPng(text: string, title: string) {
@@ -504,6 +537,7 @@ function errorStageLabel(stage?: string | null) {
   if (stage === 'design') return '设计生成';
   if (stage === 'tasks') return '任务生成';
   if (stage === 'atomize') return '任务原子化';
+  if (stage === 'reportScore') return '流程报告评分';
   return stage;
 }
 
@@ -601,7 +635,13 @@ export default function App() {
   const streamTextRef = useRef('');
   const streamFlushTimerRef = useRef<number | null>(null);
   const [animatedDisplayContent, setAnimatedDisplayContent] = useState('');
-  const typewriterRef = useRef<{ target: string; current: string }>({ target: '', current: '' });
+  const typewriterRef = useRef<{
+    target: string;
+    lastTarget: string;
+    resolvedLen: number;
+    phase: number;
+    startedAtMs: number | null;
+  }>({ target: '', lastTarget: '', resolvedLen: 0, phase: 0, startedAtMs: null });
   const typewriterTimerRef = useRef<number | null>(null);
   const [toast, setToast] = useState<{ message: string; tone: 'error' | 'info' } | null>(null);
   const toastTimerRef = useRef<number | null>(null);
@@ -1860,16 +1900,34 @@ export default function App() {
   const outputText = shouldTypewriter ? animatedDisplayContent : displayContent;
 
   useEffect(() => {
-    typewriterRef.current.target = displayContent;
     if (!shouldTypewriter) {
-      typewriterRef.current.current = displayContent;
+      typewriterRef.current.target = displayContent;
+      typewriterRef.current.lastTarget = displayContent;
+      typewriterRef.current.resolvedLen = displayContent.length;
+      typewriterRef.current.phase = 0;
+      typewriterRef.current.startedAtMs = null;
       setAnimatedDisplayContent(displayContent);
       return;
     }
-    if (!displayContent.startsWith(typewriterRef.current.current)) {
-      typewriterRef.current.current = '';
+
+    const prevTarget = typewriterRef.current.lastTarget;
+    typewriterRef.current.target = displayContent;
+    if (typewriterRef.current.startedAtMs == null) {
+      typewriterRef.current.startedAtMs = Date.now();
+    }
+
+    if (prevTarget && !displayContent.startsWith(prevTarget)) {
+      typewriterRef.current.resolvedLen = 0;
+      typewriterRef.current.phase = 0;
+      typewriterRef.current.startedAtMs = Date.now();
       setAnimatedDisplayContent('');
     }
+
+    typewriterRef.current.resolvedLen = Math.min(
+      typewriterRef.current.resolvedLen,
+      displayContent.length,
+    );
+    typewriterRef.current.lastTarget = displayContent;
   }, [displayContent, shouldTypewriter]);
 
   useEffect(() => {
@@ -1881,17 +1939,49 @@ export default function App() {
       return;
     }
     if (typewriterTimerRef.current) return;
+    const TICK_MS = 50;
+    const SCRAMBLE_WINDOW = 72;
+    const MAX_BUFFER_CHARS = 320;
+    const START_DELAY_MS = 1200;
+
     const timer = window.setInterval(() => {
-      const target = typewriterRef.current.target;
-      const current = typewriterRef.current.current;
-      if (!target || target.length <= current.length) return;
-      const backlog = target.length - current.length;
-      const cps = Math.min(8000, 1200 + backlog * 4);
-      const chunk = Math.min(backlog, Math.max(1, Math.floor((cps * 50) / 1000)));
-      const next = current + target.slice(current.length, current.length + chunk);
-      typewriterRef.current.current = next;
-      setAnimatedDisplayContent(next);
-    }, 50);
+      const ref = typewriterRef.current;
+      const target = ref.target || '';
+      if (!target) {
+        setAnimatedDisplayContent('');
+        return;
+      }
+
+      const targetLen = target.length;
+      const startedAtMs = ref.startedAtMs;
+      const elapsedMs = startedAtMs ? Date.now() - startedAtMs : null;
+
+      const holdBack = Math.min(
+        MAX_BUFFER_CHARS,
+        Math.max(0, targetLen - SCRAMBLE_WINDOW),
+      );
+      const maxResolvedLen = Math.max(0, targetLen - holdBack);
+
+      let resolvedLen = Math.min(ref.resolvedLen, targetLen);
+      if (elapsedMs != null && elapsedMs < START_DELAY_MS) {
+        resolvedLen = Math.min(resolvedLen, 0);
+      } else if (resolvedLen < maxResolvedLen) {
+        const backlog = maxResolvedLen - resolvedLen;
+        const cps = clampNumber(260 + backlog * 0.08, 220, 1300);
+        const chunk = Math.max(1, Math.floor((cps * TICK_MS) / 1000));
+        resolvedLen = Math.min(maxResolvedLen, resolvedLen + chunk);
+      }
+
+      ref.resolvedLen = resolvedLen;
+      ref.phase = (ref.phase + 1) % 1000000;
+
+      const scrambleStart = resolvedLen;
+      const scrambleEnd = Math.min(targetLen, scrambleStart + SCRAMBLE_WINDOW);
+      const head = target.slice(0, resolvedLen);
+      const tail = target.slice(scrambleStart, scrambleEnd);
+      const tailScrambled = tail ? matrixScrambleSegment(tail, ref.phase) : '';
+      setAnimatedDisplayContent(head + tailScrambled);
+    }, TICK_MS);
     typewriterTimerRef.current = timer;
     return () => {
       window.clearInterval(timer);
