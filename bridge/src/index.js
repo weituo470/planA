@@ -51,6 +51,7 @@ const state = {
 };
 
 const atomizeJobs = new Map();
+const reportScoreJobs = new Map();
 
 const fileSnapshots = new Map();
 let isPaused = false;
@@ -115,6 +116,7 @@ const PROMPT_STAGE_KEYS = [
   'design',
   'tasks',
   'atomize',
+  'reportScore',
 ];
 
 const DEFAULT_PROMPT_CONFIG = {
@@ -183,6 +185,39 @@ const DEFAULT_PROMPT_CONFIG = {
         '7) 任务顺序建议：Types/Interfaces -> Schema -> Utils/Storage -> UI 静态组件 -> 状态管理 -> 交互逻辑 -> 边界自愈。\n' +
         '8) 简体中文。\n' +
         '只输出 JSON：{"tasks":[...]}。',
+    },
+    reportScore: {
+      label: '流程报告评分',
+      variables: [
+        'specName',
+        'prompt',
+        'requirements',
+        'design',
+        'tasks',
+        'tasksAtomic',
+      ],
+      system:
+        '你是项目经理 + 资深工程评审。你将对 planA 的“任务拆解质量（尤其 tasks_atomic.md）”打分。只输出 JSON，不要解释。',
+      user:
+        `Spec：{{specName}}\n` +
+        `原始需求：{{prompt}}\n\n` +
+        '以下是该需求的核心文档快照：\n\n' +
+        '【requirements.md】\n{{requirements}}\n\n' +
+        '【design.md】\n{{design}}\n\n' +
+        '【tasks.md】\n{{tasks}}\n\n' +
+        '【tasks_atomic.md】\n{{tasksAtomic}}\n\n' +
+        '请按“任务可执行性与可验收性”评审并评分（0-100）。评分维度建议：\n' +
+        '1) 覆盖度：是否覆盖需求与关键边界\n' +
+        '2) 原子性：单任务是否 15 分钟内可完成，是否拆到无法再拆\n' +
+        '3) 具体性：是否包含明确文件路径/函数名/变量名/命令/验证步骤\n' +
+        '4) 顺序合理：是否遵循定义先行，先 types/schema 再逻辑\n' +
+        '5) 验收清晰：AC 是否可复现、可证明\n\n' +
+        '请严格只输出 JSON，字段必须包含：\n' +
+        '- score：0-100 的整数\n' +
+        '- summary：一句话总评\n' +
+        '- strengths：3-8 条字符串数组\n' +
+        '- weaknesses：3-8 条字符串数组\n' +
+        '- suggestions：3-10 条字符串数组（可落地修改建议）\n',
     },
   },
 };
@@ -916,6 +951,8 @@ function createFlowRun(specName, status, reason = '') {
     updatedAt: now,
     reason: String(reason || ''),
     stages: {},
+    ratings: { updatedAt: null, byModel: {} },
+    userRatings: [],
     report: null,
   };
   writeFlowRun(specName, run);
@@ -988,6 +1025,45 @@ function appendFlowRunStageAttempt(specName, stageKey, attempt, options = {}) {
   if (nextStatus.flowReport?.activeRunId !== run.runId) {
     writeSpecStatus(specName, nextStatus);
   }
+  return attemptRecord;
+}
+
+function appendFlowRunStageAttemptToRun(specName, runId, stageKey, attempt) {
+  const key = String(stageKey || '').trim();
+  const id = String(runId || '').trim();
+  if (!key || !id) return null;
+  const run = readFlowRun(specName, id);
+  if (!run) return null;
+
+  const now = new Date().toISOString();
+  const attemptRecord =
+    attempt && typeof attempt === 'object'
+      ? { ...attempt }
+      : { value: String(attempt || '') };
+  if (!attemptRecord.id) attemptRecord.id = nanoid();
+  attemptRecord.stageKey = key;
+  attemptRecord.recordedAt = now;
+
+  const existingStage =
+    run.stages && typeof run.stages === 'object' && run.stages[key]
+      ? run.stages[key]
+      : {};
+  const attempts = Array.isArray(existingStage.attempts) ? existingStage.attempts : [];
+  attempts.push(attemptRecord);
+
+  const nextRun = {
+    ...run,
+    updatedAt: now,
+    stages: {
+      ...(run.stages && typeof run.stages === 'object' ? run.stages : {}),
+      [key]: {
+        ...existingStage,
+        attempts,
+        last: attemptRecord,
+      },
+    },
+  };
+  writeFlowRun(specName, nextRun);
   return attemptRecord;
 }
 
@@ -1122,6 +1198,51 @@ function buildFlowReportMarkdown(specName, status, run, artifacts) {
   const stages = run?.stages && typeof run.stages === 'object' ? run.stages : {};
   const stageKeys = PROMPT_STAGE_KEYS;
 
+  const modelIds = Array.from(
+    new Set(LLM_MODEL_OPTIONS.map((m) => String(m?.id || '')).filter(Boolean)),
+  );
+  const ratings = run?.ratings && typeof run.ratings === 'object' ? run.ratings : {};
+  const byModel =
+    ratings?.byModel && typeof ratings.byModel === 'object' ? ratings.byModel : {};
+  const scoreTable = (() => {
+    const header = ['| 模型 | 分数 | 总评 | 状态 |', '|---|---:|---|---|'];
+    const rows = modelIds.map((modelId) => {
+      const label =
+        LLM_MODEL_OPTIONS.find((m) => String(m?.id || '') === modelId)?.label || modelId;
+      const item = byModel?.[modelId] && typeof byModel[modelId] === 'object'
+        ? byModel[modelId]
+        : null;
+      const score = item?.result?.score ?? null;
+      const summary = item?.result?.summary ?? '';
+      const statusText = item?.ok
+        ? 'ok'
+        : item?.skipped
+          ? 'skipped'
+          : item?.error
+            ? 'error'
+            : '未评分';
+      const scoreText =
+        typeof score === 'number' && Number.isFinite(score) ? String(score) : '-';
+      const summaryText = String(summary || '').replace(/\r?\n/g, ' ').slice(0, 120);
+      return `| ${label} | ${scoreText} | ${summaryText || '-'} | ${statusText} |`;
+    });
+    return [...header, ...rows].join('\n');
+  })();
+
+  const userRatings = Array.isArray(run?.userRatings) ? run.userRatings : [];
+  const userRatingsText = userRatings.length
+    ? userRatings
+        .map((r) => {
+          const at = r?.createdAt ? String(r.createdAt) : '';
+          const score = Number(r?.score);
+          const scoreText =
+            Number.isFinite(score) && score >= 0 && score <= 100 ? `${score}/100` : 'n/a';
+          const comment = String(r?.comment || '').trim();
+          return `- ${at || 'unknown'}：${scoreText}${comment ? `｜${comment}` : ''}`;
+        })
+        .join('\n')
+    : '（无）';
+
   const usageByStage = {};
   const durationByStage = {};
   for (const key of stageKeys) {
@@ -1207,6 +1328,16 @@ function buildFlowReportMarkdown(specName, status, run, artifacts) {
     tasksAtomic,
     '```',
     '',
+    '## 6) 报告评分（任务拆解质量，0-100）',
+    '',
+    '### 模型评分',
+    '',
+    scoreTable,
+    '',
+    '### 用户评分记录',
+    '',
+    userRatingsText,
+    '',
   ].join('\n');
 }
 
@@ -1264,6 +1395,381 @@ function finalizeFlowReport(specName, options = {}) {
   };
   writeSpecStatus(specName, nextStatus);
   return reportPath;
+}
+
+function refreshFlowReport(specName, runId) {
+  const id = String(runId || '').trim();
+  if (!id) return null;
+  const status = readSpecStatus(specName);
+  const run = readFlowRun(specName, id);
+  if (!run) return null;
+
+  const artifacts = {};
+  for (const key of SPEC_ARTIFACTS) {
+    const filePath = resolveSpecFile(specName, key);
+    artifacts[key] = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
+  }
+
+  const markdown = buildFlowReportMarkdown(specName, status, run, artifacts);
+
+  fs.mkdirSync(DOCS_DIR, { recursive: true });
+  const safeSpec = sanitizeFilenamePart(specName, 'spec');
+  const fileName = `flow_${safeSpec}_${id}.md`;
+  const reportPath =
+    run.report && typeof run.report === 'object' && typeof run.report.path === 'string' && run.report.path.trim()
+      ? run.report.path
+      : path.join(DOCS_DIR, fileName);
+  fs.writeFileSync(reportPath, markdown, 'utf8');
+
+  const now = new Date().toISOString();
+  const updatedRun = {
+    ...run,
+    updatedAt: now,
+    report: {
+      path: reportPath,
+      createdAt: run?.report?.createdAt || now,
+      updatedAt: now,
+    },
+  };
+  writeFlowRun(specName, updatedRun);
+  return reportPath;
+}
+
+function sanitizeRunId(runId) {
+  if (!runId || typeof runId !== 'string') return null;
+  const trimmed = runId.trim();
+  if (!trimmed) return null;
+  if (trimmed === '.' || trimmed === '..') return null;
+  if (trimmed.endsWith('.')) return null;
+  if (!/^[A-Za-z0-9_-]{6,96}$/.test(trimmed)) return null;
+  return trimmed;
+}
+
+function getModelLabel(modelId) {
+  const key = String(modelId || '').trim();
+  if (!key) return '';
+  return LLM_MODEL_OPTIONS.find((m) => String(m?.id || '') === key)?.label || key;
+}
+
+function listFlowRuns(specName) {
+  const dir = resolveFlowRunDir(specName);
+  if (!fs.existsSync(dir)) return [];
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const runs = [];
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const name = String(entry.name || '');
+    if (!name.endsWith('.json')) continue;
+    const runId = sanitizeRunId(name.slice(0, -'.json'.length));
+    if (!runId) continue;
+    const run = readFlowRun(specName, runId);
+    if (run) runs.push(run);
+  }
+  runs.sort((a, b) => {
+    const at = Date.parse(String(a?.createdAt || '')) || 0;
+    const bt = Date.parse(String(b?.createdAt || '')) || 0;
+    return bt - at;
+  });
+  return runs;
+}
+
+function normalizeReportScorePayload(payload) {
+  const obj = payload && typeof payload === 'object' ? payload : null;
+  if (!obj) return null;
+  const rawScore = Number(obj.score);
+  if (!Number.isFinite(rawScore)) return null;
+  const score = Math.max(0, Math.min(100, Math.round(rawScore)));
+
+  const summary = typeof obj.summary === 'string' ? obj.summary.trim() : '';
+  const normalizeList = (value, min, max) => {
+    const arr = Array.isArray(value) ? value : [];
+    const cleaned = arr
+      .map((item) => String(item ?? '').trim())
+      .filter(Boolean)
+      .slice(0, max);
+    if (cleaned.length < min) return [];
+    return cleaned;
+  };
+
+  const strengths = normalizeList(obj.strengths, 1, 12);
+  const weaknesses = normalizeList(obj.weaknesses, 1, 12);
+  const suggestions = normalizeList(obj.suggestions, 1, 20);
+  return {
+    score,
+    summary: summary || '（无）',
+    strengths,
+    weaknesses,
+    suggestions,
+  };
+}
+
+function truncateTextMiddle(text, maxLen = 16000) {
+  if (!text) return '';
+  const value = String(text);
+  if (value.length <= maxLen) return value;
+  const headLen = Math.max(2000, Math.floor(maxLen * 0.6));
+  const tailLen = Math.max(2000, maxLen - headLen);
+  return `${value.slice(0, headLen)}\n\n…(truncated)…\n\n${value.slice(-tailLen)}`;
+}
+
+function reportScoreJobKey(specName, runId) {
+  return `${String(specName || '').trim()}::${String(runId || '').trim()}`;
+}
+
+function logReportScore(job, message) {
+  const entry = { at: new Date().toISOString(), message: String(message || '') };
+  job.logs.push(entry);
+  if (job.logs.length > 200) job.logs.shift();
+  job.updatedAt = entry.at;
+}
+
+function getReportScoreStatus(job) {
+  return {
+    running: job.running,
+    total: job.total,
+    completed: job.completed,
+    logs: job.logs,
+    error: job.error,
+    startedAt: job.startedAt,
+    updatedAt: job.updatedAt,
+  };
+}
+
+async function scoreFlowReportWithModel(specName, runId, modelId, context) {
+  const status = context?.status;
+  const artifacts = context?.artifacts;
+  const cfg = getLlmConfigForModel(modelId);
+  if (!cfg?.baseUrl || !cfg?.apiKey) {
+    return {
+      ok: false,
+      skipped: true,
+      error: { message: 'Missing baseUrl or apiKey', context: describeLlmConfig(cfg) },
+      result: null,
+      attemptId: null,
+    };
+  }
+
+  const timeoutMs = Math.min(
+    Math.max(8000, Number(process.env.LLM_REPORT_SCORE_TIMEOUT_MS || 60000)),
+    120000,
+  );
+
+  const promptConfig = loadPromptConfig();
+  const stage = promptConfig.stages.reportScore;
+
+  const variables = {
+    specName,
+    prompt: String(status?.prompt || ''),
+    requirements: truncateTextMiddle(artifacts?.requirements || '', 9000),
+    design: truncateTextMiddle(artifacts?.design || '', 9000),
+    tasks: truncateTextMiddle(artifacts?.tasks || '', 12000),
+    tasksAtomic: truncateTextMiddle(artifacts?.tasks_atomic || '', 20000),
+  };
+  const promptTemplates = { system: stage.system, user: stage.user };
+  const promptRendered = {
+    system: applyPromptTemplate(stage.system, variables),
+    user: applyPromptTemplate(stage.user, variables),
+  };
+  const messages = [
+    { role: 'system', content: promptRendered.system },
+    { role: 'user', content: promptRendered.user },
+  ];
+
+  const startedAt = new Date().toISOString();
+  const startedMs = Date.now();
+  let usage = null;
+
+  try {
+    const content = await callLlm(messages, { ...cfg, timeoutMs }, {
+      onUsage: (u) => {
+        usage = u;
+      },
+    });
+
+    const payload = tryParseJson(content);
+    const result = normalizeReportScorePayload(payload);
+    if (!result) {
+      throw new Error(`LLM reportScore output invalid: ${String(content).slice(0, 240)}`);
+    }
+
+    const endedAt = new Date().toISOString();
+    const attempt = appendFlowRunStageAttemptToRun(specName, runId, 'reportScore', {
+      label: `model:${modelId}`,
+      stream: false,
+      startedAt,
+      endedAt,
+      durationMs: Date.now() - startedMs,
+      usage,
+      llmContext: describeLlmConfig(cfg),
+      prompt: { templates: promptTemplates, rendered: promptRendered, variables },
+      meta: { modelId, providerId: cfg.providerId },
+      error: null,
+      result,
+    });
+
+    return { ok: true, skipped: false, error: null, result, attemptId: attempt?.id || null };
+  } catch (error) {
+    const endedAt = new Date().toISOString();
+    const attempt = appendFlowRunStageAttemptToRun(specName, runId, 'reportScore', {
+      label: `model:${modelId}`,
+      stream: false,
+      startedAt,
+      endedAt,
+      durationMs: Date.now() - startedMs,
+      usage,
+      llmContext: describeLlmConfig(cfg),
+      prompt: { templates: promptTemplates, rendered: promptRendered, variables },
+      meta: { modelId, providerId: cfg.providerId },
+      error: { message: error?.message || String(error || ''), context: error?.llmContext || null },
+    });
+    return {
+      ok: false,
+      skipped: false,
+      error: { message: error?.message || String(error || ''), context: error?.llmContext || null },
+      result: null,
+      attemptId: attempt?.id || null,
+    };
+  }
+}
+
+async function runReportScoreJob(specName, runId, job, options = {}) {
+  try {
+    const id = sanitizeRunId(runId);
+    if (!id) throw new Error('Invalid runId');
+    const status = readSpecStatus(specName);
+    const run = readFlowRun(specName, id);
+    if (!run) throw new Error('Flow run not found');
+
+    const artifacts = {};
+    for (const key of SPEC_ARTIFACTS) {
+      const filePath = resolveSpecFile(specName, key);
+      artifacts[key] = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
+    }
+
+    const modelIds = Array.from(
+      new Set(LLM_MODEL_OPTIONS.map((m) => String(m?.id || '')).filter(Boolean)),
+    );
+    job.total = modelIds.length;
+    job.completed = 0;
+    logReportScore(job, `开始评分：${specName} / ${id}（模型数：${job.total}）`);
+
+    const force = options?.force === true;
+
+    for (const modelId of modelIds) {
+      const current = readFlowRun(specName, id);
+      const currentRatings =
+        current?.ratings && typeof current.ratings === 'object' ? current.ratings : {};
+      const currentByModel =
+        currentRatings?.byModel && typeof currentRatings.byModel === 'object'
+          ? currentRatings.byModel
+          : {};
+      const existing = currentByModel?.[modelId] && typeof currentByModel[modelId] === 'object'
+        ? currentByModel[modelId]
+        : null;
+      if (!force && existing?.ok && existing?.result?.score != null) {
+        logReportScore(job, `跳过已评分模型：${getModelLabel(modelId)}`);
+        job.completed += 1;
+        continue;
+      }
+
+      logReportScore(job, `开始模型评分：${getModelLabel(modelId)}`);
+      const verdict = await scoreFlowReportWithModel(specName, id, modelId, {
+        status,
+        artifacts,
+      });
+
+      const now = new Date().toISOString();
+      const nextRun = readFlowRun(specName, id) || run;
+      const nextRatings =
+        nextRun?.ratings && typeof nextRun.ratings === 'object' ? nextRun.ratings : {};
+      const nextByModel =
+        nextRatings?.byModel && typeof nextRatings.byModel === 'object'
+          ? { ...nextRatings.byModel }
+          : {};
+      nextByModel[modelId] = {
+        ok: Boolean(verdict.ok),
+        skipped: Boolean(verdict.skipped),
+        updatedAt: now,
+        attemptId: verdict.attemptId || null,
+        result: verdict.result || null,
+        error: verdict.error || null,
+      };
+
+      writeFlowRun(specName, {
+        ...nextRun,
+        updatedAt: now,
+        ratings: {
+          ...nextRatings,
+          updatedAt: now,
+          byModel: nextByModel,
+        },
+      });
+
+      if (verdict.ok) {
+        logReportScore(job, `完成模型评分：${getModelLabel(modelId)}（${verdict.result.score}/100）`);
+      } else if (verdict.skipped) {
+        logReportScore(job, `跳过模型：${getModelLabel(modelId)}（未配置）`);
+      } else {
+        logReportScore(
+          job,
+          `模型评分失败：${getModelLabel(modelId)}（${truncateText(verdict.error?.message || '', 160)}）`,
+        );
+      }
+
+      job.completed += 1;
+    }
+
+    refreshFlowReport(specName, id);
+    logReportScore(job, '评分完成，流程报告已更新');
+    job.running = false;
+    job.error = null;
+  } catch (error) {
+    job.running = false;
+    job.error = error?.message || String(error);
+    logReportScore(job, `评分失败：${job.error}`);
+  }
+}
+
+function getReportScoreJob(specName, runId) {
+  const id = sanitizeRunId(runId);
+  if (!id) return null;
+  return reportScoreJobs.get(reportScoreJobKey(specName, id)) || null;
+}
+
+function startReportScoreJob(specName, runId, options = {}) {
+  const id = sanitizeRunId(runId);
+  if (!id) return null;
+  const key = reportScoreJobKey(specName, id);
+  const existing = reportScoreJobs.get(key);
+  if (existing && existing.running) return existing;
+  const now = new Date().toISOString();
+  const job = existing || {
+    specName,
+    runId: id,
+    running: false,
+    total: 0,
+    completed: 0,
+    logs: [],
+    error: null,
+    startedAt: now,
+    updatedAt: now,
+  };
+  job.running = true;
+  job.error = null;
+  job.startedAt = now;
+  job.updatedAt = now;
+  if (options?.resetLogs === true) job.logs = [];
+  reportScoreJobs.set(key, job);
+  logReportScore(job, '评分任务已启动');
+  setImmediate(() => {
+    runReportScoreJob(specName, id, job, options);
+  });
+  return job;
 }
 
 function normalizePrompt(prompt) {
@@ -4085,6 +4591,155 @@ app.post('/specs', async (req, res) => {
   return res.json({ name: specName });
 });
 
+app.get('/specs/:name/reports', (req, res) => {
+  const specName = sanitizeSpecName(req.params.name);
+  if (!specName) {
+    return res.status(400).json({ error: 'Invalid spec request' });
+  }
+  const runs = listFlowRuns(specName);
+  const reports = runs.map((run) => {
+    const runId = String(run?.runId || '');
+    const ratings = run?.ratings && typeof run.ratings === 'object' ? run.ratings : {};
+    const userRatings = Array.isArray(run?.userRatings) ? run.userRatings : [];
+    const reportPath =
+      run?.report && typeof run.report === 'object' ? run.report.path || null : null;
+    const job = runId ? getReportScoreJob(specName, runId) : null;
+    return {
+      runId,
+      createdAt: run?.createdAt || null,
+      updatedAt: run?.updatedAt || null,
+      reportPath,
+      ratings: {
+        updatedAt: ratings?.updatedAt || null,
+        byModel:
+          ratings?.byModel && typeof ratings.byModel === 'object' ? ratings.byModel : {},
+      },
+      userRatings,
+      scoreJob: job ? getReportScoreStatus(job) : null,
+    };
+  });
+  return res.json({ reports });
+});
+
+app.get('/specs/:name/reports/:runId', (req, res) => {
+  const specName = sanitizeSpecName(req.params.name);
+  const runId = sanitizeRunId(req.params.runId);
+  if (!specName || !runId) {
+    return res.status(400).json({ error: 'Invalid report request' });
+  }
+  const run = readFlowRun(specName, runId);
+  if (!run) {
+    return res.status(404).json({ error: 'Report run not found' });
+  }
+  const ratings = run?.ratings && typeof run.ratings === 'object' ? run.ratings : {};
+  const userRatings = Array.isArray(run?.userRatings) ? run.userRatings : [];
+  const reportPath =
+    run?.report && typeof run.report === 'object' ? run.report.path || null : null;
+  const job = getReportScoreJob(specName, runId);
+  return res.json({
+    runId,
+    createdAt: run?.createdAt || null,
+    updatedAt: run?.updatedAt || null,
+    reportPath,
+    ratings: {
+      updatedAt: ratings?.updatedAt || null,
+      byModel: ratings?.byModel && typeof ratings.byModel === 'object' ? ratings.byModel : {},
+    },
+    userRatings,
+    scoreJob: job ? getReportScoreStatus(job) : null,
+  });
+});
+
+app.get('/specs/:name/reports/:runId/markdown', (req, res) => {
+  const specName = sanitizeSpecName(req.params.name);
+  const runId = sanitizeRunId(req.params.runId);
+  if (!specName || !runId) {
+    return res.status(400).json({ error: 'Invalid report request' });
+  }
+  const run = readFlowRun(specName, runId);
+  if (!run) {
+    return res.status(404).json({ error: 'Report run not found' });
+  }
+  try {
+    const reportPath = refreshFlowReport(specName, runId) || null;
+    if (!reportPath || !fs.existsSync(reportPath)) {
+      return res.status(404).json({ error: 'Report file not found' });
+    }
+    const content = fs.readFileSync(reportPath, 'utf8');
+    return res.json({ reportPath, content });
+  } catch (error) {
+    const message = truncateText(error?.message || String(error || ''), 240);
+    return res.status(500).json({ error: `Failed to read report: ${message}` });
+  }
+});
+
+app.get('/specs/:name/reports/:runId/score', (req, res) => {
+  const specName = sanitizeSpecName(req.params.name);
+  const runId = sanitizeRunId(req.params.runId);
+  if (!specName || !runId) {
+    return res.status(400).json({ error: 'Invalid report request' });
+  }
+  const job = getReportScoreJob(specName, runId);
+  if (!job) {
+    return res.json({
+      running: false,
+      total: 0,
+      completed: 0,
+      logs: [],
+      error: null,
+      startedAt: null,
+      updatedAt: null,
+    });
+  }
+  return res.json(getReportScoreStatus(job));
+});
+
+app.post('/specs/:name/reports/:runId/score', (req, res) => {
+  const specName = sanitizeSpecName(req.params.name);
+  const runId = sanitizeRunId(req.params.runId);
+  if (!specName || !runId) {
+    return res.status(400).json({ error: 'Invalid report request' });
+  }
+  const run = readFlowRun(specName, runId);
+  if (!run) {
+    return res.status(404).json({ error: 'Report run not found' });
+  }
+  const force = req.body?.force === true;
+  const job = startReportScoreJob(specName, runId, { force, resetLogs: true });
+  if (!job) {
+    return res.status(500).json({ error: 'Failed to start score job' });
+  }
+  return res.json(getReportScoreStatus(job));
+});
+
+app.post('/specs/:name/reports/:runId/user-score', (req, res) => {
+  const specName = sanitizeSpecName(req.params.name);
+  const runId = sanitizeRunId(req.params.runId);
+  if (!specName || !runId) {
+    return res.status(400).json({ error: 'Invalid report request' });
+  }
+  const run = readFlowRun(specName, runId);
+  if (!run) {
+    return res.status(404).json({ error: 'Report run not found' });
+  }
+  const score = Number(req.body?.score);
+  if (!Number.isFinite(score) || score < 0 || score > 100) {
+    return res.status(400).json({ error: 'score must be between 0 and 100' });
+  }
+  const comment = sanitizeReviewText(req.body?.comment, 400);
+  const record = {
+    score: Math.round(score),
+    comment,
+    createdAt: new Date().toISOString(),
+  };
+  const nextUserRatings = Array.isArray(run.userRatings) ? [...run.userRatings] : [];
+  nextUserRatings.push(record);
+  const now = new Date().toISOString();
+  writeFlowRun(specName, { ...run, updatedAt: now, userRatings: nextUserRatings });
+  refreshFlowReport(specName, runId);
+  return res.json({ ok: true, userRatings: nextUserRatings });
+});
+
 app.get('/specs/:name/:artifact', (req, res) => {
   const specName = sanitizeSpecName(req.params.name);
   const artifact = req.params.artifact;
@@ -4118,6 +4773,9 @@ app.get('/specs/:name/:artifact', (req, res) => {
       const content = generateTasksContent(designContent, status.prompt);
       writeSpecFile(specName, 'tasks', content);
     }
+  }
+  if (!fs.existsSync(filePath)) {
+    ensureSpecTemplate(specName, artifact);
   }
   if (!fs.existsSync(filePath)) {
     return res.status(404).json({ error: 'Spec file not found' });
