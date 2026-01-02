@@ -799,7 +799,7 @@ function readSpecStatus(name) {
     return { ...DEFAULT_SPEC_STATUS };
   }
   try {
-    const raw = fs.readFileSync(filePath, 'utf8');
+    const raw = fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '');
     const parsed = JSON.parse(raw);
     return { ...DEFAULT_SPEC_STATUS, ...parsed };
   } catch (error) {
@@ -1359,7 +1359,6 @@ function buildDefaultTechStackQuestions(prompt, designMarkdown) {
     required: true,
     allowOther: true,
     options: [
-      { id: 'keep', label: '沿用现有项目技术栈（推荐）' },
       { id: 'react-vite', label: 'React + Vite' },
       { id: 'nextjs', label: 'Next.js (React)' },
       { id: 'vue-vite', label: 'Vue + Vite' },
@@ -1377,7 +1376,6 @@ function buildDefaultTechStackQuestions(prompt, designMarkdown) {
     required: true,
     allowOther: true,
     options: [
-      { id: 'keep', label: '沿用现有项目技术栈（推荐）' },
       { id: 'nest', label: 'Node.js + NestJS' },
       { id: 'express', label: 'Node.js + Express' },
       { id: 'fastapi', label: 'Python + FastAPI' },
@@ -1395,7 +1393,6 @@ function buildDefaultTechStackQuestions(prompt, designMarkdown) {
     required: true,
     allowOther: true,
     options: [
-      { id: 'keep', label: '沿用现有项目技术栈（推荐）' },
       { id: 'postgres', label: 'PostgreSQL' },
       { id: 'mysql', label: 'MySQL' },
       { id: 'sqlite', label: 'SQLite' },
@@ -1413,7 +1410,6 @@ function buildDefaultTechStackQuestions(prompt, designMarkdown) {
     required: true,
     allowOther: true,
     options: [
-      { id: 'keep', label: '沿用现有项目技术栈（推荐）' },
       { id: 'jwt', label: 'JWT' },
       { id: 'session', label: 'Session + Cookie' },
       { id: 'oauth', label: 'OAuth2 / 第三方登录' },
@@ -1430,7 +1426,6 @@ function buildDefaultTechStackQuestions(prompt, designMarkdown) {
     required: true,
     allowOther: true,
     options: [
-      { id: 'keep', label: '沿用现有项目技术栈（推荐）' },
       { id: 'docker', label: 'Docker' },
       { id: 'pm2', label: 'PM2/进程守护' },
       { id: 'serverless', label: 'Serverless' },
@@ -1448,24 +1443,97 @@ function buildDefaultTechStackQuestions(prompt, designMarkdown) {
   return questions.map(normalizeClarificationQuestion).filter(Boolean);
 }
 
+function stripTechStackKeepOptions(questions) {
+  if (!Array.isArray(questions) || questions.length === 0) {
+    return { changed: false, questions: Array.isArray(questions) ? questions : [] };
+  }
+
+  const isKeepOption = (opt) => {
+    if (!opt || typeof opt !== 'object') return false;
+    const id = typeof opt.id === 'string' ? opt.id.trim() : '';
+    const label = typeof opt.label === 'string' ? opt.label.trim() : '';
+    if (id === 'keep') return true;
+    if (!label) return false;
+    if (/^(沿用|保持).*(现有|当前|项目)/.test(label)) return true;
+    if (/(沿用|保持).*(技术栈)/.test(label)) return true;
+    return false;
+  };
+
+  let changed = false;
+  const next = questions.map((q) => {
+    if (!q || typeof q !== 'object') return q;
+
+    const options = Array.isArray(q.options) ? q.options : [];
+    const filteredOptions = options.filter((opt) => !isKeepOption(opt));
+    const answer =
+      q.answer && typeof q.answer === 'object' ? q.answer : { selectedOptionIds: [], otherText: '' };
+    const selected = Array.isArray(answer.selectedOptionIds) ? answer.selectedOptionIds : [];
+    const allowed = new Set(filteredOptions.map((opt) => opt.id));
+    const filteredSelected = selected.filter((id) => allowed.has(id));
+
+    const questionChanged =
+      filteredOptions.length !== options.length ||
+      filteredSelected.length !== selected.length;
+    if (!questionChanged) return q;
+
+    changed = true;
+    return {
+      ...q,
+      options: filteredOptions,
+      answer: { ...answer, selectedOptionIds: filteredSelected },
+    };
+  });
+
+  return { changed, questions: next };
+}
+
 function ensureTechStackClarificationsSeeded(specName, status, prompt, designMarkdown) {
   const normalized = { ...DEFAULT_SPEC_STATUS, ...(status || {}) };
   const current = normalizeRequirementsClarifications(
     normalized.techStackClarifications || {},
   );
   if (!normalized.requirementsConfirmed) return { changed: false, status: normalized };
+
+  const existingGeneratedBy =
+    typeof normalized.techStackClarifications?.generatedBy === 'string'
+      ? normalized.techStackClarifications.generatedBy
+      : null;
+  const existingGenerationError =
+    typeof normalized.techStackClarifications?.generationError === 'string'
+      ? normalized.techStackClarifications.generationError
+      : null;
+
+  if (current.questions.length > 0) {
+    const cleaned = stripTechStackKeepOptions(current.questions);
+    if (!cleaned.changed) return { changed: false, status: normalized };
+    const now = new Date().toISOString();
+    const next = {
+      ...normalized,
+      techStackClarifications: {
+        ...current,
+        questions: cleaned.questions,
+        updatedAt: now,
+        confirmedAt: normalized.techStackClarifications?.confirmedAt ?? null,
+        generatedBy: existingGeneratedBy || 'default',
+        generationError: existingGenerationError || null,
+      },
+    };
+    writeSpecStatus(specName, next);
+    return { changed: true, status: next };
+  }
+
   if (normalized.techStackConfirmed) return { changed: false, status: normalized };
-  if (current.questions.length > 0) return { changed: false, status: normalized };
 
   const questions = buildDefaultTechStackQuestions(prompt, designMarkdown);
   if (questions.length === 0) return { changed: false, status: normalized };
+  const cleaned = stripTechStackKeepOptions(questions);
 
   const now = new Date().toISOString();
   const next = {
     ...normalized,
     techStackClarifications: {
       ...current,
-      questions,
+      questions: cleaned.questions,
       updatedAt: now,
       confirmedAt: normalized.techStackClarifications?.confirmedAt ?? null,
       generatedBy: 'default',
@@ -3206,6 +3274,33 @@ app.get('/specs/:name/:artifact', (req, res) => {
     return res.status(400).json({ error: 'Invalid spec request' });
   }
   const filePath = resolveSpecFile(specName, artifact);
+  if (!fs.existsSync(filePath)) {
+    const status = readSpecStatus(specName);
+    if (artifact === 'design' && status?.requirementsConfirmed) {
+      const requirementsPath = resolveSpecFile(specName, 'requirements');
+      const requirementsContent = fs.existsSync(requirementsPath)
+        ? fs.readFileSync(requirementsPath, 'utf8')
+        : '';
+      const content = generateDesignContent(requirementsContent, status.prompt);
+      writeSpecFile(specName, 'design', content);
+    }
+    if (artifact === 'tasks' && status?.designConfirmed) {
+      const designPath = resolveSpecFile(specName, 'design');
+      let designContent = fs.existsSync(designPath)
+        ? fs.readFileSync(designPath, 'utf8')
+        : '';
+      if (!designContent.trim() && status?.requirementsConfirmed) {
+        const requirementsPath = resolveSpecFile(specName, 'requirements');
+        const requirementsContent = fs.existsSync(requirementsPath)
+          ? fs.readFileSync(requirementsPath, 'utf8')
+          : '';
+        designContent = generateDesignContent(requirementsContent, status.prompt);
+        writeSpecFile(specName, 'design', designContent);
+      }
+      const content = generateTasksContent(designContent, status.prompt);
+      writeSpecFile(specName, 'tasks', content);
+    }
+  }
   if (!fs.existsSync(filePath)) {
     return res.status(404).json({ error: 'Spec file not found' });
   }
