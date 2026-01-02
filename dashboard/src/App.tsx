@@ -243,6 +243,123 @@ async function apiJson<T>(path: string, init?: RequestInit, timeoutMsOverride?: 
   return data as T;
 }
 
+async function apiNdjsonStream<T>(
+  path: string,
+  init: RequestInit | undefined,
+  onEvent: (event: any) => void,
+  timeoutMsOverride?: number,
+): Promise<T> {
+  const controller = new AbortController();
+  const timeoutMs = Number(timeoutMsOverride ?? API_TIMEOUT_MS);
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  let res: Response;
+  try {
+    res = await fetch(`${BRIDGE_URL}${path}`, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(init?.headers ?? {}),
+      },
+      signal: controller.signal,
+    });
+  } catch (error: any) {
+    window.clearTimeout(timer);
+    if (error?.name === 'AbortError') {
+      throw new Error(`请求超时（${timeoutMs}ms）`);
+    }
+    throw error;
+  }
+
+  if (!res.ok) {
+    const text = await res.text();
+    let data: any = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = text;
+    }
+    const message = typeof data === 'string' ? data : data?.error || res.statusText;
+    const error: any = new Error(message);
+    error.status = res.status;
+    error.data = data;
+    window.clearTimeout(timer);
+    throw error;
+  }
+
+  const contentType = String(res.headers.get('content-type') || '');
+  if (/application\/json/i.test(contentType)) {
+    try {
+      const data = (await res.json()) as T;
+      onEvent({ type: 'result', data });
+      return data;
+    } catch (error: any) {
+      if (error?.name === 'AbortError') {
+        throw new Error(`请求超时（${timeoutMs}ms）`);
+      }
+      throw error;
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+
+  const reader = res.body?.getReader();
+  if (!reader) {
+    window.clearTimeout(timer);
+    throw new Error('响应不支持流式读取');
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let result: any = null;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      while (true) {
+        const idx = buffer.indexOf('\n');
+        if (idx < 0) break;
+        let line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 1);
+        if (line.endsWith('\r')) line = line.slice(0, -1);
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        let evt: any = null;
+        try {
+          evt = JSON.parse(trimmed);
+        } catch {
+          continue;
+        }
+        onEvent(evt);
+        if (evt?.type === 'error') {
+          const message = String(evt?.error || '发生未知错误');
+          const error: any = new Error(message);
+          error.status = Number(evt?.status || 0) || null;
+          error.data = evt;
+          throw error;
+        }
+        if (evt?.type === 'result') {
+          result = evt?.data;
+          break;
+        }
+      }
+      if (result !== null) break;
+    }
+
+    if (result === null) {
+      throw new Error('流式响应提前结束');
+    }
+    return result as T;
+  } catch (error: any) {
+    if (error?.name === 'AbortError') {
+      throw new Error(`请求超时（${timeoutMs}ms）`);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
 function humanizeError(e: any) {
   const status = Number(e?.status || 0) || null;
   const msg = String(e?.message || e || '').trim();
@@ -280,6 +397,7 @@ function areClarificationsComplete(questions: ClarificationQuestion[]) {
 function errorStageLabel(stage?: string | null) {
   if (!stage) return '未知阶段';
   if (stage === 'requirements') return '需求生成';
+  if (stage === 'requirementsClarifications') return '需求确认问题生成';
   if (stage === 'design') return '设计生成';
   if (stage === 'tasks') return '任务生成';
   if (stage === 'atomize') return '任务原子化';
@@ -356,10 +474,60 @@ export default function App() {
   const [busyLabel, setBusyLabel] = useState<string | null>(null);
   const busyStartedAtRef = useRef<number | null>(null);
   const [busySeconds, setBusySeconds] = useState(0);
+  const [streamPreview, setStreamPreview] = useState<{ stage: string | null; text: string } | null>(null);
+  const streamStageRef = useRef<string | null>(null);
+  const streamTextRef = useRef('');
+  const streamFlushTimerRef = useRef<number | null>(null);
   const [toast, setToast] = useState<{ message: string; tone: 'error' | 'info' } | null>(null);
   const toastTimerRef = useRef<number | null>(null);
   const saveTimerRef = useRef<number | null>(null);
   const clarifSaveTimerRef = useRef<number | null>(null);
+
+  const resetStreamPreview = useCallback(() => {
+    if (streamFlushTimerRef.current) {
+      window.clearTimeout(streamFlushTimerRef.current);
+      streamFlushTimerRef.current = null;
+    }
+    streamStageRef.current = null;
+    streamTextRef.current = '';
+    setStreamPreview(null);
+  }, []);
+
+  const flushStreamPreview = useCallback(() => {
+    if (streamFlushTimerRef.current) return;
+    streamFlushTimerRef.current = window.setTimeout(() => {
+      streamFlushTimerRef.current = null;
+      setStreamPreview({ stage: streamStageRef.current, text: streamTextRef.current });
+    }, 60);
+  }, []);
+
+  const handleNdjsonEvent = useCallback(
+    (evt: any) => {
+      if (!evt || typeof evt !== 'object') return;
+      if (evt.type === 'stage') {
+        const stage = typeof evt.stage === 'string' ? evt.stage : null;
+        if (!stage) return;
+        streamStageRef.current = stage;
+        if (evt.state === 'start') {
+          streamTextRef.current = '';
+        }
+        setStreamPreview({ stage, text: streamTextRef.current });
+        return;
+      }
+      if (evt.type === 'delta') {
+        const stage = typeof evt.stage === 'string' ? evt.stage : streamStageRef.current;
+        const delta = typeof evt.delta === 'string' ? evt.delta : '';
+        if (!delta) return;
+        if (stage && stage !== streamStageRef.current) {
+          streamStageRef.current = stage;
+          streamTextRef.current = '';
+        }
+        streamTextRef.current += delta;
+        flushStreamPreview();
+      }
+    },
+    [flushStreamPreview],
+  );
 
   const showToast = useCallback((message: string, tone: 'error' | 'info' = 'error') => {
     if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
@@ -642,11 +810,17 @@ export default function App() {
   const createSpec = useCallback(async () => {
     setToast(null);
     setBusyLabel('生成中');
+    resetStreamPreview();
     try {
-      const data = await apiJson<{ name: string }>('/specs', {
-        method: 'POST',
-        body: JSON.stringify({ prompt: rawPrompt }),
-      });
+      const data = await apiNdjsonStream<{ name: string }>(
+        '/specs?stream=1',
+        {
+          method: 'POST',
+          body: JSON.stringify({ prompt: rawPrompt }),
+        },
+        handleNdjsonEvent,
+        TASK_TIMEOUT_MS,
+      );
       await refreshSpecs();
       setSelectedSpecName(data.name);
       setActiveArtifact('requirements');
@@ -661,9 +835,10 @@ export default function App() {
         }, 6000);
       }
     } finally {
+      resetStreamPreview();
       setBusyLabel(null);
     }
-  }, [loadArtifact, rawPrompt, refreshSpecs]);
+  }, [handleNdjsonEvent, loadArtifact, rawPrompt, refreshSpecs, resetStreamPreview, showToast]);
 
   const saveArtifact = useCallback(
     async (artifact: SpecArtifact, contentOverride?: string) => {
@@ -731,16 +906,25 @@ export default function App() {
     if (!selectedSpecName) return;
     setToast(null);
     setBusyLabel('生成中');
+    resetStreamPreview();
     try {
       if (!areClarificationsComplete(clarifications)) {
         throw new Error('请先完成所有必填的需求确认');
       }
       await saveClarifications();
       await applyClarificationsToRequirements();
-      await apiJson(`/specs/${encodeURIComponent(selectedSpecName)}/confirm`, {
-        method: 'POST',
-        body: JSON.stringify({ artifact: 'requirements', requirementsClarifications: { questions: clarifications } }),
-      });
+      await apiNdjsonStream(
+        `/specs/${encodeURIComponent(selectedSpecName)}/confirm?stream=1`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            artifact: 'requirements',
+            requirementsClarifications: { questions: clarifications },
+          }),
+        },
+        handleNdjsonEvent,
+        TASK_TIMEOUT_MS,
+      );
       await refreshSpecs();
       await loadArtifact(selectedSpecName, 'design');
       setActiveArtifact('design');
@@ -748,21 +932,26 @@ export default function App() {
       showToast(humanizeError(e));
       await refreshSpecs();
     } finally {
+      resetStreamPreview();
       setBusyLabel(null);
     }
   }, [
     applyClarificationsToRequirements,
     clarifications,
+    handleNdjsonEvent,
     loadArtifact,
     refreshSpecs,
+    resetStreamPreview,
     saveClarifications,
     selectedSpecName,
+    showToast,
   ]);
 
   const generateTasksFromDesign = useCallback(async () => {
     if (!selectedSpecName) return;
     setToast(null);
     setBusyLabel('生成中');
+    resetStreamPreview();
     try {
       const hasExistingTasks = Boolean(selectedSpec?.files?.tasks);
       if (hasExistingTasks) {
@@ -774,14 +963,19 @@ export default function App() {
       }
       await saveTechStackClarifications();
       await applyTechStackToDesign();
-      await apiJson(`/specs/${encodeURIComponent(selectedSpecName)}/confirm`, {
-        method: 'POST',
-        body: JSON.stringify({
-          artifact: 'design',
-          force: true,
-          techStackClarifications: { questions: techStackClarifications },
-        }),
-      }, TASK_TIMEOUT_MS);
+      await apiNdjsonStream(
+        `/specs/${encodeURIComponent(selectedSpecName)}/confirm?stream=1`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            artifact: 'design',
+            force: true,
+            techStackClarifications: { questions: techStackClarifications },
+          }),
+        },
+        handleNdjsonEvent,
+        TASK_TIMEOUT_MS,
+      );
       await refreshSpecs();
       await loadArtifact(selectedSpecName, 'tasks');
       setActiveArtifact('tasks');
@@ -796,16 +990,20 @@ export default function App() {
         }, 6000);
       }
     } finally {
+      resetStreamPreview();
       setBusyLabel(null);
     }
   }, [
     applyTechStackToDesign,
+    handleNdjsonEvent,
     loadArtifact,
     refreshSpecs,
+    resetStreamPreview,
     saveTechStackClarifications,
     selectedSpec,
     selectedSpecName,
     techStackClarifications,
+    showToast,
   ]);
 
   const startAtomizeTasks = useCallback(async () => {
@@ -897,6 +1095,8 @@ export default function App() {
           '',
           '本压缩包包含 4 份核心文档（requirements/design/tasks/tasks_atomic），用于在 AI IDE 中执行类似 Kiro 的“规范驱动开发（Spec-Driven Development）”。',
           '',
+          '提示：AI IDE 优先打开 tasks_atomic.md（原子化任务表单）按清单逐条开发；如需调整范围/补充任务，先改 tasks.md 再重新原子化。',
+          '',
           '1) requirements.md（需求）',
           '- 用途：产品/业务需求的唯一事实来源（Source of Truth）。',
           '- 建议：补全背景、用户故事、验收标准，并在“需求确认”中记录关键选择与补充信息。',
@@ -906,7 +1106,7 @@ export default function App() {
           '- 建议：让 AI IDE 在编码前先阅读 design.md，确保实现方向一致。',
           '',
           '3) tasks.md（任务）',
-          '- 用途：任务总览、范围约束与回写入口（与 tasks_atomic.md 保持同步）。',
+          '- 用途：任务总览、范围约束与回写入口（开发执行优先以 tasks_atomic.md 为准）。',
           '- 工作方式：',
           '  a) 保持 tasks.md 覆盖所有待办与范围边界；',
           '  b) AI IDE 实施时优先按 tasks_atomic.md 执行，并将完成情况/关键变更回写到 tasks.md；',
@@ -1328,7 +1528,9 @@ export default function App() {
                 <li>
                   切到“任务”，点“开始原子化”。可设置“分段 N 条/次”，默认开启“自动续段”，失败时可点“重试本段”。
                 </li>
-                <li>需要交付给 AI IDE 时，点“一键下载（ZIP）”。</li>
+                <li>
+                  需要交付给 AI IDE 时，点“一键下载（ZIP）”，并优先按 tasks_atomic.md（原子化任务表单）逐条开发。
+                </li>
               </ol>
 
               <div className="text-xs text-slate-400">
@@ -2026,6 +2228,20 @@ export default function App() {
                 </div>
               )}
             </div>
+            {streamPreview && (
+              <div className="mt-3">
+                <div className="mb-1 text-xs text-slate-400">
+                  实时输出{streamPreview.stage ? ` · ${errorStageLabel(streamPreview.stage)}` : ''}
+                </div>
+                <div className="h-44 overflow-auto rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-100">
+                  {streamPreview.text ? (
+                    <pre className="whitespace-pre-wrap">{streamPreview.text}</pre>
+                  ) : (
+                    <div className="text-slate-400">等待模型输出...</div>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}
