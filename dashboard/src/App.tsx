@@ -474,8 +474,9 @@ export default function App() {
   const [busyLabel, setBusyLabel] = useState<string | null>(null);
   const busyStartedAtRef = useRef<number | null>(null);
   const [busySeconds, setBusySeconds] = useState(0);
-  const [streamPreview, setStreamPreview] = useState<{ stage: string | null; text: string } | null>(null);
+  const [streamStage, setStreamStage] = useState<string | null>(null);
   const streamStageRef = useRef<string | null>(null);
+  const streamArtifactRef = useRef<SpecArtifact | null>(null);
   const streamTextRef = useRef('');
   const streamFlushTimerRef = useRef<number | null>(null);
   const [toast, setToast] = useState<{ message: string; tone: 'error' | 'info' } | null>(null);
@@ -489,15 +490,25 @@ export default function App() {
       streamFlushTimerRef.current = null;
     }
     streamStageRef.current = null;
+    streamArtifactRef.current = null;
     streamTextRef.current = '';
-    setStreamPreview(null);
+    setStreamStage(null);
   }, []);
 
-  const flushStreamPreview = useCallback(() => {
+  const stageToArtifact = useCallback((stage: string | null): SpecArtifact | null => {
+    if (stage === 'requirements') return 'requirements';
+    if (stage === 'design') return 'design';
+    if (stage === 'tasks') return 'tasks';
+    return null;
+  }, []);
+
+  const flushStreamToArtifact = useCallback(() => {
     if (streamFlushTimerRef.current) return;
     streamFlushTimerRef.current = window.setTimeout(() => {
       streamFlushTimerRef.current = null;
-      setStreamPreview({ stage: streamStageRef.current, text: streamTextRef.current });
+      const artifact = streamArtifactRef.current;
+      if (!artifact) return;
+      setArtifactContent((prev) => ({ ...prev, [artifact]: streamTextRef.current }));
     }, 60);
   }, []);
 
@@ -508,25 +519,40 @@ export default function App() {
         const stage = typeof evt.stage === 'string' ? evt.stage : null;
         if (!stage) return;
         streamStageRef.current = stage;
+        setStreamStage(stage);
+        const artifact = stageToArtifact(stage);
+        if (artifact) {
+          streamArtifactRef.current = artifact;
+          setActiveArtifact(artifact);
+          if (artifact === 'tasks') setTaskView('tasks');
+        }
         if (evt.state === 'start') {
           streamTextRef.current = '';
+          if (artifact) {
+            setArtifactContent((prev) => ({ ...prev, [artifact]: '' }));
+          }
         }
-        setStreamPreview({ stage, text: streamTextRef.current });
         return;
       }
       if (evt.type === 'delta') {
         const stage = typeof evt.stage === 'string' ? evt.stage : streamStageRef.current;
         const delta = typeof evt.delta === 'string' ? evt.delta : '';
         if (!delta) return;
-        if (stage && stage !== streamStageRef.current) {
+        const artifact = stageToArtifact(stage);
+        if (!artifact) return;
+        if (artifact !== streamArtifactRef.current) {
+          streamArtifactRef.current = artifact;
           streamStageRef.current = stage;
+          setStreamStage(stage);
           streamTextRef.current = '';
+          setActiveArtifact(artifact);
+          if (artifact === 'tasks') setTaskView('tasks');
         }
         streamTextRef.current += delta;
-        flushStreamPreview();
+        flushStreamToArtifact();
       }
     },
-    [flushStreamPreview],
+    [flushStreamToArtifact, stageToArtifact],
   );
 
   const showToast = useCallback((message: string, tone: 'error' | 'info' = 'error') => {
@@ -539,8 +565,14 @@ export default function App() {
     () => specs.find((s) => s.name === selectedSpecName) ?? null,
     [specs, selectedSpecName],
   );
-  const canOpenDesign = Boolean(selectedSpecName && (selectedSpec?.files?.design || selectedSpec?.status?.requirementsConfirmed));
-  const canOpenTasks = Boolean(selectedSpecName && (selectedSpec?.files?.tasks || selectedSpec?.status?.designConfirmed));
+  const canOpenDesign = Boolean(
+    selectedSpecName && (selectedSpec?.files?.design || selectedSpec?.status?.requirementsConfirmed),
+  );
+  const canOpenTasks = Boolean(
+    selectedSpecName && (selectedSpec?.files?.tasks || selectedSpec?.status?.designConfirmed),
+  );
+  const canOpenDesignEffective = canOpenDesign || streamStage === 'design';
+  const canOpenTasksEffective = canOpenTasks || streamStage === 'tasks';
   const lastError = selectedSpec?.status?.lastError ?? null;
 
   const refreshSpecs = useCallback(async () => {
@@ -768,16 +800,23 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedSpecName) return;
-    if (activeArtifact === 'tasks' && !canOpenTasks) {
-      setActiveArtifact(canOpenDesign ? 'design' : 'requirements');
+    if (activeArtifact === 'tasks' && !canOpenTasksEffective) {
+      setActiveArtifact(canOpenDesignEffective ? 'design' : 'requirements');
       return;
     }
-    if (activeArtifact === 'design' && !canOpenDesign) {
+    if (activeArtifact === 'design' && !canOpenDesignEffective) {
       setActiveArtifact('requirements');
       return;
     }
     void loadArtifact(selectedSpecName, activeArtifact).catch((e) => showToast(humanizeError(e)));
-  }, [activeArtifact, canOpenDesign, canOpenTasks, loadArtifact, selectedSpecName]);
+  }, [
+    activeArtifact,
+    canOpenDesignEffective,
+    canOpenTasksEffective,
+    loadArtifact,
+    selectedSpecName,
+    showToast,
+  ]);
 
   useEffect(() => {
     if (!selectedSpecName) return;
@@ -1006,10 +1045,15 @@ export default function App() {
     showToast,
   ]);
 
-  const startAtomizeTasks = useCallback(async () => {
+  const startAtomizeTasks = useCallback(async (options?: { switchToAtomicView?: boolean }) => {
     if (!selectedSpecName) return;
     setToast(null);
     try {
+      const switchToAtomicView = options?.switchToAtomicView !== false;
+      if (switchToAtomicView) {
+        setActiveArtifact('tasks');
+        setTaskView('atomic');
+      }
       const batchSize = Math.min(
         20,
         Math.max(1, Number.parseInt(atomizeBatchSizeText || '3', 10) || 3),
@@ -1043,9 +1087,19 @@ export default function App() {
     if (!prev.running || currentRunning) return;
     if (currentError) return;
     if (currentTotal > 0 && currentCompleted < currentTotal) {
-      void startAtomizeTasks();
+      void startAtomizeTasks({ switchToAtomicView: false });
     }
   }, [atomizeAutoContinue, atomizeStatus, selectedSpecName, startAtomizeTasks]);
+
+  useEffect(() => {
+    if (!selectedSpecName) return;
+    if (!atomizeStatus?.running) return;
+    if (activeArtifact !== 'tasks' || taskView !== 'atomic') return;
+    const timer = window.setInterval(() => {
+      void loadTasksAtomic(selectedSpecName).catch(() => null);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [activeArtifact, atomizeStatus?.running, loadTasksAtomic, selectedSpecName, taskView]);
 
   const downloadCurrentMd = useCallback(() => {
     if (!selectedSpecName) return;
@@ -1731,8 +1785,8 @@ export default function App() {
                     onClick={() => setActiveArtifact(a)}
                     disabled={
                       !selectedSpecName ||
-                      (a === 'design' && !canOpenDesign) ||
-                      (a === 'tasks' && !canOpenTasks)
+                      (a === 'design' && !canOpenDesignEffective) ||
+                      (a === 'tasks' && !canOpenTasksEffective)
                     }
                   >
                     {artifactLabel(a)}
@@ -2206,42 +2260,31 @@ export default function App() {
                 })
               }
               disabled={!selectedSpecName}
-              readOnly={isAtomicView}
+              readOnly={isAtomicView || Boolean(streamStage)}
             />
           </div>
         </section>
       </main>
 
       {busyLabel && (
-        <div className="fixed inset-0 flex items-center justify-center bg-black/40">
-          <div className="w-[520px] max-w-[90vw] rounded-lg border border-slate-700 bg-slate-950 px-5 py-4 text-slate-100 shadow-xl">
+        <div className="fixed inset-0 z-50 flex items-center justify-center pointer-events-none">
+          <div className="w-[520px] max-w-[92vw] rounded-lg border border-slate-700 bg-slate-950 px-5 py-4 text-slate-100 shadow-xl">
             <div className="flex items-center gap-3">
               <div className="h-5 w-5 animate-spin rounded-full border-2 border-slate-500 border-t-slate-100" />
-              <div className="text-sm font-semibold">{busyLabel}</div>
+              <div className="text-sm font-semibold">
+                {busyLabel}
+                {streamStage ? ` · ${errorStageLabel(streamStage)}` : ''}
+              </div>
               <div className="ml-auto text-xs text-slate-400">{busySeconds}s</div>
             </div>
-            <div className="mt-3 text-xs leading-5 text-slate-300">
-              <div>生成过程可能需要几十秒，请保持页面打开。</div>
+            <div className="mt-2 text-xs leading-5 text-slate-300">
+              <div>生成中…内容会在对应窗口实时出现。</div>
               {busySeconds >= 20 && (
                 <div className="mt-1 text-slate-400">
-                  若长时间无响应：检查模型是否可用、Base URL/Key 是否正确、以及反代是否能访问到 bridge。
+                  若长时间无响应：检查模型可用性与 Base URL/Key 配置，或确认反代可访问 bridge。
                 </div>
               )}
             </div>
-            {streamPreview && (
-              <div className="mt-3">
-                <div className="mb-1 text-xs text-slate-400">
-                  实时输出{streamPreview.stage ? ` · ${errorStageLabel(streamPreview.stage)}` : ''}
-                </div>
-                <div className="h-44 overflow-auto rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-100">
-                  {streamPreview.text ? (
-                    <pre className="whitespace-pre-wrap">{streamPreview.text}</pre>
-                  ) : (
-                    <div className="text-slate-400">等待模型输出...</div>
-                  )}
-                </div>
-              </div>
-            )}
           </div>
         </div>
       )}
