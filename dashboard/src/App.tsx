@@ -34,6 +34,54 @@ type AtomizeStatus = {
   updatedAt?: string | null;
 };
 
+type ReportScoreResult = {
+  score: number;
+  summary: string;
+  strengths: string[];
+  weaknesses: string[];
+  suggestions: string[];
+};
+
+type ReportModelRating = {
+  ok?: boolean;
+  skipped?: boolean;
+  updatedAt?: string | null;
+  attemptId?: string | null;
+  result?: ReportScoreResult | null;
+  error?: { message?: string } | null;
+};
+
+type ReportRatings = {
+  updatedAt: string | null;
+  byModel: Record<string, ReportModelRating>;
+};
+
+type ReportUserRating = {
+  score: number;
+  comment?: string;
+  createdAt: string;
+};
+
+type ReportScoreJobStatus = {
+  running: boolean;
+  total: number;
+  completed: number;
+  logs: AtomizeLogEntry[];
+  error?: string | null;
+  startedAt?: string | null;
+  updatedAt?: string | null;
+};
+
+type SpecReportSummary = {
+  runId: string;
+  createdAt: string | null;
+  updatedAt: string | null;
+  reportPath: string | null;
+  ratings: ReportRatings;
+  userRatings: ReportUserRating[];
+  scoreJob: ReportScoreJobStatus | null;
+};
+
 const PROMPT_STAGE_ORDER = [
   { key: 'requirements', label: '需求生成' },
   { key: 'requirementsClarifications', label: '需求确认问题生成' },
@@ -432,10 +480,17 @@ export default function App() {
   const [atomizeStatus, setAtomizeStatus] = useState<AtomizeStatus | null>(null);
   const [atomizeBatchSizeText, setAtomizeBatchSizeText] = useState('3');
   const [atomizeAutoContinue, setAtomizeAutoContinue] = useState(true);
+  const [reports, setReports] = useState<SpecReportSummary[]>([]);
+  const [activeReportRunId, setActiveReportRunId] = useState('');
+  const [reportMarkdown, setReportMarkdown] = useState('');
+  const [reportScoreStatus, setReportScoreStatus] = useState<ReportScoreJobStatus | null>(null);
+  const [userReportScoreText, setUserReportScoreText] = useState('');
+  const [userReportCommentText, setUserReportCommentText] = useState('');
   const atomizePrevRef = useRef<{
     specName: string | null;
     running: boolean;
   } | null>(null);
+  const reportScoreRunningPrevRef = useRef(false);
   const baselineContentRef = useRef<Record<SpecArtifact, string>>({
     requirements: '',
     design: '',
@@ -574,11 +629,97 @@ export default function App() {
   const canOpenDesignEffective = canOpenDesign || streamStage === 'design';
   const canOpenTasksEffective = canOpenTasks || streamStage === 'tasks';
   const lastError = selectedSpec?.status?.lastError ?? null;
+  const activeReport = useMemo(() => {
+    if (activeReportRunId) {
+      return reports.find((r) => r.runId === activeReportRunId) ?? null;
+    }
+    return reports.length ? reports[0] : null;
+  }, [activeReportRunId, reports]);
 
   const refreshSpecs = useCallback(async () => {
     const data = await apiJson<{ specs: SpecSummary[] }>('/specs');
     setSpecs(data.specs ?? []);
   }, []);
+
+  const refreshReports = useCallback(async (specName: string) => {
+    const data = await apiJson<{ reports: SpecReportSummary[] }>(
+      `/specs/${encodeURIComponent(specName)}/reports`,
+    );
+    const nextReports = data.reports ?? [];
+    setReports(nextReports);
+    setActiveReportRunId((prev) => {
+      if (prev && nextReports.some((r) => r.runId === prev)) return prev;
+      return nextReports[0]?.runId ?? '';
+    });
+    return nextReports;
+  }, []);
+
+  const fetchReportScoreStatus = useCallback(async (specName: string, runId: string) => {
+    const data = await apiJson<ReportScoreJobStatus>(
+      `/specs/${encodeURIComponent(specName)}/reports/${encodeURIComponent(runId)}/score`,
+    );
+    setReportScoreStatus(data);
+    return data;
+  }, []);
+
+  const loadReportMarkdown = useCallback(async (specName: string, runId: string) => {
+    const data = await apiJson<{ reportPath: string | null; content: string }>(
+      `/specs/${encodeURIComponent(specName)}/reports/${encodeURIComponent(runId)}/markdown`,
+    );
+    setReportMarkdown(data.content ?? '');
+    return data;
+  }, []);
+
+  const startReportScoreJob = useCallback(async (specName: string, runId: string, force = false) => {
+    const data = await apiJson<ReportScoreJobStatus>(
+      `/specs/${encodeURIComponent(specName)}/reports/${encodeURIComponent(runId)}/score`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ force }),
+      },
+      TASK_TIMEOUT_MS,
+    );
+    setReportScoreStatus(data);
+    return data;
+  }, []);
+
+  const submitUserReportRating = useCallback(async () => {
+    if (!selectedSpecName || !activeReportRunId) return;
+    const score = Number.parseInt(userReportScoreText, 10);
+    if (!Number.isFinite(score) || Number.isNaN(score) || score < 0 || score > 100) {
+      showToast('评分需为 0-100 的整数');
+      return;
+    }
+    try {
+      await apiJson<{ ok: boolean; userRatings: ReportUserRating[] }>(
+        `/specs/${encodeURIComponent(selectedSpecName)}/reports/${encodeURIComponent(activeReportRunId)}/user-score`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ score, comment: userReportCommentText }),
+        },
+      );
+      showToast('已提交用户评分', 'info');
+      setUserReportScoreText('');
+      setUserReportCommentText('');
+      void refreshReports(selectedSpecName).catch((e) => showToast(humanizeError(e)));
+      if (reportMarkdown.trim()) {
+        void loadReportMarkdown(selectedSpecName, activeReportRunId).catch((e) =>
+          showToast(humanizeError(e)),
+        );
+      }
+    } catch (error: any) {
+      showToast(humanizeError(error));
+    }
+  }, [
+    activeReportRunId,
+    loadReportMarkdown,
+    refreshReports,
+    reportMarkdown,
+    selectedSpecName,
+    showToast,
+    userReportCommentText,
+    userReportScoreText,
+  ]);
 
   const refreshLlm = useCallback(async () => {
     const data = await apiJson<LlmInfo>('/llm');
@@ -814,6 +955,82 @@ export default function App() {
     canOpenDesignEffective,
     canOpenTasksEffective,
     loadArtifact,
+    selectedSpecName,
+    showToast,
+  ]);
+
+  useEffect(() => {
+    if (!selectedSpecName) {
+      setReports([]);
+      setActiveReportRunId('');
+      setReportMarkdown('');
+      setReportScoreStatus(null);
+      return;
+    }
+    void refreshReports(selectedSpecName).catch((e) => showToast(humanizeError(e)));
+  }, [refreshReports, selectedSpecName, showToast]);
+
+  useEffect(() => {
+    if (!selectedSpecName || !activeReportRunId) {
+      setReportScoreStatus(null);
+      return;
+    }
+    void fetchReportScoreStatus(selectedSpecName, activeReportRunId).catch((e) =>
+      showToast(humanizeError(e)),
+    );
+  }, [activeReportRunId, fetchReportScoreStatus, selectedSpecName, showToast]);
+
+  useEffect(() => {
+    if (!selectedSpecName || !activeReportRunId) return;
+    if (!reportScoreStatus?.running) return;
+    const timer = window.setInterval(() => {
+      void fetchReportScoreStatus(selectedSpecName, activeReportRunId).catch((e) =>
+        showToast(humanizeError(e)),
+      );
+      void refreshReports(selectedSpecName).catch(() => null);
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [
+    activeReportRunId,
+    fetchReportScoreStatus,
+    refreshReports,
+    reportScoreStatus?.running,
+    selectedSpecName,
+    showToast,
+  ]);
+
+  useEffect(() => {
+    const prevRunning = reportScoreRunningPrevRef.current;
+    const nowRunning = Boolean(reportScoreStatus?.running);
+    reportScoreRunningPrevRef.current = nowRunning;
+    if (!prevRunning || nowRunning) return;
+    if (!selectedSpecName) return;
+    void refreshReports(selectedSpecName).catch((e) => showToast(humanizeError(e)));
+    if (activeReportRunId && reportMarkdown.trim()) {
+      void loadReportMarkdown(selectedSpecName, activeReportRunId).catch((e) =>
+        showToast(humanizeError(e)),
+      );
+    }
+  }, [
+    activeReportRunId,
+    loadReportMarkdown,
+    refreshReports,
+    reportMarkdown,
+    reportScoreStatus?.running,
+    selectedSpecName,
+    showToast,
+  ]);
+
+  useEffect(() => {
+    if (!selectedSpecName) return;
+    if (atomizeStatus?.running) return;
+    if (!atomizeStatus?.total || atomizeStatus.completed < atomizeStatus.total) return;
+    void refreshReports(selectedSpecName).catch((e) => showToast(humanizeError(e)));
+  }, [
+    atomizeStatus?.completed,
+    atomizeStatus?.running,
+    atomizeStatus?.total,
+    refreshReports,
     selectedSpecName,
     showToast,
   ]);
@@ -1401,6 +1618,27 @@ export default function App() {
             <Button onClick={createSpec} disabled={!rawPrompt.trim() || Boolean(busyLabel)}>
               生成需求
             </Button>
+            <label className="flex flex-wrap items-center gap-2 text-sm text-slate-300">
+              <span>Spec：</span>
+              <select
+                className="h-9 rounded-md border border-slate-700 bg-slate-950 px-2 text-sm text-slate-100"
+                value={selectedSpecName ?? ''}
+                onChange={(e) => {
+                  const name = e.target.value;
+                  setSelectedSpecName(name || null);
+                  setActiveArtifact('requirements');
+                  setTaskView('tasks');
+                }}
+                disabled={Boolean(busyLabel) || !specs.length}
+              >
+                <option value="">（未选择）</option>
+                {specs.map((spec) => (
+                  <option key={spec.name} value={spec.name}>
+                    {spec.name}
+                  </option>
+                ))}
+              </select>
+            </label>
             <div className="ml-auto flex flex-wrap items-center gap-2 text-sm text-slate-300">
               <span>模型：</span>
               <select
@@ -1589,7 +1827,7 @@ export default function App() {
               </ol>
 
               <div className="text-xs text-slate-400">
-                默认地址：Bridge {BRIDGE_URL} · Dashboard 一般为 http://localhost:5173/
+                默认地址：Bridge {BRIDGE_URL} · Dashboard 一般为 http://localhost:5174/
               </div>
             </div>
           </details>
@@ -2185,6 +2423,237 @@ export default function App() {
                     失败：{atomizeStatus.error}
                   </div>
                 )}
+              </div>
+            )}
+
+            {activeArtifact === 'tasks' && selectedSpecName && (
+              <div className="mb-3 rounded-md border border-slate-800 bg-slate-950/40 p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="text-sm font-semibold text-slate-200">流程报告</div>
+                  <div className="text-xs text-slate-400">
+                    {reports.length ? `共 ${reports.length} 份` : '暂无'}
+                  </div>
+                  <div className="ml-auto flex flex-wrap items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() =>
+                        void refreshReports(selectedSpecName).catch((e) =>
+                          showToast(humanizeError(e)),
+                        )
+                      }
+                      disabled={Boolean(busyLabel)}
+                    >
+                      刷新
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() =>
+                        activeReportRunId
+                          ? void loadReportMarkdown(selectedSpecName, activeReportRunId).catch((e) =>
+                              showToast(humanizeError(e)),
+                            )
+                          : undefined
+                      }
+                      disabled={!activeReportRunId}
+                    >
+                      打开
+                    </Button>
+                    <Button
+                      size="sm"
+                      onClick={() =>
+                        activeReportRunId
+                          ? void startReportScoreJob(selectedSpecName, activeReportRunId).then(() => {
+                              showToast('已启动评分任务', 'info');
+                            }).catch((e) => showToast(humanizeError(e)))
+                          : undefined
+                      }
+                      disabled={!activeReportRunId || reportScoreStatus?.running}
+                    >
+                      {reportScoreStatus?.running ? '评分中' : '对全部模型评分'}
+                    </Button>
+                  </div>
+                </div>
+
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-300">
+                  <label className="flex items-center gap-2">
+                    <span className="text-slate-400">runId</span>
+                    <select
+                      className="h-8 rounded-md border border-slate-700 bg-slate-950 px-2 text-xs text-slate-100"
+                      value={activeReportRunId}
+                      onChange={(e) => {
+                        setActiveReportRunId(e.target.value);
+                        setReportMarkdown('');
+                      }}
+                    >
+                      <option value="">（选择）</option>
+                      {reports.map((r) => (
+                        <option key={r.runId} value={r.runId}>
+                          {r.runId}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {activeReport?.reportPath && (
+                    <div className="text-slate-400 break-all">
+                      已保存：{activeReport.reportPath}
+                    </div>
+                  )}
+                </div>
+
+                <div className="mt-3 overflow-auto rounded-md border border-slate-800">
+                  <table className="w-full text-xs text-slate-200">
+                    <thead className="bg-slate-900/50 text-slate-400">
+                      <tr>
+                        <th className="px-2 py-1 text-left">模型</th>
+                        <th className="px-2 py-1 text-right">分数</th>
+                        <th className="px-2 py-1 text-left">总评</th>
+                        <th className="px-2 py-1 text-left">状态</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(llm?.options ?? []).map((opt) => {
+                        const item = activeReport?.ratings?.byModel?.[opt.id] ?? null;
+                        const score = item?.result?.score ?? null;
+                        const summary = String(item?.result?.summary ?? '');
+                        const statusText = item?.ok
+                          ? 'ok'
+                          : item?.skipped
+                            ? 'skipped'
+                            : item?.error
+                              ? 'error'
+                              : '未评分';
+                        const scoreText =
+                          typeof score === 'number' && Number.isFinite(score) ? String(score) : '-';
+                        return (
+                          <tr key={opt.id} className="border-t border-slate-800">
+                            <td className="px-2 py-1">{opt.label}</td>
+                            <td className="px-2 py-1 text-right">{scoreText}</td>
+                            <td className="px-2 py-1 text-slate-300">
+                              {summary ? summary.slice(0, 80) : '-'}
+                            </td>
+                            <td className="px-2 py-1 text-slate-400">{statusText}</td>
+                          </tr>
+                        );
+                      })}
+                      {!llm?.options?.length && (
+                        <tr>
+                          <td className="px-2 py-2 text-slate-400" colSpan={4}>
+                            模型列表未加载
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+
+                {reportScoreStatus &&
+                  (reportScoreStatus.running ||
+                    reportScoreStatus.logs?.length ||
+                    reportScoreStatus.error) && (
+                    <div className="mt-3 rounded-md border border-slate-800 bg-slate-950/40 p-2">
+                      <div className="flex items-center gap-2">
+                        <div className="text-xs font-semibold text-slate-200">评分日志</div>
+                        <div className="ml-auto text-xs text-slate-400">
+                          {reportScoreStatus.total
+                            ? `完成 ${reportScoreStatus.completed}/${reportScoreStatus.total}`
+                            : '完成 0/0'}
+                        </div>
+                      </div>
+                      <div className="mt-2 h-24 overflow-auto rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-300">
+                        {reportScoreStatus.logs?.length ? (
+                          reportScoreStatus.logs.map((entry, idx) => (
+                            <div key={`${entry.at}-${idx}`}>{entry.message}</div>
+                          ))
+                        ) : (
+                          <div className="text-slate-400">暂无日志</div>
+                        )}
+                      </div>
+                      {reportScoreStatus.error && (
+                        <div className="mt-2 text-xs text-red-300">
+                          失败：{reportScoreStatus.error}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                <div className="mt-3 flex flex-wrap items-end gap-2">
+                  <label className="flex items-center gap-2 text-xs text-slate-300">
+                    <span className="text-slate-400">用户评分</span>
+                    <input
+                      className="h-8 w-20 rounded-md border border-slate-700 bg-slate-950 px-2 text-xs text-slate-100"
+                      value={userReportScoreText}
+                      onChange={(e) =>
+                        setUserReportScoreText(
+                          e.target.value.replace(/[^\d]/g, '').slice(0, 3),
+                        )
+                      }
+                      placeholder="0-100"
+                      inputMode="numeric"
+                    />
+                  </label>
+                  <input
+                    className="h-8 min-w-[220px] flex-1 rounded-md border border-slate-700 bg-slate-950 px-2 text-xs text-slate-100"
+                    value={userReportCommentText}
+                    onChange={(e) => setUserReportCommentText(e.target.value)}
+                    placeholder="可选：备注"
+                  />
+                  <Button
+                    size="sm"
+                    onClick={() => void submitUserReportRating()}
+                    disabled={!activeReportRunId || !userReportScoreText.trim()}
+                  >
+                    提交
+                  </Button>
+                </div>
+
+                {activeReport?.userRatings?.length ? (
+                  <div className="mt-2 text-xs text-slate-300">
+                    <div className="text-slate-400">历史用户评分（最近 5 条）：</div>
+                    <div className="mt-1 space-y-1">
+                      {activeReport.userRatings.slice(-5).map((r, idx) => (
+                        <div key={`${r.createdAt}-${idx}`}>
+                          {new Date(r.createdAt).toLocaleString()}：{r.score}/100
+                          {r.comment ? `｜${r.comment}` : ''}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-2 text-xs text-slate-400">历史用户评分：暂无</div>
+                )}
+
+                <details className="mt-3 rounded-md border border-slate-800 bg-slate-950/30 p-2">
+                  <summary className="cursor-pointer select-none text-xs font-semibold text-slate-200">
+                    报告内容（Markdown）
+                  </summary>
+                  <div className="mt-2 space-y-2">
+                    <textarea
+                      className="h-64 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100"
+                      value={reportMarkdown}
+                      readOnly
+                      placeholder="点击“打开”加载报告…"
+                    />
+                    <div className="flex justify-end">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          if (!selectedSpecName || !activeReportRunId) return;
+                          const safe = makeDownloadBaseName(selectedSpecName);
+                          downloadMarkdown(
+                            `${safe}_flow_${activeReportRunId}.md`,
+                            reportMarkdown,
+                          );
+                        }}
+                        disabled={!reportMarkdown.trim() || !activeReportRunId}
+                      >
+                        下载报告 MD
+                      </Button>
+                    </div>
+                  </div>
+                </details>
               </div>
             )}
 
