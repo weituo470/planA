@@ -156,36 +156,41 @@ const DEFAULT_PROMPT_CONFIG = {
         `需求内容如下：\n{{requirements}}\n\n补充描述：{{prompt}}\n\n` +
         '请只输出 JSON，字段：overview（字符串）, flows（字符串数组）, considerations（字符串数组）。不要输出除 JSON 以外的任何内容。',
     },
-    tasks: {
-      label: '任务生成',
-      variables: ['design', 'prompt', 'minTasks', 'maxTasks'],
-      system:
-        '你是项目任务拆解助手。请输出清晰但不必原子化的任务列表。只输出 JSON，不要解释。',
-      user:
-        `设计内容如下：\n{{design}}\n\n补充描述：{{prompt}}\n\n` +
-        '请输出 {{minTasks}}-{{maxTasks}} 条任务（不要求原子化）。' +
-        '每条任务必须包含 title/core/details/ac 四个字段，简体中文。\n' +
-        'title 写清任务名称与产出，允许是模块/流程级别，不要求文件路径。\n' +
-        '请严格输出 JSON：{"tasks":[{title,core,details,ac}]}。',
-    },
-    atomize: {
-      label: '任务原子化',
-      variables: ['context', 'main', 'reasonBlock'],
-      system:
-        'Role: 硬核工程架构师 (Hardcore Engineering Lead)。你擅长把任务拆解为“原子级执行指令”。只输出 JSON。',
-      user:
-        `{{context}}{{main}}\n\n{{reasonBlock}}` +
-        '要求：\n' +
-        '1) 输出为原子级任务，不要摘要，拆到无法再拆。\n' +
-        '2) 任务对象字段：title/core/details/ac。\n' +
-        '3) title 必须以“创建/修改/删除 <文件路径>”开头（路径不确定用 TBD）。\n' +
-        '4) core/details/ac 必须具体可执行，包含函数名/变量名/组件 Prop/CSS 类名；每条任务应在 15 分钟内可完成。\n' +
-        '5) 遵循定义先行：先 types/interfaces/schema，再业务逻辑。\n' +
-        '6) 禁止自由发挥，保持与上下文一致；若涉及样式，写清具体类名或布局方案。\n' +
-        '7) 任务顺序建议：Types/Interfaces -> Schema -> Utils/Storage -> UI 静态组件 -> 状态管理 -> 交互逻辑 -> 边界自愈。\n' +
-        '8) 简体中文。\n' +
-        '只输出 JSON：{"tasks":[...]}。',
-    },
+	    tasks: {
+	      label: '任务生成',
+	      variables: ['design', 'prompt', 'minTasks', 'maxTasks'],
+	      system:
+	        '你是项目任务拆解助手。你的输出将作为后续“任务原子化”的输入，并会交付给 AI IDE 执行。只输出 JSON，不要解释。',
+	      user:
+	        `设计内容如下：\n{{design}}\n\n补充描述：{{prompt}}\n\n` +
+	        '请输出 {{minTasks}}-{{maxTasks}} 条任务（不要求原子化）。' +
+	        '每条任务必须包含 title/core/details/ac 四个字段，简体中文。\n' +
+	        'title 写清任务名称与产出（模块/流程级别即可）。\n' +
+	        'core 写清关键目标与范围边界（做什么/不做什么）。\n' +
+	        'details 写清关键技术点/接口/数据结构/页面与路由，不要空泛。\n' +
+	        'ac 必须可验证：写清验证步骤（命令/接口/页面路径/可观察结果）。\n' +
+	        '请严格输出 JSON：{"tasks":[{title,core,details,ac}]}。',
+	    },
+	    atomize: {
+	      label: '任务原子化',
+	      variables: ['context', 'main', 'reasonBlock'],
+	      system:
+	        'Role: 硬核工程架构师 (Hardcore Engineering Lead)。你擅长把任务拆解为“原子级执行指令”。只输出 JSON。',
+	      user:
+	        `{{context}}{{main}}\n\n{{reasonBlock}}` +
+	        '要求：\n' +
+	        '1) 输出为原子级任务，不要摘要，拆到无法再拆；单条任务建议 5-10 分钟内可完成。\n' +
+	        '2) 任务对象字段：title/core/details/ac。\n' +
+	        '3) title 必须以“创建/修改/删除 <相对文件路径>”开头（必须包含扩展名，如 .ts/.tsx/.js/.md/.css）。\n' +
+	        '   - 严禁使用 TBD/待定/占位符；必须给出最终文件路径。\n' +
+	        '   - 若上下文未给出目录结构，请按通用工程约定规划：前端 src/...；后端 src/...；配置在根目录或 config/。\n' +
+	        '4) core/details 必须具体可执行，包含关键导出名/函数名/接口字段/API 路由/组件 Props/CSS 类名；不要写“实现XX”。\n' +
+	        '5) 遵循定义先行：先 types/interfaces/schema/DTO，再业务逻辑，再 UI/交互。\n' +
+	        '6) ac 必须“机器可验证”：写清可检查的客观结果（文件存在、包含某段 export、运行某条命令无报错、接口返回字段等）。\n' +
+	        '7) 禁止自由发挥，保持与上下文一致；若信息不足，先补一条“创建 docs/assumptions.md 记录假设/待确认点”，再继续拆分。\n' +
+	        '8) 简体中文。\n' +
+	        '只输出 JSON：{"tasks":[...]}。',
+	    },
     reportScore: {
       label: '流程报告评分',
       variables: [
@@ -208,14 +213,15 @@ const DEFAULT_PROMPT_CONFIG = {
         '【tasks_atomic.md】\n{{tasksAtomic}}\n\n' +
         '请按“任务可执行性与可验收性”评审并评分（0-100）。评分维度建议：\n' +
         '1) 覆盖度：是否覆盖需求与关键边界\n' +
-        '2) 原子性：单任务是否 15 分钟内可完成，是否拆到无法再拆\n' +
-        '3) 具体性：是否包含明确文件路径/函数名/变量名/命令/验证步骤\n' +
-        '4) 顺序合理：是否遵循定义先行，先 types/schema 再逻辑\n' +
-        '5) 验收清晰：AC 是否可复现、可证明\n\n' +
-        '请严格只输出 JSON，字段必须包含：\n' +
-        '- score：0-100 的整数\n' +
-        '- summary：一句话总评\n' +
-        '- strengths：3-8 条字符串数组\n' +
+	        '2) 原子性：单任务是否 15 分钟内可完成，是否拆到无法再拆\n' +
+	        '3) 具体性：是否包含明确文件路径/函数名/变量名/命令/验证步骤\n' +
+	        '4) 顺序合理：是否遵循定义先行，先 types/schema 再逻辑\n' +
+	        '5) 验收清晰：AC 是否可复现、可证明（最好可用 CLI/接口/页面操作验证）\n' +
+	        '6) 路径精确：是否存在 TBD/待定/占位符路径（出现则应显著扣分）\n\n' +
+	        '请严格只输出 JSON，字段必须包含：\n' +
+	        '- score：0-100 的整数\n' +
+	        '- summary：一句话总评\n' +
+	        '- strengths：3-8 条字符串数组\n' +
         '- weaknesses：3-8 条字符串数组\n' +
         '- suggestions：3-10 条字符串数组（可落地修改建议）\n',
     },
