@@ -2,5 +2,48 @@
   "requirementsConfirmed": false,
   "designConfirmed": false,
   "tasksConfirmed": false,
-  "prompt": "???????????"
+  "techStackConfirmed": false,
+  "prompt": "???????????",
+  "requirementsReview": {
+    "notes": "",
+    "points": [
+      {
+        "id": "wwsO-TwMOBnY4dglG4ndL",
+        "start": null,
+        "end": null,
+        "text": "作为需求提供方，我希望补充明确的需求描述，以便产出准确的 user stories 和验收标准。",
+        "note": "",
+        "checked": false,
+        "kind": "story",
+        "createdAt": "2026-01-02T16:04:15.620Z"
+      },
+      {
+        "id": "9a7djK7lr8ytoW8MJmZo3",
+        "start": null,
+        "end": null,
+        "text": "当用户提供完整需求描述时，系统应生成符合 EARS 的验收标准并返回 JSON。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.620Z"
+      }
+    ],
+    "updatedAt": "2026-01-02T16:04:15.620Z",
+    "confirmedAt": null
+  },
+  "requirementsClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "techStackClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "lastError": null,
+  "flowReport": {
+    "activeRunId": null,
+    "history": []
+  }
 }

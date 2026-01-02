@@ -1,5 +1,39 @@
 {
   "requirementsConfirmed": false,
   "designConfirmed": false,
-  "tasksConfirmed": false
+  "tasksConfirmed": false,
+  "techStackConfirmed": false,
+  "prompt": "",
+  "requirementsReview": {
+    "notes": "",
+    "points": [
+      {
+        "id": "TVPXST435TNjP3O2uFeno",
+        "start": null,
+        "end": null,
+        "text": "WHEN [条件/事件]",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.647Z"
+      }
+    ],
+    "updatedAt": "2026-01-02T16:04:15.647Z",
+    "confirmedAt": null
+  },
+  "requirementsClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "techStackClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "lastError": null,
+  "flowReport": {
+    "activeRunId": null,
+    "history": []
+  }
 }

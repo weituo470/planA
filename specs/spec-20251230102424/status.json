@@ -2,5 +2,244 @@
   "requirementsConfirmed": true,
   "designConfirmed": true,
   "tasksConfirmed": false,
-  "prompt": "???????????"
+  "techStackConfirmed": false,
+  "prompt": "???????????",
+  "requirementsReview": {
+    "notes": "",
+    "points": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "requirementsClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "techStackClarifications": {
+    "questions": [
+      {
+        "id": "frontend",
+        "question": "前端/客户端技术栈倾向是什么？",
+        "mode": "single",
+        "required": true,
+        "allowOther": true,
+        "options": [
+          {
+            "id": "react-vite",
+            "label": "React + Vite",
+            "desc": "单页应用/管理台常用组合，开发与构建速度快，生态成熟。",
+            "wiki": "https://en.wikipedia.org/wiki/React_(software)"
+          },
+          {
+            "id": "nextjs",
+            "label": "Next.js (React)",
+            "desc": "React 全栈框架，支持 SSR/SSG/路由等，适合官网/内容站/全栈应用。",
+            "wiki": "https://en.wikipedia.org/wiki/Next.js"
+          },
+          {
+            "id": "vue-vite",
+            "label": "Vue + Vite",
+            "desc": "Vue SPA 常用组合，上手快，适合管理台/中小项目。",
+            "wiki": "https://en.wikipedia.org/wiki/Vue.js"
+          },
+          {
+            "id": "vanilla",
+            "label": "纯 HTML/CSS/JS",
+            "desc": "无框架，适合简单页面/原型/极简性能场景。",
+            "wiki": "https://en.wikipedia.org/wiki/Front-end_web_development"
+          },
+          {
+            "id": "none",
+            "label": "不需要前端",
+            "desc": "仅接口/脚本/CLI 等，无 UI。",
+            "wiki": "https://en.wikipedia.org/wiki/User_interface"
+          }
+        ],
+        "answer": {
+          "selectedOptionIds": [],
+          "otherText": ""
+        },
+        "createdAt": "2026-01-02T16:04:15.607Z"
+      },
+      {
+        "id": "backend",
+        "question": "后端技术栈倾向是什么？",
+        "mode": "single",
+        "required": true,
+        "allowOther": true,
+        "options": [
+          {
+            "id": "nest",
+            "label": "Node.js + NestJS",
+            "desc": "基于 TypeScript 的企业级 Node 框架（模块/依赖注入），适合中大型后端。",
+            "wiki": "https://en.wikipedia.org/wiki/NestJS"
+          },
+          {
+            "id": "express",
+            "label": "Node.js + Express",
+            "desc": "轻量 Node Web 框架，灵活、上手快，适合小型 API/原型。",
+            "wiki": "https://en.wikipedia.org/wiki/Express.js"
+          },
+          {
+            "id": "fastapi",
+            "label": "Python + FastAPI",
+            "desc": "高性能 Python API 框架，类型提示友好，适合数据/AI 服务。",
+            "wiki": "https://en.wikipedia.org/wiki/FastAPI"
+          },
+          {
+            "id": "spring",
+            "label": "Java + Spring Boot",
+            "desc": "Java 生态主流后端框架，工程化强，适合企业应用。",
+            "wiki": "https://en.wikipedia.org/wiki/Spring_Boot"
+          },
+          {
+            "id": "none",
+            "label": "不需要后端",
+            "desc": "纯前端/静态站/本地存储等场景，不需要服务端。",
+            "wiki": "https://en.wikipedia.org/wiki/Back_end"
+          }
+        ],
+        "answer": {
+          "selectedOptionIds": [],
+          "otherText": ""
+        },
+        "createdAt": "2026-01-02T16:04:15.607Z"
+      },
+      {
+        "id": "database",
+        "question": "数据存储倾向是什么？",
+        "mode": "single",
+        "required": true,
+        "allowOther": true,
+        "options": [
+          {
+            "id": "postgres",
+            "label": "PostgreSQL",
+            "desc": "关系型数据库，功能完整，适合复杂查询与事务。",
+            "wiki": "https://en.wikipedia.org/wiki/PostgreSQL"
+          },
+          {
+            "id": "mysql",
+            "label": "MySQL",
+            "desc": "关系型数据库，通用、生态广。",
+            "wiki": "https://en.wikipedia.org/wiki/MySQL"
+          },
+          {
+            "id": "sqlite",
+            "label": "SQLite",
+            "desc": "嵌入式数据库，零运维，适合单机/轻量应用。",
+            "wiki": "https://en.wikipedia.org/wiki/SQLite"
+          },
+          {
+            "id": "mongo",
+            "label": "MongoDB",
+            "desc": "文档型数据库，schema 灵活，适合 JSON 数据场景。",
+            "wiki": "https://en.wikipedia.org/wiki/MongoDB"
+          },
+          {
+            "id": "none",
+            "label": "不需要数据库/文件存储即可",
+            "desc": "不建库，只用文件/浏览器存储即可。",
+            "wiki": "https://en.wikipedia.org/wiki/File_system"
+          }
+        ],
+        "answer": {
+          "selectedOptionIds": [],
+          "otherText": ""
+        },
+        "createdAt": "2026-01-02T16:04:15.607Z"
+      },
+      {
+        "id": "auth",
+        "question": "登录/鉴权方案倾向是什么？",
+        "mode": "single",
+        "required": true,
+        "allowOther": true,
+        "options": [
+          {
+            "id": "jwt",
+            "label": "JWT",
+            "desc": "无状态 Token，适合 API/移动端。",
+            "wiki": "https://en.wikipedia.org/wiki/JSON_Web_Token"
+          },
+          {
+            "id": "session",
+            "label": "Session + Cookie",
+            "desc": "服务端会话 + Cookie，适合传统 Web。",
+            "wiki": "https://en.wikipedia.org/wiki/Session_(computer_science)"
+          },
+          {
+            "id": "oauth",
+            "label": "OAuth2 / 第三方登录",
+            "desc": "对接第三方登录/授权（如 Google/GitHub/微信等）。",
+            "wiki": "https://en.wikipedia.org/wiki/OAuth"
+          },
+          {
+            "id": "none",
+            "label": "无登录/公开访问",
+            "desc": "公开访问，无鉴权。",
+            "wiki": "https://en.wikipedia.org/wiki/Authentication"
+          }
+        ],
+        "answer": {
+          "selectedOptionIds": [],
+          "otherText": ""
+        },
+        "createdAt": "2026-01-02T16:04:15.607Z"
+      },
+      {
+        "id": "deploy",
+        "question": "部署方式倾向是什么？",
+        "mode": "single",
+        "required": true,
+        "allowOther": true,
+        "options": [
+          {
+            "id": "docker",
+            "label": "Docker",
+            "desc": "容器化部署，环境一致性好。",
+            "wiki": "https://en.wikipedia.org/wiki/Docker_(software)"
+          },
+          {
+            "id": "pm2",
+            "label": "PM2/进程守护",
+            "desc": "进程守护/自动重启，适合单机或简单部署。",
+            "wiki": "https://en.wikipedia.org/wiki/PM2_(software)"
+          },
+          {
+            "id": "serverless",
+            "label": "Serverless",
+            "desc": "按需运行、自动伸缩，适合事件驱动/突发流量。",
+            "wiki": "https://en.wikipedia.org/wiki/Serverless_computing"
+          },
+          {
+            "id": "static",
+            "label": "静态托管",
+            "desc": "只发布静态资源（HTML/CSS/JS），无需服务器。",
+            "wiki": "https://en.wikipedia.org/wiki/Static_web_page"
+          },
+          {
+            "id": "local",
+            "label": "本地运行即可",
+            "desc": "仅本地运行，无需部署。",
+            "wiki": "https://en.wikipedia.org/wiki/Localhost"
+          }
+        ],
+        "answer": {
+          "selectedOptionIds": [],
+          "otherText": ""
+        },
+        "createdAt": "2026-01-02T16:04:15.607Z"
+      }
+    ],
+    "updatedAt": "2026-01-02T16:04:15.607Z",
+    "confirmedAt": null,
+    "generatedBy": "default",
+    "generationError": null
+  },
+  "lastError": null,
+  "flowReport": {
+    "activeRunId": null,
+    "history": []
+  }
 }

@@ -2,5 +2,78 @@
   "requirementsConfirmed": false,
   "designConfirmed": false,
   "tasksConfirmed": false,
-  "prompt": "???????????"
+  "techStackConfirmed": false,
+  "prompt": "???????????",
+  "requirementsReview": {
+    "notes": "",
+    "points": [
+      {
+        "id": "HsPHTYZXENbVBBS8fqFCB",
+        "start": null,
+        "end": null,
+        "text": "作为用户，我希望能够???????????，以便获得清晰的内容与体验。",
+        "note": "",
+        "checked": false,
+        "kind": "story",
+        "createdAt": "2026-01-02T16:04:15.625Z"
+      },
+      {
+        "id": "GsYf-0oPOPfcDo90QfEI_",
+        "start": null,
+        "end": null,
+        "text": "当用户打开需求描述页时，系统应显示需求概述与最近更新时间。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.625Z"
+      },
+      {
+        "id": "P8ShkO-9DWniXN3TSdxhG",
+        "start": null,
+        "end": null,
+        "text": "当用户提交有效需求描述时，系统应保存内容并返回成功确认。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.625Z"
+      },
+      {
+        "id": "VazWBjXgXy3sw3Gv3y-XR",
+        "start": null,
+        "end": null,
+        "text": "当用户修改需求描述时，系统应记录修改人和修改时间。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.625Z"
+      },
+      {
+        "id": "jpO-gtm01S0jKwLlWL2ja",
+        "start": null,
+        "end": null,
+        "text": "当保存失败时，系统应提示失败原因并允许重试。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.625Z"
+      }
+    ],
+    "updatedAt": "2026-01-02T16:04:15.625Z",
+    "confirmedAt": null
+  },
+  "requirementsClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "techStackClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "lastError": null,
+  "flowReport": {
+    "activeRunId": null,
+    "history": []
+  }
 }

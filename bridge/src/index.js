@@ -1790,12 +1790,29 @@ function sanitizeOptionLabel(value) {
   return sanitizeReviewText(value, 120);
 }
 
+function sanitizeOptionDesc(value) {
+  return sanitizeReviewText(value, 240);
+}
+
+function sanitizeWikiUrl(value) {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
+  if (!trimmed) return '';
+  if (trimmed.length > 400) return '';
+  if (!/^https?:\/\/\S+$/i.test(trimmed)) return '';
+  return trimmed;
+}
+
 function normalizeClarificationOption(input) {
   const label = sanitizeOptionLabel(input?.label);
   if (!label) return null;
   const id =
     typeof input?.id === 'string' && input.id.trim() ? input.id.trim() : nanoid();
-  return { id, label };
+  const desc = sanitizeOptionDesc(input?.desc);
+  const wiki = sanitizeWikiUrl(input?.wiki);
+  const out = { id, label };
+  if (desc) out.desc = desc;
+  if (wiki) out.wiki = wiki;
+  return out;
 }
 
 function normalizeClarificationAnswer(input, mode) {
@@ -2284,6 +2301,150 @@ function buildDefaultClarificationQuestions(prompt) {
   return questions.map(normalizeClarificationQuestion).filter(Boolean);
 }
 
+const TECH_STACK_OPTION_META = {
+  'frontend:react-vite': {
+    desc: '单页应用/管理台常用组合，开发与构建速度快，生态成熟。',
+    wiki: 'https://en.wikipedia.org/wiki/React_(software)',
+  },
+  'frontend:nextjs': {
+    desc: 'React 全栈框架，支持 SSR/SSG/路由等，适合官网/内容站/全栈应用。',
+    wiki: 'https://en.wikipedia.org/wiki/Next.js',
+  },
+  'frontend:vue-vite': {
+    desc: 'Vue SPA 常用组合，上手快，适合管理台/中小项目。',
+    wiki: 'https://en.wikipedia.org/wiki/Vue.js',
+  },
+  'frontend:vanilla': {
+    desc: '无框架，适合简单页面/原型/极简性能场景。',
+    wiki: 'https://en.wikipedia.org/wiki/Front-end_web_development',
+  },
+  'frontend:none': {
+    desc: '仅接口/脚本/CLI 等，无 UI。',
+    wiki: 'https://en.wikipedia.org/wiki/User_interface',
+  },
+
+  'backend:nest': {
+    desc: '基于 TypeScript 的企业级 Node 框架（模块/依赖注入），适合中大型后端。',
+    wiki: 'https://en.wikipedia.org/wiki/NestJS',
+  },
+  'backend:express': {
+    desc: '轻量 Node Web 框架，灵活、上手快，适合小型 API/原型。',
+    wiki: 'https://en.wikipedia.org/wiki/Express.js',
+  },
+  'backend:fastapi': {
+    desc: '高性能 Python API 框架，类型提示友好，适合数据/AI 服务。',
+    wiki: 'https://en.wikipedia.org/wiki/FastAPI',
+  },
+  'backend:spring': {
+    desc: 'Java 生态主流后端框架，工程化强，适合企业应用。',
+    wiki: 'https://en.wikipedia.org/wiki/Spring_Boot',
+  },
+  'backend:none': {
+    desc: '纯前端/静态站/本地存储等场景，不需要服务端。',
+    wiki: 'https://en.wikipedia.org/wiki/Back_end',
+  },
+
+  'database:postgres': {
+    desc: '关系型数据库，功能完整，适合复杂查询与事务。',
+    wiki: 'https://en.wikipedia.org/wiki/PostgreSQL',
+  },
+  'database:mysql': {
+    desc: '关系型数据库，通用、生态广。',
+    wiki: 'https://en.wikipedia.org/wiki/MySQL',
+  },
+  'database:sqlite': {
+    desc: '嵌入式数据库，零运维，适合单机/轻量应用。',
+    wiki: 'https://en.wikipedia.org/wiki/SQLite',
+  },
+  'database:mongo': {
+    desc: '文档型数据库，schema 灵活，适合 JSON 数据场景。',
+    wiki: 'https://en.wikipedia.org/wiki/MongoDB',
+  },
+  'database:none': {
+    desc: '不建库，只用文件/浏览器存储即可。',
+    wiki: 'https://en.wikipedia.org/wiki/File_system',
+  },
+
+  'auth:jwt': {
+    desc: '无状态 Token，适合 API/移动端。',
+    wiki: 'https://en.wikipedia.org/wiki/JSON_Web_Token',
+  },
+  'auth:session': {
+    desc: '服务端会话 + Cookie，适合传统 Web。',
+    wiki: 'https://en.wikipedia.org/wiki/Session_(computer_science)',
+  },
+  'auth:oauth': {
+    desc: '对接第三方登录/授权（如 Google/GitHub/微信等）。',
+    wiki: 'https://en.wikipedia.org/wiki/OAuth',
+  },
+  'auth:none': {
+    desc: '公开访问，无鉴权。',
+    wiki: 'https://en.wikipedia.org/wiki/Authentication',
+  },
+
+  'deploy:docker': {
+    desc: '容器化部署，环境一致性好。',
+    wiki: 'https://en.wikipedia.org/wiki/Docker_(software)',
+  },
+  'deploy:pm2': {
+    desc: '进程守护/自动重启，适合单机或简单部署。',
+    wiki: 'https://en.wikipedia.org/wiki/PM2_(software)',
+  },
+  'deploy:serverless': {
+    desc: '按需运行、自动伸缩，适合事件驱动/突发流量。',
+    wiki: 'https://en.wikipedia.org/wiki/Serverless_computing',
+  },
+  'deploy:static': {
+    desc: '只发布静态资源（HTML/CSS/JS），无需服务器。',
+    wiki: 'https://en.wikipedia.org/wiki/Static_web_page',
+  },
+  'deploy:local': {
+    desc: '仅本地运行，无需部署。',
+    wiki: 'https://en.wikipedia.org/wiki/Localhost',
+  },
+};
+
+function applyTechStackOptionMeta(questionId, options) {
+  const qid = String(questionId || '').trim();
+  const list = Array.isArray(options) ? options : [];
+  if (!qid || list.length === 0) return list;
+  let changed = false;
+  const next = list.map((opt) => {
+    if (!opt || typeof opt !== 'object') return opt;
+    const id = typeof opt.id === 'string' ? opt.id.trim() : '';
+    if (!id) return opt;
+    const meta = TECH_STACK_OPTION_META[`${qid}:${id}`];
+    if (!meta) return opt;
+    const hasDesc = typeof opt.desc === 'string' && opt.desc.trim();
+    const hasWiki = typeof opt.wiki === 'string' && opt.wiki.trim();
+    if (hasDesc && hasWiki) return opt;
+    changed = true;
+    return {
+      ...opt,
+      desc: hasDesc ? opt.desc : meta.desc,
+      wiki: hasWiki ? opt.wiki : meta.wiki,
+    };
+  });
+  return changed ? next : list;
+}
+
+function enrichTechStackQuestions(questions) {
+  const list = Array.isArray(questions) ? questions : [];
+  if (list.length === 0) return { changed: false, questions: list };
+  let changed = false;
+  const next = list.map((q) => {
+    if (!q || typeof q !== 'object') return q;
+    const qid = typeof q.id === 'string' ? q.id.trim() : '';
+    if (!qid) return q;
+    const options = Array.isArray(q.options) ? q.options : [];
+    const nextOptions = applyTechStackOptionMeta(qid, options);
+    if (nextOptions === options) return q;
+    changed = true;
+    return { ...q, options: nextOptions };
+  });
+  return { changed, questions: next };
+}
+
 function buildDefaultTechStackQuestions(prompt, designMarkdown) {
   const now = new Date().toISOString();
   const normalizedPrompt = normalizePrompt(prompt);
@@ -2302,13 +2463,13 @@ function buildDefaultTechStackQuestions(prompt, designMarkdown) {
     mode: 'single',
     required: true,
     allowOther: true,
-    options: [
+    options: applyTechStackOptionMeta('frontend', [
       { id: 'react-vite', label: 'React + Vite' },
       { id: 'nextjs', label: 'Next.js (React)' },
       { id: 'vue-vite', label: 'Vue + Vite' },
       { id: 'vanilla', label: '纯 HTML/CSS/JS' },
       { id: 'none', label: '不需要前端' },
-    ],
+    ]),
     answer: { selectedOptionIds: [], otherText: '' },
     createdAt: now,
   };
@@ -2319,13 +2480,13 @@ function buildDefaultTechStackQuestions(prompt, designMarkdown) {
     mode: 'single',
     required: true,
     allowOther: true,
-    options: [
+    options: applyTechStackOptionMeta('backend', [
       { id: 'nest', label: 'Node.js + NestJS' },
       { id: 'express', label: 'Node.js + Express' },
       { id: 'fastapi', label: 'Python + FastAPI' },
       { id: 'spring', label: 'Java + Spring Boot' },
       { id: 'none', label: '不需要后端' },
-    ],
+    ]),
     answer: { selectedOptionIds: [], otherText: '' },
     createdAt: now,
   };
@@ -2336,13 +2497,13 @@ function buildDefaultTechStackQuestions(prompt, designMarkdown) {
     mode: 'single',
     required: true,
     allowOther: true,
-    options: [
+    options: applyTechStackOptionMeta('database', [
       { id: 'postgres', label: 'PostgreSQL' },
       { id: 'mysql', label: 'MySQL' },
       { id: 'sqlite', label: 'SQLite' },
       { id: 'mongo', label: 'MongoDB' },
       { id: 'none', label: '不需要数据库/文件存储即可' },
-    ],
+    ]),
     answer: { selectedOptionIds: [], otherText: '' },
     createdAt: now,
   };
@@ -2353,12 +2514,12 @@ function buildDefaultTechStackQuestions(prompt, designMarkdown) {
     mode: 'single',
     required: true,
     allowOther: true,
-    options: [
+    options: applyTechStackOptionMeta('auth', [
       { id: 'jwt', label: 'JWT' },
       { id: 'session', label: 'Session + Cookie' },
       { id: 'oauth', label: 'OAuth2 / 第三方登录' },
       { id: 'none', label: '无登录/公开访问' },
-    ],
+    ]),
     answer: { selectedOptionIds: [], otherText: '' },
     createdAt: now,
   };
@@ -2369,13 +2530,13 @@ function buildDefaultTechStackQuestions(prompt, designMarkdown) {
     mode: 'single',
     required: true,
     allowOther: true,
-    options: [
+    options: applyTechStackOptionMeta('deploy', [
       { id: 'docker', label: 'Docker' },
       { id: 'pm2', label: 'PM2/进程守护' },
       { id: 'serverless', label: 'Serverless' },
       { id: 'static', label: '静态托管' },
       { id: 'local', label: '本地运行即可' },
-    ],
+    ]),
     answer: { selectedOptionIds: [], otherText: '' },
     createdAt: now,
   };
@@ -2449,13 +2610,14 @@ function ensureTechStackClarificationsSeeded(specName, status, prompt, designMar
 
   if (current.questions.length > 0) {
     const cleaned = stripTechStackKeepOptions(current.questions);
-    if (!cleaned.changed) return { changed: false, status: normalized };
+    const enriched = enrichTechStackQuestions(cleaned.questions);
+    if (!cleaned.changed && !enriched.changed) return { changed: false, status: normalized };
     const now = new Date().toISOString();
     const next = {
       ...normalized,
       techStackClarifications: {
         ...current,
-        questions: cleaned.questions,
+        questions: enriched.questions,
         updatedAt: now,
         confirmedAt: normalized.techStackClarifications?.confirmedAt ?? null,
         generatedBy: existingGeneratedBy || 'default',
@@ -2471,13 +2633,14 @@ function ensureTechStackClarificationsSeeded(specName, status, prompt, designMar
   const questions = buildDefaultTechStackQuestions(prompt, designMarkdown);
   if (questions.length === 0) return { changed: false, status: normalized };
   const cleaned = stripTechStackKeepOptions(questions);
+  const enriched = enrichTechStackQuestions(cleaned.questions);
 
   const now = new Date().toISOString();
   const next = {
     ...normalized,
     techStackClarifications: {
       ...current,
-      questions: cleaned.questions,
+      questions: enriched.questions,
       updatedAt: now,
       confirmedAt: normalized.techStackClarifications?.confirmedAt ?? null,
       generatedBy: 'default',
@@ -2614,6 +2777,14 @@ function generateSpecName(prompt) {
   return `${slug}-${formatTimestamp(new Date())}`;
 }
 
+function summarizeForTemplate(text, maxLen = 160) {
+  const raw = typeof text === 'string' ? text : '';
+  const cleaned = raw.replace(/\s+/g, ' ').trim();
+  if (!cleaned) return '';
+  if (cleaned.length <= maxLen) return cleaned;
+  return `${cleaned.slice(0, Math.max(1, maxLen - 1)).trimEnd()}…`;
+}
+
 function generateRequirementsContent(prompt) {
   const summary = normalizePrompt(prompt);
   if (!summary) {
@@ -2623,7 +2794,11 @@ function generateRequirementsContent(prompt) {
 }
 
 function generateDesignContent(requirements, prompt) {
-  const summary = normalizePrompt(requirements || prompt);
+  const summary = summarizeForTemplate(
+    normalizePrompt(prompt) ||
+      extractOriginalRequirement(requirements) ||
+      normalizePrompt(requirements),
+  );
   if (!summary) {
     return SPEC_TEMPLATES.design;
   }
@@ -2631,11 +2806,15 @@ function generateDesignContent(requirements, prompt) {
 }
 
 function generateTasksContent(design, prompt) {
-  const summary = normalizePrompt(design || prompt);
+  const summary = summarizeForTemplate(
+    normalizePrompt(prompt) ||
+      extractOriginalRequirement(design) ||
+      normalizePrompt(design),
+  );
   if (!summary) {
     return SPEC_TEMPLATES.tasks;
   }
-  return `# 任务（tasks）\n\n## 任务清单\n- [ ] 1. 梳理“${summary}”的模块清单与页面/服务边界。\n- [ ] 2. 明确最小可运行结构（入口、路由/页面、核心依赖）。\n- [ ] 3. 拆分关键流程并标注对应代码落点。\n- [ ] 4. 明确数据结构/接口草案（字段、命名、约束）。\n- [ ] 5. 记录需要的环境变量/配置项。\n- [ ] 6. 列出需要补齐的边界与异常场景。\n`;
+  return `# 任务（tasks）\n\n## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务总览与回写入口（范围约束 / 验收记录）。\n- AI IDE 开发时优先按 tasks_atomic.md（原子化任务表单）逐条执行；完成情况与关键变更回写到 tasks.md，保持任务与代码同步。\n- 如发现遗漏或范围变化：先更新 tasks.md，再重新生成 tasks_atomic.md 后继续。\n\n## 任务清单\n- [ ] 1. 梳理“${summary}”的模块清单与页面/服务边界。\n- [ ] 2. 明确最小可运行结构（入口、路由/页面、核心依赖）。\n- [ ] 3. 拆分关键流程并标注对应代码落点。\n- [ ] 4. 明确数据结构/接口草案（字段、命名、约束）。\n- [ ] 5. 记录需要的环境变量/配置项。\n- [ ] 6. 列出需要补齐的边界与异常场景。\n`;
 }
 
 function tryParseJson(text) {

@@ -3,6 +3,8 @@ export type SpecArtifact = 'requirements' | 'design' | 'tasks';
 export interface ClarificationOption {
   id: string;
   label: string;
+  desc?: string;
+  wiki?: string;
 }
 
 export interface ClarificationAnswer {

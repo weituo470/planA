@@ -2,5 +2,78 @@
   "requirementsConfirmed": false,
   "designConfirmed": false,
   "tasksConfirmed": false,
-  "prompt": "?????????"
+  "techStackConfirmed": false,
+  "prompt": "?????????",
+  "requirementsReview": {
+    "notes": "",
+    "points": [
+      {
+        "id": "Qes1apXDTj61Ic88kkdrH",
+        "start": null,
+        "end": null,
+        "text": "作为用户，我希望能够?????????，以便获得清晰的内容与体验。",
+        "note": "",
+        "checked": false,
+        "kind": "story",
+        "createdAt": "2026-01-02T16:04:15.637Z"
+      },
+      {
+        "id": "BVrUCW6x9UoXtSiBdHMvd",
+        "start": null,
+        "end": null,
+        "text": "当用户提交空的需求描述时，系统应返回默认的澄清占位内容。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.637Z"
+      },
+      {
+        "id": "Fn-qs3HLhuwo4Vf0d0XEx",
+        "start": null,
+        "end": null,
+        "text": "当用户提交包含关键词的需求描述时，系统应提取关键词并生成对应的功能概述。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.637Z"
+      },
+      {
+        "id": "W30YRz2zk7TqCdJD1gPIJ",
+        "start": null,
+        "end": null,
+        "text": "如果需求描述包含时间或频率信息，系统应将其转换为可执行的计划参数。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.637Z"
+      },
+      {
+        "id": "Jp8ngAy_f8QBjTZ4A7vTR",
+        "start": null,
+        "end": null,
+        "text": "如果需求描述涉及数据输入输出，系统应定义输入字段与输出结果的格式。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.637Z"
+      }
+    ],
+    "updatedAt": "2026-01-02T16:04:15.637Z",
+    "confirmedAt": null
+  },
+  "requirementsClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "techStackClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "lastError": null,
+  "flowReport": {
+    "activeRunId": null,
+    "history": []
+  }
 }

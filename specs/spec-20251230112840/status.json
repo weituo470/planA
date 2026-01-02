@@ -2,5 +2,88 @@
   "requirementsConfirmed": false,
   "designConfirmed": false,
   "tasksConfirmed": false,
-  "prompt": "???????????"
+  "techStackConfirmed": false,
+  "prompt": "???????????",
+  "requirementsReview": {
+    "notes": "",
+    "points": [
+      {
+        "id": "cGDsOIhU-EOljsRcfl6MA",
+        "start": null,
+        "end": null,
+        "text": "作为用户，我希望能够???????????，以便获得清晰的内容与体验。",
+        "note": "",
+        "checked": false,
+        "kind": "story",
+        "createdAt": "2026-01-02T16:04:15.623Z"
+      },
+      {
+        "id": "CZaejnIjKalQnQisESc-x",
+        "start": null,
+        "end": null,
+        "text": "当系统接收到用户查询时，系统应返回与查询主题相关的答案。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.623Z"
+      },
+      {
+        "id": "TM3CXa73qaeH1x2tIBKj_",
+        "start": null,
+        "end": null,
+        "text": "当系统无法确定用户意图时，系统应返回通用的说明并提示可用的功能示例。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.623Z"
+      },
+      {
+        "id": "xW30PjWiCrPvb-5kTD5Vb",
+        "start": null,
+        "end": null,
+        "text": "当输入包含无效或空内容时，系统应返回错误提示并不执行进一步处理。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.623Z"
+      },
+      {
+        "id": "oyQFb3sFTRxC2k84fTeTd",
+        "start": null,
+        "end": null,
+        "text": "当系统处理查询超时或失败时，系统应返回失败信息并建议用户重试。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.623Z"
+      },
+      {
+        "id": "kM-yGEWQ1AhsEUFb3jL3o",
+        "start": null,
+        "end": null,
+        "text": "当系统返回结果时，系统应以简洁清晰的文本格式呈现并避免不必要的冗长内容。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.623Z"
+      }
+    ],
+    "updatedAt": "2026-01-02T16:04:15.623Z",
+    "confirmedAt": null
+  },
+  "requirementsClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "techStackClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "lastError": null,
+  "flowReport": {
+    "activeRunId": null,
+    "history": []
+  }
 }

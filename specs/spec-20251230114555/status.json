@@ -2,5 +2,88 @@
   "requirementsConfirmed": false,
   "designConfirmed": false,
   "tasksConfirmed": false,
-  "prompt": "?????????"
+  "techStackConfirmed": false,
+  "prompt": "?????????",
+  "requirementsReview": {
+    "notes": "",
+    "points": [
+      {
+        "id": "yroBKfSfNp-l3mzUK5Qxz",
+        "start": null,
+        "end": null,
+        "text": "作为用户，我希望能够?????????，以便获得清晰的内容与体验。",
+        "note": "",
+        "checked": false,
+        "kind": "story",
+        "createdAt": "2026-01-02T16:04:15.634Z"
+      },
+      {
+        "id": "tigfIRHvOH-r3PA8rtKkX",
+        "start": null,
+        "end": null,
+        "text": "当用户提交需求描述时，系统应解析输入并生成对应的验收条件列表。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.634Z"
+      },
+      {
+        "id": "Cy-Z9xGHfEYtXO4-wEORZ",
+        "start": null,
+        "end": null,
+        "text": "如果需求描述为空或无效，系统应使用合理默认假设生成至少3条验收条件。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.634Z"
+      },
+      {
+        "id": "ZcwOjGxuGaGe9psDwVJ7V",
+        "start": null,
+        "end": null,
+        "text": "当生成验收条件时，系统应仅输出JSON并包含acceptance字段。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.634Z"
+      },
+      {
+        "id": "2h9MqcrB5nQUAnLqfkXJj",
+        "start": null,
+        "end": null,
+        "text": "如果生成的验收条件少于3条，系统应补足至3-6条。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.634Z"
+      },
+      {
+        "id": "83VWLpwUdeueYuan_LX0V",
+        "start": null,
+        "end": null,
+        "text": "当输出JSON时，系统应保证acceptance字段为字符串数组，且每条为EARS语句。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.634Z"
+      }
+    ],
+    "updatedAt": "2026-01-02T16:04:15.634Z",
+    "confirmedAt": null
+  },
+  "requirementsClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "techStackClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "lastError": null,
+  "flowReport": {
+    "activeRunId": null,
+    "history": []
+  }
 }

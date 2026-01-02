@@ -14,6 +14,15 @@ task/mvp2/.mvp2env
 # runtime artifacts
 bridge/data/
 
+# generated flow reports (saved locally for analysis)
+docs/flow_*.md
+
+# local spec artifacts (legacy; runtime spec root is outside repo)
+specs/
+
+# temporary screenshots
+tmp_*.png
+
 # nested repos (keep separate)
 openspec/
 planA/
