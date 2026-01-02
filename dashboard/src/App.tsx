@@ -19,6 +19,8 @@ const DOWNLOAD_PREFIX = 'planA-v0.1';
 
 type TaskView = 'tasks' | 'atomic';
 
+type OutputScrollEl = HTMLDivElement | HTMLTextAreaElement;
+
 type AtomizeLogEntry = {
   at: string;
   message: string;
@@ -634,7 +636,8 @@ export default function App() {
   const streamArtifactRef = useRef<SpecArtifact | null>(null);
   const streamTextRef = useRef('');
   const streamFlushTimerRef = useRef<number | null>(null);
-  const [animatedDisplayContent, setAnimatedDisplayContent] = useState('');
+  const [animatedDisplayHead, setAnimatedDisplayHead] = useState('');
+  const [animatedDisplayTail, setAnimatedDisplayTail] = useState('');
   const typewriterRef = useRef<{
     target: string;
     lastTarget: string;
@@ -1897,7 +1900,120 @@ export default function App() {
   const busyProgressEffective = busyProgress != null ? busyProgress : streamProgress;
   const busyEtaSecondsEffective = busyEtaSeconds != null ? busyEtaSeconds : streamEtaSeconds;
   const busyEtaText = formatDurationSeconds(busyEtaSecondsEffective);
-  const outputText = shouldTypewriter ? animatedDisplayContent : displayContent;
+  const outputText = shouldTypewriter
+    ? `${animatedDisplayHead}${animatedDisplayTail}`
+    : displayContent;
+
+  const outputScrollRef = useRef<OutputScrollEl | null>(null);
+  const outputLastScrollTopRef = useRef(0);
+  const [outputAutoFollow, setOutputAutoFollow] = useState(true);
+  const outputAutoFollowRef = useRef(true);
+  useEffect(() => {
+    outputAutoFollowRef.current = outputAutoFollow;
+  }, [outputAutoFollow]);
+
+  const handleOutputScroll = useCallback(() => {
+    if (!shouldTypewriter) return;
+    const el = outputScrollRef.current;
+    if (!el) return;
+    outputLastScrollTopRef.current = el.scrollTop;
+    const distanceToBottom = el.scrollHeight - (el.scrollTop + el.clientHeight);
+    const nearBottom = distanceToBottom <= 120;
+    if (!nearBottom && outputAutoFollowRef.current) setOutputAutoFollow(false);
+    if (nearBottom && !outputAutoFollowRef.current) setOutputAutoFollow(true);
+  }, [shouldTypewriter]);
+
+  useEffect(() => {
+    if (!shouldTypewriter) return;
+    setOutputAutoFollow(true);
+  }, [shouldTypewriter]);
+
+  useEffect(() => {
+    const el = outputScrollRef.current;
+    if (!el) return;
+    window.requestAnimationFrame(() => {
+      const node = outputScrollRef.current;
+      if (!node) return;
+      if (outputAutoFollowRef.current) {
+        node.scrollTop = node.scrollHeight;
+        return;
+      }
+      node.scrollTop = Math.min(outputLastScrollTopRef.current, node.scrollHeight);
+    });
+  }, [shouldTypewriter]);
+
+  useEffect(() => {
+    if (!shouldTypewriter) return;
+    if (!outputAutoFollowRef.current) return;
+    const el = outputScrollRef.current;
+    if (!el) return;
+    window.requestAnimationFrame(() => {
+      const node = outputScrollRef.current;
+      if (!node) return;
+      node.scrollTop = node.scrollHeight;
+    });
+  }, [outputText, shouldTypewriter]);
+
+  const nextAction = useMemo(() => {
+    if (busyLabel || shouldTypewriter) return null;
+
+    if (!selectedSpecName) {
+      return rawPrompt.trim() ? 'createSpec' : null;
+    }
+
+    if (activeArtifact === 'requirements') {
+      if (
+        !artifactContent.design.trim() &&
+        clarifications.length &&
+        areClarificationsComplete(clarifications)
+      ) {
+        return 'generateDesign';
+      }
+    }
+
+    if (activeArtifact === 'design') {
+      if (
+        artifactContent.design.trim() &&
+        !artifactContent.tasks.trim() &&
+        techStackClarifications.length &&
+        areClarificationsComplete(techStackClarifications)
+      ) {
+        return 'generateTasks';
+      }
+    }
+
+    if (activeArtifact === 'tasks') {
+      const hasTasks = Boolean(artifactContent.tasks.trim());
+      const hasAtomic =
+        Boolean(selectedSpec?.files?.tasks_atomic) || Boolean(tasksAtomicContent.trim());
+      const atomizeIncomplete =
+        Boolean(atomizeStatus?.total) && (atomizeStatus?.completed ?? 0) < (atomizeStatus?.total ?? 0);
+
+      if (atomizeStatus?.running) return null;
+      if (hasTasks && (!hasAtomic || atomizeIncomplete)) return 'startAtomize';
+      if (hasTasks) return 'downloadZip';
+    }
+
+    return null;
+  }, [
+    activeArtifact,
+    artifactContent.design,
+    artifactContent.tasks,
+    atomizeStatus?.running,
+    atomizeStatus?.completed,
+    atomizeStatus?.total,
+    busyLabel,
+    clarifications,
+    rawPrompt,
+    selectedSpec?.files?.tasks_atomic,
+    selectedSpecName,
+    shouldTypewriter,
+    tasksAtomicContent,
+    techStackClarifications,
+  ]);
+
+  const guidedButtonClass =
+    'ring-2 ring-green-400/80 shadow-lg shadow-green-500/25 animate-pulse';
 
   useEffect(() => {
     if (!shouldTypewriter) {
@@ -1906,7 +2022,8 @@ export default function App() {
       typewriterRef.current.resolvedLen = displayContent.length;
       typewriterRef.current.phase = 0;
       typewriterRef.current.startedAtMs = null;
-      setAnimatedDisplayContent(displayContent);
+      setAnimatedDisplayHead(displayContent);
+      setAnimatedDisplayTail('');
       return;
     }
 
@@ -1920,7 +2037,8 @@ export default function App() {
       typewriterRef.current.resolvedLen = 0;
       typewriterRef.current.phase = 0;
       typewriterRef.current.startedAtMs = Date.now();
-      setAnimatedDisplayContent('');
+      setAnimatedDisplayHead('');
+      setAnimatedDisplayTail('');
     }
 
     typewriterRef.current.resolvedLen = Math.min(
@@ -1948,7 +2066,8 @@ export default function App() {
       const ref = typewriterRef.current;
       const target = ref.target || '';
       if (!target) {
-        setAnimatedDisplayContent('');
+        setAnimatedDisplayHead('');
+        setAnimatedDisplayTail('');
         return;
       }
 
@@ -1980,7 +2099,8 @@ export default function App() {
       const head = target.slice(0, resolvedLen);
       const tail = target.slice(scrambleStart, scrambleEnd);
       const tailScrambled = tail ? matrixScrambleSegment(tail, ref.phase) : '';
-      setAnimatedDisplayContent(head + tailScrambled);
+      setAnimatedDisplayHead(head);
+      setAnimatedDisplayTail(tailScrambled);
     }, TICK_MS);
     typewriterTimerRef.current = timer;
     return () => {
@@ -2013,8 +2133,12 @@ export default function App() {
             onChange={(e) => setRawPrompt(e.target.value)}
             placeholder="粘贴/输入需求描述，点击“生成需求”创建一个新的 Spec。"
           />
-          <div className="flex flex-wrap items-center gap-2">
-            <Button onClick={createSpec} disabled={!rawPrompt.trim() || Boolean(busyLabel)}>
+            <div className="flex flex-wrap items-center gap-2">
+            <Button
+              onClick={createSpec}
+              disabled={!rawPrompt.trim() || Boolean(busyLabel)}
+              className={nextAction === 'createSpec' ? guidedButtonClass : ''}
+            >
               生成需求
             </Button>
             <div className="ml-auto flex flex-wrap items-center gap-2 text-sm text-slate-300">
@@ -2538,6 +2662,7 @@ export default function App() {
                     size="sm"
                     onClick={() => void confirmRequirementsAndGenerateDesign()}
                     disabled={!selectedSpecName || Boolean(busyLabel) || !clarifications.length}
+                    className={nextAction === 'generateDesign' ? guidedButtonClass : ''}
                   >
                     生成设计
                   </Button>
@@ -2690,6 +2815,7 @@ export default function App() {
                       !techStackClarifications.length ||
                       !areClarificationsComplete(techStackClarifications)
                     }
+                    className={nextAction === 'generateTasks' ? guidedButtonClass : ''}
                   >
                     确认技术栈并生成任务
                   </Button>
@@ -2726,6 +2852,7 @@ export default function App() {
                         !artifactContent.tasks.trim() ||
                         atomizeStatus?.running
                       }
+                      className={nextAction === 'startAtomize' ? guidedButtonClass : ''}
                     >
                       {atomizeStatus?.running
                         ? '原子化中'
@@ -2775,6 +2902,7 @@ export default function App() {
                     size="sm"
                     onClick={() => void downloadAllZip()}
                     disabled={!selectedSpecName || Boolean(busyLabel)}
+                    className={nextAction === 'downloadZip' ? guidedButtonClass : ''}
                   >
                     一键下载（ZIP）
                   </Button>
@@ -3165,49 +3293,74 @@ export default function App() {
             </div>
 
             <div className="relative">
-              <textarea
-                className={`h-[520px] w-full rounded-md border bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent ${
-                  shouldTypewriter ? 'border-slate-600' : 'border-slate-700'
-                }`}
-                value={outputText}
-                onChange={(e) =>
-                  setArtifactContent((prev) => {
-                    if (isAtomicView) return prev;
-                    const nextValue = e.target.value;
-                    const currentValue = prev[activeArtifact] ?? '';
-                    const next = { ...prev, [activeArtifact]: nextValue };
+              {shouldTypewriter ? (
+                <div
+                  ref={(el) => {
+                    outputScrollRef.current = el;
+                  }}
+                  onScroll={handleOutputScroll}
+                  className={`h-[520px] w-full overflow-auto rounded-md border bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none ${
+                    shouldTypewriter ? 'border-slate-600' : 'border-slate-700'
+                  }`}
+                >
+                  <pre className="whitespace-pre-wrap break-words font-sans">
+                    <span>{animatedDisplayHead}</span>
+                    {animatedDisplayTail ? (
+                      <span className="font-mono text-green-400 drop-shadow-[0_0_8px_rgba(34,197,94,0.65)]">
+                        {animatedDisplayTail}
+                      </span>
+                    ) : null}
+                  </pre>
+                </div>
+              ) : (
+                <textarea
+                  ref={(el) => {
+                    outputScrollRef.current = el;
+                  }}
+                  className={`h-[520px] w-full rounded-md border bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent ${
+                    shouldTypewriter ? 'border-slate-600' : 'border-slate-700'
+                  }`}
+                  value={outputText}
+                  onChange={(e) =>
+                    setArtifactContent((prev) => {
+                      if (isAtomicView) return prev;
+                      const nextValue = e.target.value;
+                      const currentValue = prev[activeArtifact] ?? '';
+                      const next = { ...prev, [activeArtifact]: nextValue };
 
-                    if (
-                      selectedSpecName &&
-                      !isApplyingHistoryRef.current &&
-                      nextValue !== currentValue
-                    ) {
-                      const h = historyRef.current[activeArtifact];
-                      h.undo.push(currentValue);
-                      if (h.undo.length > 80) h.undo.shift();
-                      h.redo = [];
-                      setHistoryState((prevState) => ({
-                        ...prevState,
-                        [activeArtifact]: { undo: h.undo.length, redo: 0 },
-                      }));
-                    }
+                      if (
+                        selectedSpecName &&
+                        !isApplyingHistoryRef.current &&
+                        nextValue !== currentValue
+                      ) {
+                        const h = historyRef.current[activeArtifact];
+                        h.undo.push(currentValue);
+                        if (h.undo.length > 80) h.undo.shift();
+                        h.redo = [];
+                        setHistoryState((prevState) => ({
+                          ...prevState,
+                          [activeArtifact]: { undo: h.undo.length, redo: 0 },
+                        }));
+                      }
 
-                    if (selectedSpecName) {
-                      if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
-                      saveTimerRef.current = window.setTimeout(() => {
-                        void saveArtifact(activeArtifact);
-                      }, 900);
-                    }
-                    return next;
-                  })
-                }
-                disabled={!selectedSpecName}
-                readOnly={isAtomicView || Boolean(streamStage)}
-              />
+                      if (selectedSpecName) {
+                        if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+                        saveTimerRef.current = window.setTimeout(() => {
+                          void saveArtifact(activeArtifact);
+                        }, 900);
+                      }
+                      return next;
+                    })
+                  }
+                  disabled={!selectedSpecName}
+                  readOnly={isAtomicView || Boolean(streamStage)}
+                />
+              )}
               {shouldTypewriter && (
                 <div className="pointer-events-none absolute bottom-2 right-2 flex items-center gap-2 rounded-md border border-slate-800 bg-slate-950/80 px-2 py-1 text-xs text-slate-200">
                   <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-300" />
                   <span>{streamStage ? errorStageLabel(streamStage) : '输出中'}</span>
+                  {!outputAutoFollow && <span className="text-slate-500">跟随暂停</span>}
                   <span className="text-slate-400">
                     {outputEtaText ? `剩余约 ${outputEtaText}` : '剩余时间估算中…'}
                   </span>
