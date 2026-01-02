@@ -56,8 +56,8 @@ const SPEC_ARTIFACTS = ['requirements', 'design', 'tasks', 'tasks_atomic'];
 const SPEC_TEMPLATES = {
   requirements: `# 需求（requirements）\n\n## 背景\n\n## 用户故事\n\n## 验收标准（EARS）\n- 当[条件/事件]时，系统应[期望行为]。\n`,
   design: `# 设计（design）\n\n## 架构概览\n\n## 关键流程/时序\n\n## 实现考虑\n`,
-  tasks: `# 任务（tasks）\n\n## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务清单与执行记录入口。\n- AI IDE 应以此文件为唯一事实来源：逐条勾选任务、补充实现要点与验证结果，保持任务与代码同步。\n- 建议工作流：先完成 tasks.md → 再逐步实现代码 → 每完成一项就在此记录（类似 Kiro 的规范驱动开发）。\n\n## 任务清单\n\n- [ ] 1. \n- [ ] 2. \n- [ ] 3. \n`,
-  tasks_atomic: `# 任务原子化（tasks_atomic）\n\n## 使用说明\n- 本文件由 tasks.md 原子化拆解生成，任务粒度更细，适合 AI IDE 逐条执行。\n- 原子化过程会按条追加写入，若中断可再次“开始原子化”继续。\n\n## 原子任务清单\n\n- [ ] 1. \n- [ ] 2. \n- [ ] 3. \n`,
+  tasks: `# 任务（tasks）\n\n## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务总览与回写入口（范围约束 / 验收记录）。\n- AI IDE 开发时优先按 tasks_atomic.md 逐条执行；完成情况与关键变更回写到 tasks.md，保持任务与代码同步。\n- 如发现遗漏或范围变化：先更新 tasks.md，再重新生成 tasks_atomic.md 后继续。\n\n## 任务清单\n\n- [ ] 1. \n- [ ] 2. \n- [ ] 3. \n`,
+  tasks_atomic: `# 任务原子化（tasks_atomic）\n\n## 使用说明\n- 本文件由 tasks.md 原子化拆解生成，作为 AI IDE 开发的首选执行清单（逐条勾选、逐条验收）。\n- 原子化过程会按条追加写入，若中断可再次“开始原子化”继续。\n\n## 原子任务清单\n\n- [ ] 1. \n- [ ] 2. \n- [ ] 3. \n`,
 };
 const DEFAULT_SPEC_STATUS = {
   requirementsConfirmed: false,
@@ -546,6 +546,204 @@ async function callLlm(messages, overrideConfig = null) {
     console.error('LLM call failed:', error?.message || error, error?.llmContext || llmContext);
     throw error;
   }
+}
+
+async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
+  const activeConfig = getActiveLlmConfig();
+  const mergedConfig = overrideConfig ? { ...activeConfig, ...overrideConfig } : activeConfig;
+  const { baseUrl, apiKey, model, responseFormat } = mergedConfig;
+  assertValidLlmConfig(mergedConfig);
+  const llmContext = describeLlmConfig(mergedConfig);
+  const timeoutMsOverride = Number(mergedConfig?.timeoutMs || 0) || null;
+  const onToken = typeof handlers?.onToken === 'function' ? handlers.onToken : null;
+
+  const readResponseTextStream = async (response, onTextChunk) => {
+    const body = response.body;
+    if (!body) return;
+    const decoder = new TextDecoder();
+    if (typeof body.getReader === 'function') {
+      const reader = body.getReader();
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) onTextChunk(decoder.decode(value, { stream: true }));
+      }
+      const tail = decoder.decode();
+      if (tail) onTextChunk(tail);
+      return;
+    }
+    // Fallback for Node streams / async iterables.
+    for await (const chunk of body) {
+      if (chunk) onTextChunk(decoder.decode(chunk, { stream: true }));
+    }
+    const tail = decoder.decode();
+    if (tail) onTextChunk(tail);
+  };
+
+  const tryOnce = async (rootUrl) => {
+    const url = `${String(rootUrl || '').replace(/\/$/, '')}/chat/completions`;
+    const controller = new AbortController();
+    const timeoutMs = timeoutMsOverride || Number(process.env.LLM_TIMEOUT_MS || 60000);
+    const hardTimeout = new Promise((_, reject) => {
+      const timer = setTimeout(() => {
+        controller.abort();
+        const err = new Error(`LLM request timeout after ${timeoutMs}ms`);
+        err.llmContext = llmContext;
+        reject(err);
+      }, timeoutMs);
+      timer.unref?.();
+    });
+
+    const body = {
+      model,
+      temperature: 0.3,
+      messages,
+      stream: true,
+      stream_options: { include_usage: false },
+    };
+    if (responseFormat && responseFormat !== 'none' && responseFormat !== 'text') {
+      body.response_format = { type: responseFormat };
+    }
+
+    const requestPromise = (async () => {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        const message = text ? `${response.status}: ${text}` : `${response.status}`;
+        const err = new Error(`LLM request failed: ${message}`);
+        err.llmContext = llmContext;
+        throw err;
+      }
+
+      // Some gateways ignore stream=true and still return a JSON payload.
+      const contentType = String(response.headers.get('content-type') || '');
+      if (/application\/json/i.test(contentType)) {
+        const data = await response.json();
+        const content = data?.choices?.[0]?.message?.content;
+        if (!content || typeof content !== 'string') {
+          const err = new Error('LLM response empty');
+          err.llmContext = llmContext;
+          throw err;
+        }
+        onToken?.(content);
+        return content.trim();
+      }
+
+      let buffer = '';
+      let full = '';
+      const emitDelta = (delta) => {
+        if (typeof delta !== 'string' || !delta) return;
+        full += delta;
+        onToken?.(delta);
+      };
+
+      await readResponseTextStream(response, (chunk) => {
+        buffer += chunk;
+        // Parse SSE line-by-line. We only care about `data:` lines.
+        while (true) {
+          const idx = buffer.indexOf('\n');
+          if (idx < 0) break;
+          let line = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 1);
+          if (line.endsWith('\r')) line = line.slice(0, -1);
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          if (!trimmed.startsWith('data:')) continue;
+          const dataText = trimmed.slice('data:'.length).trim();
+          if (!dataText) continue;
+          if (dataText === '[DONE]') return;
+          let payload;
+          try {
+            payload = JSON.parse(dataText);
+          } catch {
+            continue;
+          }
+          const delta = payload?.choices?.[0]?.delta?.content;
+          emitDelta(delta);
+        }
+      });
+
+      if (!full.trim()) {
+        const err = new Error('LLM response empty');
+        err.llmContext = llmContext;
+        throw err;
+      }
+      return full.trim();
+    })();
+
+    try {
+      return await Promise.race([requestPromise, hardTimeout]);
+    } catch (error) {
+      if (error?.name === 'AbortError') {
+        const err = new Error(`LLM request timeout after ${timeoutMs}ms`);
+        err.llmContext = llmContext;
+        throw err;
+      }
+      throw error;
+    }
+  };
+
+  const withV1Fallback = async () => {
+    const trimmed = String(baseUrl || '').replace(/\/$/, '');
+    const v1Url = trimmed.endsWith('/v1') ? trimmed : `${trimmed}/v1`;
+    try {
+      return await tryOnce(trimmed);
+    } catch (error) {
+      if (trimmed === v1Url) throw error;
+      try {
+        return await tryOnce(v1Url);
+      } catch {
+        throw error;
+      }
+    }
+  };
+
+  try {
+    return await withV1Fallback();
+  } catch (error) {
+    console.error('LLM call failed:', error?.message || error, error?.llmContext || llmContext);
+    throw error;
+  }
+}
+
+function isNdjsonStreamRequest(req) {
+  const value = req?.query?.stream;
+  if (value === '1' || value === 1 || value === true) return true;
+  const header = String(req?.headers?.['x-stream'] || '').trim();
+  return header === '1' || header.toLowerCase() === 'true';
+}
+
+function createNdjsonStream(res) {
+  res.status(200);
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  let ended = false;
+  const write = (payload) => {
+    if (ended || res.writableEnded) return;
+    try {
+      res.write(`${JSON.stringify(payload)}\n`);
+    } catch {
+      // Ignore serialization errors to keep the stream alive.
+    }
+  };
+  const end = () => {
+    if (ended || res.writableEnded) return;
+    ended = true;
+    res.end();
+  };
+  return { write, end };
 }
 
 function sanitizeSpecName(name) {
@@ -1278,7 +1476,7 @@ function ensureTechStackClarificationsSeeded(specName, status, prompt, designMar
   return { changed: true, status: next };
 }
 
-async function generateClarificationsWithModel(prompt) {
+async function generateClarificationsWithModel(prompt, options = {}) {
   assertValidLlmConfig(getActiveLlmConfig());
 
   const isBadQuestionText = (text) => {
@@ -1305,16 +1503,32 @@ async function generateClarificationsWithModel(prompt) {
   try {
     const promptConfig = loadPromptConfig();
     const stage = promptConfig.stages.requirementsClarifications;
-    const content = await callLlm([
-      {
-        role: 'system',
-        content: applyPromptTemplate(stage.system, { prompt }),
-      },
-      {
-        role: 'user',
-        content: applyPromptTemplate(stage.user, { prompt }),
-      },
-    ]);
+    const onToken = typeof options?.onToken === 'function' ? options.onToken : null;
+    const content = onToken
+      ? await callLlmStream(
+          [
+            {
+              role: 'system',
+              content: applyPromptTemplate(stage.system, { prompt }),
+            },
+            {
+              role: 'user',
+              content: applyPromptTemplate(stage.user, { prompt }),
+            },
+          ],
+          null,
+          { onToken },
+        )
+      : await callLlm([
+          {
+            role: 'system',
+            content: applyPromptTemplate(stage.system, { prompt }),
+          },
+          {
+            role: 'user',
+            content: applyPromptTemplate(stage.user, { prompt }),
+          },
+        ]);
     const payload = tryParseJson(content);
     if (!payload) throw new Error(`LLM output not JSON: ${String(content).slice(0, 200)}`);
     const normalized = normalizeRequirementsClarifications(payload);
@@ -1555,7 +1769,7 @@ function buildDesignMarkdown(prompt, payload) {
 
 function buildTasksMarkdown(prompt, payload) {
   const fallbackSummary = normalizePrompt(prompt);
-  const guide = `## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务清单与执行记录入口。\n- AI IDE 应以此文件为唯一事实来源：逐条勾选任务、补充实现要点与验证结果，保持任务与代码同步。\n- 建议工作流：先完成 tasks.md → 再逐步实现代码 → 每完成一项就在此记录（类似 Kiro 的规范驱动开发）。\n\n## 任务清单`;
+  const guide = `## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务总览与回写入口（范围约束 / 验收记录）。\n- AI IDE 开发时优先按 tasks_atomic.md（原子化任务表单）逐条执行；完成情况与关键变更回写到 tasks.md，保持任务与代码同步。\n- 如发现遗漏或范围变化：先更新 tasks.md，再重新生成 tasks_atomic.md 后继续。\n\n## 任务清单`;
 
   const rawTasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
   const tasks = rawTasks
@@ -1598,21 +1812,37 @@ function buildTasksMarkdown(prompt, payload) {
   return `# 任务（tasks）\n\n${guide}\n\n${blocks}\n`;
 }
 
-async function generateRequirementsWithModel(prompt) {
+async function generateRequirementsWithModel(prompt, options = {}) {
   assertValidLlmConfig(getActiveLlmConfig());
 
   const promptConfig = loadPromptConfig();
   const stage = promptConfig.stages.requirements;
-  const content = await callLlm([
-    {
-      role: 'system',
-      content: applyPromptTemplate(stage.system, { prompt }),
-    },
-    {
-      role: 'user',
-      content: applyPromptTemplate(stage.user, { prompt }),
-    },
-  ]);
+  const onToken = typeof options?.onToken === 'function' ? options.onToken : null;
+  const content = onToken
+    ? await callLlmStream(
+        [
+          {
+            role: 'system',
+            content: applyPromptTemplate(stage.system, { prompt }),
+          },
+          {
+            role: 'user',
+            content: applyPromptTemplate(stage.user, { prompt }),
+          },
+        ],
+        null,
+        { onToken },
+      )
+    : await callLlm([
+        {
+          role: 'system',
+          content: applyPromptTemplate(stage.system, { prompt }),
+        },
+        {
+          role: 'user',
+          content: applyPromptTemplate(stage.user, { prompt }),
+        },
+      ]);
 
   const payload = tryParseJson(content);
   if (!payload) {
@@ -1646,21 +1876,37 @@ function resolveDesignPrompt(prompt, requirements) {
   return normalizePrompt(requirements);
 }
 
-async function generateDesignWithModel(requirements, prompt) {
+async function generateDesignWithModel(requirements, prompt, options = {}) {
   assertValidLlmConfig(getActiveLlmConfig());
 
   const promptConfig = loadPromptConfig();
   const stage = promptConfig.stages.design;
-  const content = await callLlm([
-    {
-      role: 'system',
-      content: applyPromptTemplate(stage.system, { requirements, prompt }),
-    },
-    {
-      role: 'user',
-      content: applyPromptTemplate(stage.user, { requirements, prompt }),
-    },
-  ]);
+  const onToken = typeof options?.onToken === 'function' ? options.onToken : null;
+  const content = onToken
+    ? await callLlmStream(
+        [
+          {
+            role: 'system',
+            content: applyPromptTemplate(stage.system, { requirements, prompt }),
+          },
+          {
+            role: 'user',
+            content: applyPromptTemplate(stage.user, { requirements, prompt }),
+          },
+        ],
+        null,
+        { onToken },
+      )
+    : await callLlm([
+        {
+          role: 'system',
+          content: applyPromptTemplate(stage.system, { requirements, prompt }),
+        },
+        {
+          role: 'user',
+          content: applyPromptTemplate(stage.user, { requirements, prompt }),
+        },
+      ]);
   const payload = tryParseJson(content);
   if (!payload) {
     throw new Error(`LLM design output not JSON: ${String(content).slice(0, 200)}`);
@@ -1835,7 +2081,7 @@ function shouldSplitFurther(tasks) {
   return tasks.some((t) => pattern.test(`${t.title} ${t.core} ${t.details}`));
 }
 
-async function generateTasksWithModel(design, prompt) {
+async function generateTasksWithModel(design, prompt, options = {}) {
   assertValidLlmConfig(getActiveLlmConfig());
 
   const minTasks = Number(process.env.LLM_TASK_MIN || 8);
@@ -1845,19 +2091,35 @@ async function generateTasksWithModel(design, prompt) {
   const promptConfig = loadPromptConfig();
   const stage = promptConfig.stages.tasks;
 
-  const content = await callLlm(
-    [
-      {
-        role: 'system',
-        content: applyPromptTemplate(stage.system, { design, prompt, minTasks, maxTasks }),
-      },
-      {
-        role: 'user',
-        content: applyPromptTemplate(stage.user, { design, prompt, minTasks, maxTasks }),
-      },
-    ],
-    { timeoutMs },
-  );
+  const onToken = typeof options?.onToken === 'function' ? options.onToken : null;
+  const content = onToken
+    ? await callLlmStream(
+        [
+          {
+            role: 'system',
+            content: applyPromptTemplate(stage.system, { design, prompt, minTasks, maxTasks }),
+          },
+          {
+            role: 'user',
+            content: applyPromptTemplate(stage.user, { design, prompt, minTasks, maxTasks }),
+          },
+        ],
+        { timeoutMs },
+        { onToken },
+      )
+    : await callLlm(
+        [
+          {
+            role: 'system',
+            content: applyPromptTemplate(stage.system, { design, prompt, minTasks, maxTasks }),
+          },
+          {
+            role: 'user',
+            content: applyPromptTemplate(stage.user, { design, prompt, minTasks, maxTasks }),
+          },
+        ],
+        { timeoutMs },
+      );
 
   const payload = tryParseJson(content);
   const rawTasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
@@ -2361,17 +2623,29 @@ function listSpecs() {
     });
 }
 
-async function createSpecTemplates(name, artifacts = ['requirements'], prompt = '') {
+async function createSpecTemplates(name, artifacts = ['requirements'], prompt = '', options = {}) {
   fs.mkdirSync(resolveSpecDir(name), { recursive: true });
   ensureSpecStatus(name, prompt ? { prompt } : null);
+  const onLlmToken = typeof options?.onLlmToken === 'function' ? options.onLlmToken : null;
+  const onStage = typeof options?.onStage === 'function' ? options.onStage : null;
   for (const artifact of artifacts) {
     if (SPEC_ARTIFACTS.includes(artifact)) {
       if (artifact === 'requirements') {
-        const content = await generateRequirementsWithModel(prompt);
+        onStage?.('requirements', 'start');
+        const content = await generateRequirementsWithModel(prompt, {
+          onToken: onLlmToken ? (delta) => onLlmToken('requirements', delta) : null,
+        });
+        onStage?.('requirements', 'end');
         writeSpecFile(name, artifact, content);
         const status = readSpecStatus(name);
         ensureRequirementsReviewSeeded(name, status, content);
-        const clarifications = await generateClarificationsWithModel(prompt);
+        onStage?.('requirementsClarifications', 'start');
+        const clarifications = await generateClarificationsWithModel(prompt, {
+          onToken: onLlmToken
+            ? (delta) => onLlmToken('requirementsClarifications', delta)
+            : null,
+        });
+        onStage?.('requirementsClarifications', 'end');
         const normalizedClarifications = normalizeRequirementsClarifications(clarifications);
         const nextStatus = readSpecStatus(name);
         nextStatus.requirementsClarifications = {
@@ -2868,6 +3142,44 @@ app.get('/specs', (req, res) => {
 app.post('/specs', async (req, res) => {
   const prompt = normalizePrompt(req.body?.prompt);
   let specName = sanitizeSpecName(req.body?.name);
+  const wantsStream = isNdjsonStreamRequest(req);
+
+  if (wantsStream) {
+    const stream = createNdjsonStream(res);
+    if (!specName) {
+      if (!prompt) {
+        stream.write({ type: 'error', error: 'Invalid spec name', status: 400 });
+        stream.end();
+        return;
+      }
+      specName = generateSpecName(prompt);
+    }
+    stream.write({ type: 'meta', action: 'spec:create', specName });
+    try {
+      await createSpecTemplates(specName, ['requirements'], prompt, {
+        onStage: (stage, state) => stream.write({ type: 'stage', stage, state }),
+        onLlmToken: (stage, delta) => stream.write({ type: 'delta', stage, delta }),
+      });
+    } catch (error) {
+      console.error('Spec generation failed:', error?.message || error);
+      stream.write({
+        type: 'error',
+        error: error?.message || 'Spec generation failed',
+        context: error?.llmContext || null,
+        status: 502,
+      });
+      stream.end();
+      return;
+    }
+    emitEvent('log:append', {
+      source: 'spec',
+      message: `[spec] created ${specName}`,
+    });
+    stream.write({ type: 'result', data: { name: specName } });
+    stream.end();
+    return;
+  }
+
   if (!specName) {
     if (!prompt) {
       return res.status(400).json({ error: 'Invalid spec name' });
@@ -2988,9 +3300,24 @@ app.post('/specs/:name/confirm', async (req, res) => {
   const specName = sanitizeSpecName(req.params.name);
   const artifact = req.body?.artifact;
   const force = req.body?.force === true;
+  const wantsStream = isNdjsonStreamRequest(req);
+  const stream = wantsStream ? createNdjsonStream(res) : null;
+  const respondError = (httpStatus, message, extra = null) => {
+    const payload = { error: message };
+    if (extra && typeof extra === 'object') Object.assign(payload, extra);
+    if (stream) {
+      stream.write({ type: 'error', status: httpStatus, ...payload });
+      stream.end();
+      return;
+    }
+    return res.status(httpStatus).json(payload);
+  };
+
   if (!specName || !SPEC_ARTIFACTS.includes(artifact)) {
-    return res.status(400).json({ error: 'Invalid spec request' });
+    return respondError(400, 'Invalid spec request');
   }
+
+  stream?.write({ type: 'meta', action: 'spec:confirm', specName, artifact, force });
 
   let status = readSpecStatus(specName);
 
@@ -3008,7 +3335,7 @@ app.post('/specs/:name/confirm', async (req, res) => {
       );
     }
     if (!areClarificationsComplete(status.requirementsClarifications)) {
-      return res.status(409).json({ error: 'Requirements clarifications incomplete' });
+      return respondError(409, 'Requirements clarifications incomplete');
     }
     const now = new Date().toISOString();
     status.requirementsReview = {
@@ -3038,7 +3365,18 @@ app.post('/specs/:name/confirm', async (req, res) => {
         ]
           .filter(Boolean)
           .join('\n\n');
-        const content = await generateDesignWithModel(requirementsContent, supplementalPrompt);
+        stream?.write({ type: 'stage', stage: 'design', state: 'start' });
+        const content = await generateDesignWithModel(
+          requirementsContent,
+          supplementalPrompt,
+          stream
+            ? {
+                onToken: (delta) =>
+                  stream.write({ type: 'delta', stage: 'design', delta }),
+              }
+            : null,
+        );
+        stream?.write({ type: 'stage', stage: 'design', state: 'end' });
         writeSpecFile(specName, 'design', content);
         status.lastError = null;
 
@@ -3046,14 +3384,17 @@ app.post('/specs/:name/confirm', async (req, res) => {
         recordSpecError(status, 'design', error, null);
         writeSpecStatus(specName, status);
         console.error('Design generation failed:', error?.message || error);
-        return res.status(502).json({ error: error?.message || 'Design generation failed' });
+        return respondError(502, error?.message || 'Design generation failed', {
+          stage: 'design',
+          context: error?.llmContext || null,
+        });
       }
     }
   }
 
   if (artifact === 'design') {
     if (!status.requirementsConfirmed) {
-      return res.status(409).json({ error: 'Requirements not confirmed' });
+      return respondError(409, 'Requirements not confirmed');
     }
     const designPath = resolveSpecFile(specName, 'design');
     const designContent = fs.existsSync(designPath) ? fs.readFileSync(designPath, 'utf8') : '';
@@ -3077,7 +3418,7 @@ app.post('/specs/:name/confirm', async (req, res) => {
 
     if (!areClarificationsComplete(status.techStackClarifications)) {
       writeSpecStatus(specName, status);
-      return res.status(409).json({ error: 'Tech stack clarifications incomplete' });
+      return respondError(409, 'Tech stack clarifications incomplete');
     }
 
     const now = new Date().toISOString();
@@ -3096,7 +3437,17 @@ app.post('/specs/:name/confirm', async (req, res) => {
         const supplementalPrompt = [status.prompt, buildTechStackSummary(status.techStackClarifications)]
           .filter(Boolean)
           .join('\n\n');
-        const content = await generateTasksWithModel(designContent, supplementalPrompt);
+        stream?.write({ type: 'stage', stage: 'tasks', state: 'start' });
+        const content = await generateTasksWithModel(
+          designContent,
+          supplementalPrompt,
+          stream
+            ? {
+                onToken: (delta) => stream.write({ type: 'delta', stage: 'tasks', delta }),
+              }
+            : null,
+        );
+        stream?.write({ type: 'stage', stage: 'tasks', state: 'end' });
         writeSpecFile(specName, 'tasks', content);
         status.lastError = null;
 
@@ -3104,14 +3455,18 @@ app.post('/specs/:name/confirm', async (req, res) => {
         recordSpecError(status, 'tasks', error, { timeoutMs: Number(process.env.LLM_TASK_TIMEOUT_MS || 0) || null });
         writeSpecStatus(specName, status);
         console.error('Tasks generation failed:', error?.message || error);
-        return res.status(502).json({ error: error?.message || 'Tasks generation failed' });
+        return respondError(502, error?.message || 'Tasks generation failed', {
+          stage: 'tasks',
+          context: error?.llmContext || null,
+          timeoutMs: Number(process.env.LLM_TASK_TIMEOUT_MS || 0) || null,
+        });
       }
     }
   }
 
   if (artifact === 'tasks') {
     if (!status.designConfirmed) {
-      return res.status(409).json({ error: 'Design not confirmed' });
+      return respondError(409, 'Design not confirmed');
     }
     status.tasksConfirmed = true;
   }
@@ -3121,6 +3476,11 @@ app.post('/specs/:name/confirm', async (req, res) => {
     source: 'spec',
     message: `[spec] confirmed ${specName}/${artifact}`,
   });
+  if (stream) {
+    stream.write({ type: 'result', data: { ok: true, status } });
+    stream.end();
+    return;
+  }
   return res.json({ ok: true, status });
 });
 
