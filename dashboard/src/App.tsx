@@ -119,6 +119,54 @@ function downloadMarkdown(filename: string, content: string) {
   downloadBlob(filename, new Blob([content ?? ''], { type: 'text/markdown;charset=utf-8' }));
 }
 
+function clampNumber(value: number, min: number, max: number) {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, value));
+}
+
+function averageNumber(values: number[]) {
+  const list = Array.isArray(values) ? values.filter((n) => Number.isFinite(n)) : [];
+  if (!list.length) return null;
+  return list.reduce((a, b) => a + b, 0) / list.length;
+}
+
+function formatDurationSeconds(seconds: number | null) {
+  if (seconds == null || !Number.isFinite(seconds)) return '';
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const ss = s % 60;
+  if (m < 60) return `${m}m${String(ss).padStart(2, '0')}s`;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return `${h}h${String(mm).padStart(2, '0')}m`;
+}
+
+function parseIsoMs(value: string | null | undefined) {
+  const t = Date.parse(String(value || ''));
+  return Number.isFinite(t) ? t : null;
+}
+
+function computeThroughputEtaSeconds(input: {
+  total: number;
+  completed: number;
+  startedAt: string | null | undefined;
+}) {
+  const total = Number(input.total);
+  const completed = Number(input.completed);
+  if (!Number.isFinite(total) || !Number.isFinite(completed) || total <= 0) return null;
+  if (completed <= 0 || completed >= total) return 0;
+  const startedMs = parseIsoMs(input.startedAt);
+  if (!startedMs) return null;
+  const elapsedMs = Date.now() - startedMs;
+  if (elapsedMs <= 0) return null;
+  const rate = completed / elapsedMs; // items per ms
+  if (!Number.isFinite(rate) || rate <= 0) return null;
+  const remainingMs = (total - completed) / rate;
+  if (!Number.isFinite(remainingMs) || remainingMs < 0) return null;
+  return Math.ceil(remainingMs / 1000);
+}
+
 async function renderTextToPng(text: string, title: string) {
   const padding = 24;
   const width = 960;
@@ -231,13 +279,20 @@ function buildTechStackMarkdown(questions: ClarificationQuestion[]) {
   lines.push('## 技术栈确认', '');
   questions.forEach((q, i) => {
     const selectedIds = q.answer?.selectedOptionIds ?? [];
-    const selectedLabels = q.options
+    const selectedText = q.options
       .filter((opt) => selectedIds.includes(opt.id))
-      .map((opt) => opt.label)
+      .map((opt) => {
+        const desc = (opt.desc ?? '').trim();
+        const wiki = (opt.wiki ?? '').trim();
+        const parts: string[] = [opt.label];
+        if (desc) parts.push(`— ${desc}`);
+        if (wiki) parts.push(`[Wiki](${wiki})`);
+        return parts.join(' ');
+      })
       .filter(Boolean);
     const otherText = (q.answer?.otherText ?? '').trim();
     lines.push(`### Q${i + 1}. ${q.question}`);
-    lines.push(`- 选择：${selectedLabels.length ? selectedLabels.join('、') : '（未选择）'}`);
+    lines.push(`- 选择：${selectedText.length ? selectedText.join('； ') : '（未选择）'}`);
     if (q.allowOther) lines.push(`- 补充：${otherText ? otherText : '（无）'}`);
     lines.push('');
   });
@@ -529,11 +584,25 @@ export default function App() {
   const [busyLabel, setBusyLabel] = useState<string | null>(null);
   const busyStartedAtRef = useRef<number | null>(null);
   const [busySeconds, setBusySeconds] = useState(0);
+  const [busyProgress, setBusyProgress] = useState<number | null>(null);
+  const [busyEtaSeconds, setBusyEtaSeconds] = useState<number | null>(null);
+  const [busyDetail, setBusyDetail] = useState<string | null>(null);
   const [streamStage, setStreamStage] = useState<string | null>(null);
   const streamStageRef = useRef<string | null>(null);
+  const [streamEtaSeconds, setStreamEtaSeconds] = useState<number | null>(null);
+  const [streamProgress, setStreamProgress] = useState<number | null>(null);
+  const stageStatsRef = useRef<Record<string, { durationsMs: number[]; outputChars: number[] }>>({});
+  const stageRunRef = useRef<{ stage: string | null; startedMs: number | null; outputChars: number }>({
+    stage: null,
+    startedMs: null,
+    outputChars: 0,
+  });
   const streamArtifactRef = useRef<SpecArtifact | null>(null);
   const streamTextRef = useRef('');
   const streamFlushTimerRef = useRef<number | null>(null);
+  const [animatedDisplayContent, setAnimatedDisplayContent] = useState('');
+  const typewriterRef = useRef<{ target: string; current: string }>({ target: '', current: '' });
+  const typewriterTimerRef = useRef<number | null>(null);
   const [toast, setToast] = useState<{ message: string; tone: 'error' | 'info' } | null>(null);
   const toastTimerRef = useRef<number | null>(null);
   const saveTimerRef = useRef<number | null>(null);
@@ -572,6 +641,7 @@ export default function App() {
       if (!evt || typeof evt !== 'object') return;
       if (evt.type === 'stage') {
         const stage = typeof evt.stage === 'string' ? evt.stage : null;
+        const state = typeof evt.state === 'string' ? evt.state : null;
         if (!stage) return;
         streamStageRef.current = stage;
         setStreamStage(stage);
@@ -581,10 +651,25 @@ export default function App() {
           setActiveArtifact(artifact);
           if (artifact === 'tasks') setTaskView('tasks');
         }
-        if (evt.state === 'start') {
+        if (state === 'start') {
+          stageRunRef.current = { stage, startedMs: Date.now(), outputChars: 0 };
           streamTextRef.current = '';
           if (artifact) {
             setArtifactContent((prev) => ({ ...prev, [artifact]: '' }));
+          }
+          setStreamEtaSeconds(null);
+          setStreamProgress(null);
+        }
+        if (state === 'end') {
+          const run = stageRunRef.current;
+          if (run.stage === stage && run.startedMs) {
+            const durationMs = Math.max(0, Date.now() - run.startedMs);
+            const stats = stageStatsRef.current[stage] ?? { durationsMs: [], outputChars: [] };
+            stats.durationsMs.push(durationMs);
+            stats.outputChars.push(Math.max(0, run.outputChars));
+            if (stats.durationsMs.length > 12) stats.durationsMs.shift();
+            if (stats.outputChars.length > 12) stats.outputChars.shift();
+            stageStatsRef.current[stage] = stats;
           }
         }
         return;
@@ -604,6 +689,9 @@ export default function App() {
           if (artifact === 'tasks') setTaskView('tasks');
         }
         streamTextRef.current += delta;
+        if (stageRunRef.current.stage === stage) {
+          stageRunRef.current.outputChars += delta.length;
+        }
         flushStreamToArtifact();
       }
     },
@@ -917,12 +1005,20 @@ export default function App() {
     if (!busyLabel) {
       busyStartedAtRef.current = null;
       setBusySeconds(0);
+      setBusyProgress(null);
+      setBusyEtaSeconds(null);
+      setBusyDetail(null);
+      setStreamEtaSeconds(null);
+      setStreamProgress(null);
       return;
     }
 
     if (!busyStartedAtRef.current) {
       busyStartedAtRef.current = Date.now();
       setBusySeconds(0);
+      setBusyProgress(null);
+      setBusyEtaSeconds(null);
+      setBusyDetail(null);
     }
 
     const t = window.setInterval(() => {
@@ -932,6 +1028,113 @@ export default function App() {
 
     return () => window.clearInterval(t);
   }, [busyLabel]);
+
+  useEffect(() => {
+    if (!busyLabel) return;
+    const timer = window.setInterval(() => {
+      const stage = streamStageRef.current;
+      if (!stage) {
+        setStreamEtaSeconds(null);
+        setStreamProgress(null);
+        return;
+      }
+      const run = stageRunRef.current;
+      const startedMs =
+        run.stage === stage && typeof run.startedMs === 'number' ? run.startedMs : null;
+      if (!startedMs) {
+        setStreamEtaSeconds(null);
+        setStreamProgress(null);
+        return;
+      }
+      const elapsedMs = Math.max(0, Date.now() - startedMs);
+      const stats = stageStatsRef.current[stage] ?? null;
+      const avgDurationMs =
+        averageNumber(stats?.durationsMs ?? []) ??
+        (stage === 'requirements'
+          ? 25000
+          : stage === 'requirementsClarifications'
+            ? 15000
+            : stage === 'design'
+              ? 35000
+              : stage === 'tasks'
+                ? 45000
+                : null);
+      const avgChars =
+        averageNumber(stats?.outputChars ?? []) ??
+        (stage === 'requirements'
+          ? 2500
+          : stage === 'requirementsClarifications'
+            ? 1400
+            : stage === 'design'
+              ? 4500
+              : stage === 'tasks'
+                ? 7000
+                : null);
+
+      const etaFromTimeMs = avgDurationMs != null ? avgDurationMs - elapsedMs : null;
+      const progressFromTime =
+        avgDurationMs != null && avgDurationMs > 0 ? elapsedMs / avgDurationMs : null;
+
+      const outputChars = Math.max(0, Number(run.outputChars) || 0);
+      const speedCharsPerMs = outputChars > 0 && elapsedMs > 0 ? outputChars / elapsedMs : null;
+      const etaFromCharsMs =
+        avgChars != null && speedCharsPerMs != null && speedCharsPerMs > 0
+          ? (avgChars - outputChars) / speedCharsPerMs
+          : null;
+      const progressFromChars = avgChars != null && avgChars > 0 ? outputChars / avgChars : null;
+
+      let etaMs: number | null = null;
+      if (etaFromTimeMs != null && Number.isFinite(etaFromTimeMs)) etaMs = etaFromTimeMs;
+      if (etaFromCharsMs != null && Number.isFinite(etaFromCharsMs)) {
+        const w = clampNumber(
+          avgChars != null && avgChars > 0 ? outputChars / avgChars : 0,
+          0,
+          1,
+        );
+        if (etaMs == null) {
+          etaMs = etaFromCharsMs;
+        } else {
+          etaMs = etaMs * (1 - w) + etaFromCharsMs * w;
+        }
+      }
+
+      let progress: number | null = null;
+      if (progressFromChars != null && Number.isFinite(progressFromChars) && outputChars > 0) {
+        progress = progressFromChars;
+      } else if (progressFromTime != null && Number.isFinite(progressFromTime)) {
+        progress = progressFromTime;
+      }
+
+      setStreamEtaSeconds(
+        etaMs == null || !Number.isFinite(etaMs) ? null : Math.max(0, Math.ceil(etaMs / 1000)),
+      );
+      setStreamProgress(
+        progress == null || !Number.isFinite(progress)
+          ? null
+          : clampNumber(progress, 0, 0.99),
+      );
+    }, 250);
+    return () => window.clearInterval(timer);
+  }, [busyLabel]);
+
+  useEffect(() => {
+    if (!busyLabel) return;
+    if (busyProgress == null) return;
+    if (busyProgress <= 0 || busyProgress >= 1) {
+      setBusyEtaSeconds(null);
+      return;
+    }
+    const startedAt = busyStartedAtRef.current;
+    if (!startedAt) return;
+    const elapsedSeconds = (Date.now() - startedAt) / 1000;
+    if (!Number.isFinite(elapsedSeconds) || elapsedSeconds <= 0) return;
+    const etaSeconds = elapsedSeconds * (1 / busyProgress - 1);
+    if (!Number.isFinite(etaSeconds) || etaSeconds < 0) {
+      setBusyEtaSeconds(null);
+      return;
+    }
+    setBusyEtaSeconds(Math.ceil(etaSeconds));
+  }, [busyLabel, busyProgress]);
 
   useEffect(() => {
     if (!selectedSpec) return;
@@ -1333,6 +1536,8 @@ export default function App() {
     if (!selectedSpecName) return;
     setToast(null);
     setBusyLabel('生成中');
+    setBusyProgress(0.05);
+    setBusyDetail('渲染 PNG…');
     try {
       const isAtomicView = activeArtifact === 'tasks' && taskView === 'atomic';
       const displayArtifact = isAtomicView ? 'tasks_atomic' : activeArtifact;
@@ -1342,8 +1547,11 @@ export default function App() {
         ? tasksAtomicContent
         : artifactContent[activeArtifact] ?? '';
       const blob = await renderTextToPng(content, title);
+      setBusyProgress(0.85);
+      setBusyDetail('准备下载…');
       const base = makeDownloadBaseName(selectedSpecName);
       downloadBlob(`${base}_${displayArtifact}.png`, blob);
+      setBusyProgress(1);
     } catch (e: any) {
       showToast(humanizeError(e));
     } finally {
@@ -1355,10 +1563,20 @@ export default function App() {
     if (!selectedSpecName) return;
     setToast(null);
     setBusyLabel('生成中');
+    setBusyProgress(0.02);
+    setBusyDetail('准备打包…');
     try {
       const zip = new JSZip();
       const base = makeDownloadBaseName(selectedSpecName);
       const folder = zip.folder(base) ?? zip;
+
+      let step = 0;
+      const totalSteps = 12;
+      const bump = (detail: string) => {
+        step += 1;
+        setBusyProgress(Math.min(0.99, step / totalSteps));
+        setBusyDetail(detail);
+      };
       folder.file(
         '使用说明.txt',
         [
@@ -1402,11 +1620,13 @@ export default function App() {
           '',
         ].join('\n'),
       );
+      bump('写入说明…');
       const artifacts: SpecArtifact[] = ['requirements', 'design', 'tasks'];
       for (const a of artifacts) {
         const title = `${selectedSpecName} / ${artifactLabel(a)}`;
         let content = artifactContent[a] ?? '';
         try {
+          bump(`加载 ${a}.md…`);
           const latest = await apiJson<{ content: string }>(
             `/specs/${encodeURIComponent(selectedSpecName)}/${a}`,
           );
@@ -1416,10 +1636,12 @@ export default function App() {
           // Ignore refresh failures and use local snapshot.
         }
         folder.file(`${a}.md`, content);
+        bump(`渲染 ${a}.png…`);
         const png = await renderTextToPng(content, title);
         folder.file(`${a}.png`, png);
       }
       try {
+        bump('加载 tasks_atomic.md…');
         const latest = await apiJson<{ content: string }>(
           `/specs/${encodeURIComponent(selectedSpecName)}/tasks_atomic`,
         );
@@ -1427,20 +1649,48 @@ export default function App() {
         if (atomicContent.trim()) {
           folder.file('tasks_atomic.md', atomicContent);
           const atomicTitle = `${selectedSpecName} / 任务原子化`;
+          bump('渲染 tasks_atomic.png…');
           const png = await renderTextToPng(atomicContent, atomicTitle);
           folder.file('tasks_atomic.png', png);
         }
       } catch {
         // Ignore missing atomic tasks
       }
+
+      try {
+        bump('加载流程报告…');
+        let runId = (activeReportRunId ?? '').trim();
+        if (!runId) {
+          const reportList = await apiJson<{ reports: SpecReportSummary[] }>(
+            `/specs/${encodeURIComponent(selectedSpecName)}/reports`,
+          );
+          runId = (reportList.reports?.[0]?.runId ?? '').trim();
+        }
+        if (runId) {
+          const report = await apiJson<{ reportPath: string | null; content: string }>(
+            `/specs/${encodeURIComponent(selectedSpecName)}/reports/${encodeURIComponent(runId)}/markdown`,
+          );
+          const reportContent = report.content ?? '';
+          if (reportContent.trim()) {
+            bump(`写入流程报告（${runId}）…`);
+            folder.file(`flow_report_${runId}.md`, reportContent);
+          }
+        }
+      } catch {
+        // Ignore missing flow report
+      }
+
+      bump('打包 ZIP…');
       const blob = await zip.generateAsync({ type: 'blob' });
       downloadBlob(`${base}_all.zip`, blob);
+      setBusyProgress(1);
+      setBusyDetail(null);
     } catch (e: any) {
       showToast(humanizeError(e));
     } finally {
       setBusyLabel(null);
     }
-  }, [artifactContent, selectedSpecName]);
+  }, [activeReportRunId, artifactContent, selectedSpecName]);
 
   const updateHistoryState = useCallback((artifact: SpecArtifact) => {
     const h = historyRef.current[artifact];
@@ -1589,6 +1839,65 @@ export default function App() {
   const displayContent = isAtomicView
     ? tasksAtomicContent
     : artifactContent[activeArtifact] ?? '';
+  const shouldTypewriter =
+    Boolean(streamStage) || (isAtomicView && Boolean(atomizeStatus?.running));
+  const atomizeEtaSeconds = computeThroughputEtaSeconds({
+    total: atomizeStatus?.total ?? 0,
+    completed: atomizeStatus?.completed ?? 0,
+    startedAt: atomizeStatus?.startedAt ?? null,
+  });
+  const reportScoreEtaSeconds = computeThroughputEtaSeconds({
+    total: reportScoreStatus?.total ?? 0,
+    completed: reportScoreStatus?.completed ?? 0,
+    startedAt: reportScoreStatus?.startedAt ?? null,
+  });
+  const outputEtaSeconds =
+    streamStage ? streamEtaSeconds : isAtomicView && atomizeStatus?.running ? atomizeEtaSeconds : null;
+  const outputEtaText = formatDurationSeconds(outputEtaSeconds);
+  const busyProgressEffective = busyProgress != null ? busyProgress : streamProgress;
+  const busyEtaSecondsEffective = busyEtaSeconds != null ? busyEtaSeconds : streamEtaSeconds;
+  const busyEtaText = formatDurationSeconds(busyEtaSecondsEffective);
+  const outputText = shouldTypewriter ? animatedDisplayContent : displayContent;
+
+  useEffect(() => {
+    typewriterRef.current.target = displayContent;
+    if (!shouldTypewriter) {
+      typewriterRef.current.current = displayContent;
+      setAnimatedDisplayContent(displayContent);
+      return;
+    }
+    if (!displayContent.startsWith(typewriterRef.current.current)) {
+      typewriterRef.current.current = '';
+      setAnimatedDisplayContent('');
+    }
+  }, [displayContent, shouldTypewriter]);
+
+  useEffect(() => {
+    if (!shouldTypewriter) {
+      if (typewriterTimerRef.current) {
+        window.clearInterval(typewriterTimerRef.current);
+        typewriterTimerRef.current = null;
+      }
+      return;
+    }
+    if (typewriterTimerRef.current) return;
+    const timer = window.setInterval(() => {
+      const target = typewriterRef.current.target;
+      const current = typewriterRef.current.current;
+      if (!target || target.length <= current.length) return;
+      const backlog = target.length - current.length;
+      const cps = Math.min(8000, 1200 + backlog * 4);
+      const chunk = Math.min(backlog, Math.max(1, Math.floor((cps * 50) / 1000)));
+      const next = current + target.slice(current.length, current.length + chunk);
+      typewriterRef.current.current = next;
+      setAnimatedDisplayContent(next);
+    }, 50);
+    typewriterTimerRef.current = timer;
+    return () => {
+      window.clearInterval(timer);
+      typewriterTimerRef.current = null;
+    };
+  }, [shouldTypewriter]);
 
   return (
     <div className="min-h-screen bg-surface text-slate-100">
@@ -1618,27 +1927,6 @@ export default function App() {
             <Button onClick={createSpec} disabled={!rawPrompt.trim() || Boolean(busyLabel)}>
               生成需求
             </Button>
-            <label className="flex flex-wrap items-center gap-2 text-sm text-slate-300">
-              <span>Spec：</span>
-              <select
-                className="h-9 rounded-md border border-slate-700 bg-slate-950 px-2 text-sm text-slate-100"
-                value={selectedSpecName ?? ''}
-                onChange={(e) => {
-                  const name = e.target.value;
-                  setSelectedSpecName(name || null);
-                  setActiveArtifact('requirements');
-                  setTaskView('tasks');
-                }}
-                disabled={Boolean(busyLabel) || !specs.length}
-              >
-                <option value="">（未选择）</option>
-                {specs.map((spec) => (
-                  <option key={spec.name} value={spec.name}>
-                    {spec.name}
-                  </option>
-                ))}
-              </select>
-            </label>
             <div className="ml-auto flex flex-wrap items-center gap-2 text-sm text-slate-300">
               <span>模型：</span>
               <select
@@ -2202,13 +2490,14 @@ export default function App() {
                           {(q.options ?? []).map((opt) => {
                             const selected = q.answer?.selectedOptionIds ?? [];
                             const checked = selected.includes(opt.id);
+                            const inputId = `ts-${q.id}-${opt.id}`;
+                            const wiki = (opt.wiki ?? '').trim();
+                            const desc = (opt.desc ?? '').trim();
                             return (
-                              <label
-                                key={opt.id}
-                                className="flex items-start gap-2 text-sm leading-5 text-slate-200"
-                              >
+                              <div key={opt.id} className="flex items-start gap-2">
                                 <input
                                   type="checkbox"
+                                  id={inputId}
                                   name={`q-${q.id}`}
                                   checked={checked}
                                   className="mt-0.5 h-4 w-4 shrink-0"
@@ -2239,8 +2528,28 @@ export default function App() {
                                     );
                                   }}
                                 />
-                                <span>{opt.label}</span>
-                              </label>
+                                <div className="min-w-0 flex-1">
+                                  <label
+                                    htmlFor={inputId}
+                                    className="cursor-pointer text-sm leading-5 text-slate-200"
+                                  >
+                                    {opt.label}
+                                  </label>
+                                  {desc && (
+                                    <div className="mt-0.5 text-xs text-slate-400">{desc}</div>
+                                  )}
+                                  {wiki && (
+                                    <a
+                                      className="mt-0.5 inline-block text-xs text-slate-400 underline underline-offset-4 hover:text-slate-200"
+                                      href={wiki}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                    >
+                                      Wiki
+                                    </a>
+                                  )}
+                                </div>
+                              </div>
                             );
                           })}
 
@@ -2409,6 +2718,38 @@ export default function App() {
                       : '完成 0/0'}
                   </div>
                 </div>
+                {atomizeStatus?.total ? (
+                  <div className="mt-2">
+                    <div className="h-2 w-full overflow-hidden rounded bg-slate-800">
+                      <div
+                        className="h-full bg-cyan-400 transition-[width] duration-200"
+                        style={{
+                          width: `${Math.max(
+                            2,
+                            Math.min(
+                              100,
+                              Math.round((atomizeStatus.completed / atomizeStatus.total) * 100),
+                            ),
+                          )}%`,
+                        }}
+                      />
+                    </div>
+                    <div className="mt-1 flex items-center justify-between text-xs text-slate-400">
+                      <div>
+                        {Math.round((atomizeStatus.completed / atomizeStatus.total) * 100)}%
+                      </div>
+                      <div>
+                        {atomizeStatus.running
+                          ? atomizeEtaSeconds != null
+                            ? `剩余约 ${formatDurationSeconds(atomizeEtaSeconds)}`
+                            : '剩余时间估算中…'
+                          : atomizeStatus.completed >= atomizeStatus.total
+                            ? '已完成'
+                            : ''}
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
                 <div className="mt-2 h-32 overflow-auto rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-300">
                   {atomizeStatus?.logs?.length ? (
                     atomizeStatus.logs.map((entry, idx) => (
@@ -2561,6 +2902,44 @@ export default function App() {
                             : '完成 0/0'}
                         </div>
                       </div>
+                      {reportScoreStatus.total ? (
+                        <div className="mt-2">
+                          <div className="h-2 w-full overflow-hidden rounded bg-slate-800">
+                            <div
+                              className="h-full bg-cyan-400 transition-[width] duration-200"
+                              style={{
+                                width: `${Math.max(
+                                  2,
+                                  Math.min(
+                                    100,
+                                    Math.round(
+                                      (reportScoreStatus.completed / reportScoreStatus.total) *
+                                        100,
+                                    ),
+                                  ),
+                                )}%`,
+                              }}
+                            />
+                          </div>
+                          <div className="mt-1 flex items-center justify-between text-xs text-slate-400">
+                            <div>
+                              {Math.round(
+                                (reportScoreStatus.completed / reportScoreStatus.total) * 100,
+                              )}
+                              %
+                            </div>
+                            <div>
+                              {reportScoreStatus.running
+                                ? reportScoreEtaSeconds != null
+                                  ? `剩余约 ${formatDurationSeconds(reportScoreEtaSeconds)}`
+                                  : '剩余时间估算中…'
+                                : reportScoreStatus.completed >= reportScoreStatus.total
+                                  ? '已完成'
+                                  : ''}
+                            </div>
+                          </div>
+                        </div>
+                      ) : null}
                       <div className="mt-2 h-24 overflow-auto rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-300">
                         {reportScoreStatus.logs?.length ? (
                           reportScoreStatus.logs.map((entry, idx) => (
@@ -2695,43 +3074,56 @@ export default function App() {
               </div>
             </div>
 
-            <textarea
-              className="h-[520px] w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent"
-              value={displayContent}
-              onChange={(e) =>
-                setArtifactContent((prev) => {
-                  if (isAtomicView) return prev;
-                  const nextValue = e.target.value;
-                  const currentValue = prev[activeArtifact] ?? '';
-                  const next = { ...prev, [activeArtifact]: nextValue };
+            <div className="relative">
+              <textarea
+                className={`h-[520px] w-full rounded-md border bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent ${
+                  shouldTypewriter ? 'border-slate-600' : 'border-slate-700'
+                }`}
+                value={outputText}
+                onChange={(e) =>
+                  setArtifactContent((prev) => {
+                    if (isAtomicView) return prev;
+                    const nextValue = e.target.value;
+                    const currentValue = prev[activeArtifact] ?? '';
+                    const next = { ...prev, [activeArtifact]: nextValue };
 
-                  if (
-                    selectedSpecName &&
-                    !isApplyingHistoryRef.current &&
-                    nextValue !== currentValue
-                  ) {
-                    const h = historyRef.current[activeArtifact];
-                    h.undo.push(currentValue);
-                    if (h.undo.length > 80) h.undo.shift();
-                    h.redo = [];
-                    setHistoryState((prevState) => ({
-                      ...prevState,
-                      [activeArtifact]: { undo: h.undo.length, redo: 0 },
-                    }));
-                  }
+                    if (
+                      selectedSpecName &&
+                      !isApplyingHistoryRef.current &&
+                      nextValue !== currentValue
+                    ) {
+                      const h = historyRef.current[activeArtifact];
+                      h.undo.push(currentValue);
+                      if (h.undo.length > 80) h.undo.shift();
+                      h.redo = [];
+                      setHistoryState((prevState) => ({
+                        ...prevState,
+                        [activeArtifact]: { undo: h.undo.length, redo: 0 },
+                      }));
+                    }
 
-                  if (selectedSpecName) {
-                    if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
-                    saveTimerRef.current = window.setTimeout(() => {
-                      void saveArtifact(activeArtifact);
-                    }, 900);
-                  }
-                  return next;
-                })
-              }
-              disabled={!selectedSpecName}
-              readOnly={isAtomicView || Boolean(streamStage)}
-            />
+                    if (selectedSpecName) {
+                      if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+                      saveTimerRef.current = window.setTimeout(() => {
+                        void saveArtifact(activeArtifact);
+                      }, 900);
+                    }
+                    return next;
+                  })
+                }
+                disabled={!selectedSpecName}
+                readOnly={isAtomicView || Boolean(streamStage)}
+              />
+              {shouldTypewriter && (
+                <div className="pointer-events-none absolute bottom-2 right-2 flex items-center gap-2 rounded-md border border-slate-800 bg-slate-950/80 px-2 py-1 text-xs text-slate-200">
+                  <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-300" />
+                  <span>{streamStage ? errorStageLabel(streamStage) : '输出中'}</span>
+                  <span className="text-slate-400">
+                    {outputEtaText ? `剩余约 ${outputEtaText}` : '剩余时间估算中…'}
+                  </span>
+                </div>
+              )}
+            </div>
           </div>
         </section>
       </main>
@@ -2745,8 +3137,24 @@ export default function App() {
                 {busyLabel}
                 {streamStage ? ` · ${errorStageLabel(streamStage)}` : ''}
               </div>
-              <div className="ml-auto text-xs text-slate-400">{busySeconds}s</div>
+              <div className="ml-auto text-xs text-slate-400">
+                {formatDurationSeconds(busySeconds)}
+                {busyEtaText ? ` · 剩余约 ${busyEtaText}` : ' · 剩余时间估算中…'}
+              </div>
             </div>
+            {busyProgressEffective != null && (
+              <div className="mt-3 h-2 w-full overflow-hidden rounded bg-slate-800">
+                <div
+                  className="h-full bg-cyan-400 transition-[width] duration-200"
+                  style={{
+                    width: `${Math.max(2, Math.min(100, Math.round(busyProgressEffective * 100)))}%`,
+                  }}
+                />
+              </div>
+            )}
+            {busyDetail && (
+              <div className="mt-2 text-xs text-slate-400">{busyDetail}</div>
+            )}
             <div className="mt-2 text-xs leading-5 text-slate-300">
               <div>生成中…内容会在对应窗口实时出现。</div>
               {busySeconds >= 20 && (

@@ -2,5 +2,48 @@
   "requirementsConfirmed": false,
   "designConfirmed": false,
   "tasksConfirmed": false,
-  "prompt": "?????????"
+  "techStackConfirmed": false,
+  "prompt": "?????????",
+  "requirementsReview": {
+    "notes": "",
+    "points": [
+      {
+        "id": "MU_43uMskE7_kpATuivm9",
+        "start": null,
+        "end": null,
+        "text": "请补充具体用户画像与主要任务（至少3条）。",
+        "note": "",
+        "checked": false,
+        "kind": "story",
+        "createdAt": "2026-01-02T16:04:15.635Z"
+      },
+      {
+        "id": "zZSYvOCpHFF6vsFzWqsJ9",
+        "start": null,
+        "end": null,
+        "text": "当提供完整需求信息时，系统应能据此生成用户故事与验收标准。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.635Z"
+      }
+    ],
+    "updatedAt": "2026-01-02T16:04:15.635Z",
+    "confirmedAt": null
+  },
+  "requirementsClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "techStackClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "lastError": null,
+  "flowReport": {
+    "activeRunId": null,
+    "history": []
+  }
 }

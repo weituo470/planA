@@ -2,5 +2,48 @@
   "requirementsConfirmed": false,
   "designConfirmed": false,
   "tasksConfirmed": false,
-  "prompt": "?????????"
+  "techStackConfirmed": false,
+  "prompt": "?????????",
+  "requirementsReview": {
+    "notes": "",
+    "points": [
+      {
+        "id": "f3UhvldmU2W0f0s0ZvqE1",
+        "start": null,
+        "end": null,
+        "text": "作为用户，我希望能够?????????，以便获得清晰的内容与体验。",
+        "note": "",
+        "checked": false,
+        "kind": "story",
+        "createdAt": "2026-01-02T16:04:15.633Z"
+      },
+      {
+        "id": "0-WMHIc51vXbIJAXv3ONI",
+        "start": null,
+        "end": null,
+        "text": "当提供清晰且完整的需求描述时，系统应生成对应的 user_stories 与 acceptance 列表。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.633Z"
+      }
+    ],
+    "updatedAt": "2026-01-02T16:04:15.633Z",
+    "confirmedAt": null
+  },
+  "requirementsClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "techStackClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "lastError": null,
+  "flowReport": {
+    "activeRunId": null,
+    "history": []
+  }
 }

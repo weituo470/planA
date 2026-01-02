@@ -2,5 +2,78 @@
   "requirementsConfirmed": false,
   "designConfirmed": false,
   "tasksConfirmed": false,
-  "prompt": "???????????"
+  "techStackConfirmed": false,
+  "prompt": "???????????",
+  "requirementsReview": {
+    "notes": "",
+    "points": [
+      {
+        "id": "fMSNbJMHIv-iQ_QaRYIE2",
+        "start": null,
+        "end": null,
+        "text": "作为产品负责人，我希望补充完整的需求描述，以便团队明确目标与范围。",
+        "note": "",
+        "checked": false,
+        "kind": "story",
+        "createdAt": "2026-01-02T16:04:15.622Z"
+      },
+      {
+        "id": "Z_1Y7g_qkUFvxuh19LLAt",
+        "start": null,
+        "end": null,
+        "text": "作为开发人员，我希望获得清晰的验收标准，以便实现并验证功能。",
+        "note": "",
+        "checked": false,
+        "kind": "story",
+        "createdAt": "2026-01-02T16:04:15.622Z"
+      },
+      {
+        "id": "J786rW-wkINknDm7nJRxX",
+        "start": null,
+        "end": null,
+        "text": "当提供需求描述时，系统应记录并展示完整的背景信息。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.622Z"
+      },
+      {
+        "id": "Mg9oXOUowH0S0fWww6jh8",
+        "start": null,
+        "end": null,
+        "text": "当需求描述缺失时，系统应提示需要补充需求与验收标准。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.622Z"
+      },
+      {
+        "id": "TbYVuQ2v2tufN7CY3ZcBM",
+        "start": null,
+        "end": null,
+        "text": "当验收标准提供后，系统应以清晰可检查的条目展示。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.622Z"
+      }
+    ],
+    "updatedAt": "2026-01-02T16:04:15.622Z",
+    "confirmedAt": null
+  },
+  "requirementsClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "techStackClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "lastError": null,
+  "flowReport": {
+    "activeRunId": null,
+    "history": []
+  }
 }

@@ -2,5 +2,78 @@
   "requirementsConfirmed": false,
   "designConfirmed": false,
   "tasksConfirmed": false,
-  "prompt": "?????????"
+  "techStackConfirmed": false,
+  "prompt": "?????????",
+  "requirementsReview": {
+    "notes": "",
+    "points": [
+      {
+        "id": "0QTCq-XbyT_vjFbaaqRLp",
+        "start": null,
+        "end": null,
+        "text": "作为用户，我希望能够?????????，以便获得清晰的内容与体验。",
+        "note": "",
+        "checked": false,
+        "kind": "story",
+        "createdAt": "2026-01-02T16:04:15.636Z"
+      },
+      {
+        "id": "lcKUz1SrkKnxSHH8PMwmc",
+        "start": null,
+        "end": null,
+        "text": "当用户提交需求描述时，系统应在 2 秒内生成对应的验收标准列表。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.636Z"
+      },
+      {
+        "id": "KjCuXBmqjhucFDpyXOWw0",
+        "start": null,
+        "end": null,
+        "text": "当系统生成验收标准时，每条验收标准应符合 EARS 语句格式（当…时，系统应…）。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.636Z"
+      },
+      {
+        "id": "iaKvFyEutP2KCnsGWQ6vd",
+        "start": null,
+        "end": null,
+        "text": "当生成验收标准数量不足 3 条时，系统应自动补充到 3 条以上。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.636Z"
+      },
+      {
+        "id": "-0_xis7gCdcJmsq1dcs_6",
+        "start": null,
+        "end": null,
+        "text": "当生成完成时，系统应仅输出 JSON 格式结果且不包含其他文本。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.636Z"
+      }
+    ],
+    "updatedAt": "2026-01-02T16:04:15.636Z",
+    "confirmedAt": null
+  },
+  "requirementsClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "techStackClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "lastError": null,
+  "flowReport": {
+    "activeRunId": null,
+    "history": []
+  }
 }

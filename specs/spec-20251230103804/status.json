@@ -2,5 +2,58 @@
   "requirementsConfirmed": false,
   "designConfirmed": false,
   "tasksConfirmed": false,
-  "prompt": "???????????"
+  "techStackConfirmed": false,
+  "prompt": "???????????",
+  "requirementsReview": {
+    "notes": "",
+    "points": [
+      {
+        "id": "CbxtP08JJc9QS9UfvDIxo",
+        "start": null,
+        "end": null,
+        "text": "作为用户，我希望能够???????????，以便获得清晰的内容与体验。",
+        "note": "",
+        "checked": false,
+        "kind": "story",
+        "createdAt": "2026-01-02T16:04:15.609Z"
+      },
+      {
+        "id": "xOwu4HGHiuQqgDye43Dwi",
+        "start": null,
+        "end": null,
+        "text": "WHEN 用户打开页面",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.609Z"
+      },
+      {
+        "id": "5wXi3vHiz8U-IPVDeAUGY",
+        "start": null,
+        "end": null,
+        "text": "WHEN 用户滚动阅读",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.609Z"
+      }
+    ],
+    "updatedAt": "2026-01-02T16:04:15.609Z",
+    "confirmedAt": null
+  },
+  "requirementsClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "techStackClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "lastError": null,
+  "flowReport": {
+    "activeRunId": null,
+    "history": []
+  }
 }

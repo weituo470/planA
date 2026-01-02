@@ -2,5 +2,128 @@
   "requirementsConfirmed": false,
   "designConfirmed": false,
   "tasksConfirmed": false,
-  "prompt": "帮我写一个技术博客网页"
+  "techStackConfirmed": false,
+  "prompt": "帮我写一个技术博客网页",
+  "requirementsReview": {
+    "notes": "",
+    "points": [
+      {
+        "id": "psPb5znQBxJQd9gJTUf2U",
+        "start": null,
+        "end": null,
+        "text": "作为读者，我希望在首页看到最新文章列表，以便快速浏览感兴趣的内容。",
+        "note": "",
+        "checked": false,
+        "kind": "story",
+        "createdAt": "2026-01-02T16:04:15.630Z"
+      },
+      {
+        "id": "Z-or3XlVFALCEhdGJWApD",
+        "start": null,
+        "end": null,
+        "text": "作为读者，我希望能按分类和标签筛选文章，以便定位特定主题。",
+        "note": "",
+        "checked": false,
+        "kind": "story",
+        "createdAt": "2026-01-02T16:04:15.630Z"
+      },
+      {
+        "id": "BYJw_7SgKf6b_8JCHAOrS",
+        "start": null,
+        "end": null,
+        "text": "作为读者，我希望在文章页看到目录与代码高亮，以便高效阅读技术内容。",
+        "note": "",
+        "checked": false,
+        "kind": "story",
+        "createdAt": "2026-01-02T16:04:15.630Z"
+      },
+      {
+        "id": "U5PA7joH2iuydyvwdkAIv",
+        "start": null,
+        "end": null,
+        "text": "作为作者，我希望展示作者信息与社交链接，以便建立可信度与交流。",
+        "note": "",
+        "checked": false,
+        "kind": "story",
+        "createdAt": "2026-01-02T16:04:15.630Z"
+      },
+      {
+        "id": "1iERy6_SGStb00rDzZl8y",
+        "start": null,
+        "end": null,
+        "text": "作为移动端用户，我希望页面在小屏设备上自适应，以便舒适阅读。",
+        "note": "",
+        "checked": false,
+        "kind": "story",
+        "createdAt": "2026-01-02T16:04:15.630Z"
+      },
+      {
+        "id": "Azj28xcqficvNoUmTX-Qo",
+        "start": null,
+        "end": null,
+        "text": "When用户访问首页 then 应显示最新文章列表、每篇文章的标题、摘要、发布时间与阅读时长。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.630Z"
+      },
+      {
+        "id": "NYAycUg7D6vJjE1YzjFnS",
+        "start": null,
+        "end": null,
+        "text": "When用户选择分类或标签 then 列表应仅展示匹配的文章且筛选条件可清除。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.630Z"
+      },
+      {
+        "id": "0oBx9o1IEdGRyPzZNb9Yz",
+        "start": null,
+        "end": null,
+        "text": "When用户进入文章详情页 then 应显示文章正文、目录、代码高亮与上一篇/下一篇导航。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.630Z"
+      },
+      {
+        "id": "xF7mBkvPFuVa8ZTsIK4hT",
+        "start": null,
+        "end": null,
+        "text": "When页面在移动端宽度下渲染 then 布局应自适应并保持可读性与可点击性。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.630Z"
+      },
+      {
+        "id": "1Ae-LhrmVcOfTmoOPiSGW",
+        "start": null,
+        "end": null,
+        "text": "When用户查看作者区域 then 应显示头像、姓名、简介与至少一个社交链接。",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.630Z"
+      }
+    ],
+    "updatedAt": "2026-01-02T16:04:15.630Z",
+    "confirmedAt": null
+  },
+  "requirementsClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "techStackClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "lastError": null,
+  "flowReport": {
+    "activeRunId": null,
+    "history": []
+  }
 }

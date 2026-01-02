@@ -2,5 +2,58 @@
   "requirementsConfirmed": false,
   "designConfirmed": false,
   "tasksConfirmed": false,
-  "prompt": "帮我写一个网页"
+  "techStackConfirmed": false,
+  "prompt": "帮我写一个网页",
+  "requirementsReview": {
+    "notes": "",
+    "points": [
+      {
+        "id": "GPQOhzugd6xYBUXSIrfAm",
+        "start": null,
+        "end": null,
+        "text": "作为用户，我希望能够帮我写一个网页，以便获得清晰的内容与体验。",
+        "note": "",
+        "checked": false,
+        "kind": "story",
+        "createdAt": "2026-01-02T16:04:15.612Z"
+      },
+      {
+        "id": "xFvRv3q7xbycTTI9LSaZv",
+        "start": null,
+        "end": null,
+        "text": "WHEN 用户打开页面",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.612Z"
+      },
+      {
+        "id": "mV9HDu3zrOWTM1uMH5GTO",
+        "start": null,
+        "end": null,
+        "text": "WHEN 用户滚动阅读",
+        "note": "",
+        "checked": false,
+        "kind": "acceptance",
+        "createdAt": "2026-01-02T16:04:15.612Z"
+      }
+    ],
+    "updatedAt": "2026-01-02T16:04:15.612Z",
+    "confirmedAt": null
+  },
+  "requirementsClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "techStackClarifications": {
+    "questions": [],
+    "updatedAt": null,
+    "confirmedAt": null
+  },
+  "lastError": null,
+  "flowReport": {
+    "activeRunId": null,
+    "history": []
+  }
 }
