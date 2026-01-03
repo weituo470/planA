@@ -120,7 +120,7 @@ const PROMPT_STAGE_KEYS = [
 ];
 
 const DEFAULT_PROMPT_CONFIG = {
-  version: 1,
+  version: 2,
   stages: {
     requirements: {
       label: '需求生成',
@@ -181,14 +181,16 @@ const DEFAULT_PROMPT_CONFIG = {
 	        '要求：\n' +
 	        '1) 输出为原子级任务，不要摘要，拆到无法再拆；单条任务建议 5-10 分钟内可完成。\n' +
 	        '2) 任务对象字段：title/core/details/ac。\n' +
-	        '3) title 必须以“创建/修改/删除 <相对文件路径>”开头（必须包含扩展名，如 .ts/.tsx/.js/.md/.css）。\n' +
-	        '   - 严禁使用 TBD/待定/占位符；必须给出最终文件路径。\n' +
-	        '   - 若上下文未给出目录结构，请按通用工程约定规划：前端 src/...；后端 src/...；配置在根目录或 config/。\n' +
-	        '4) core/details 必须具体可执行，包含关键导出名/函数名/接口字段/API 路由/组件 Props/CSS 类名；不要写“实现XX”。\n' +
-	        '5) 遵循定义先行：先 types/interfaces/schema/DTO，再业务逻辑，再 UI/交互。\n' +
-	        '6) ac 必须“机器可验证”：写清可检查的客观结果（文件存在、包含某段 export、运行某条命令无报错、接口返回字段等）。\n' +
-	        '7) 禁止自由发挥，保持与上下文一致；若信息不足，先补一条“创建 docs/assumptions.md 记录假设/待确认点”，再继续拆分。\n' +
-	        '8) 简体中文。\n' +
+	        '3) title 必须以“创建/修改/删除 <相对文件路径>”开头，且 <相对文件路径> 必须是动作后的第一个 token（后续说明用“｜”追加）。\n' +
+	        '   - 文件路径必须包含扩展名（.ts/.tsx/.js/.md/.css/.json 等），且必须为最终可用路径。\n' +
+	        '   - 绝对禁止使用 TBD/待定/[path]/占位符。\n' +
+	        '   - 若 {{context}} 中包含“项目结构/文件树”，路径必须优先从中选择；若需新建文件，也必须落在合理目录并与现有结构一致。\n' +
+	        '4) 一条任务只允许涉及 1 个文件；若需要改多个文件，拆成多条。\n' +
+	        '5) core/details 必须具体可执行，包含关键导出名/函数名/接口字段/API 路由/组件 Props/CSS 类名；避免空泛措辞。\n' +
+	        '6) 遵循定义先行：先 types/interfaces/schema/DTO，再业务逻辑，再 UI/交互。\n' +
+	        '7) ac 必须“机器可验证”，至少包含 1 条可执行的验证方式（命令/接口/页面路径/可观察结果）。\n' +
+	        '8) 信息不足时：先补 1 条“创建 docs/assumptions.md”记录假设/待确认点（写清缺失信息），再继续拆分。\n' +
+	        '9) 简体中文。\n' +
 	        '只输出 JSON：{"tasks":[...]}。',
 	    },
     reportScore: {
@@ -217,13 +219,14 @@ const DEFAULT_PROMPT_CONFIG = {
 	        '3) 具体性：是否包含明确文件路径/函数名/变量名/命令/验证步骤\n' +
 	        '4) 顺序合理：是否遵循定义先行，先 types/schema 再逻辑\n' +
 	        '5) 验收清晰：AC 是否可复现、可证明（最好可用 CLI/接口/页面操作验证）\n' +
-	        '6) 路径精确：是否存在 TBD/待定/占位符路径（出现则应显著扣分）\n\n' +
+	        '6) 路径精确：是否存在 TBD/待定/[path]/占位符路径（出现则应显著扣分）\n' +
+	        '7) 可改进性：suggestions 是否足够具体，能直接转化为下一轮生成约束\n\n' +
 	        '请严格只输出 JSON，字段必须包含：\n' +
 	        '- score：0-100 的整数\n' +
 	        '- summary：一句话总评\n' +
 	        '- strengths：3-8 条字符串数组\n' +
         '- weaknesses：3-8 条字符串数组\n' +
-        '- suggestions：3-10 条字符串数组（可落地修改建议）\n',
+        '- suggestions：3-10 条字符串数组（每条以“必须/禁止/确保”开头，可直接作为下一轮约束）\n',
     },
   },
 };
@@ -277,11 +280,46 @@ function normalizePromptConfig(input) {
   };
 }
 
+function migratePromptConfig(normalized) {
+  const defaults = cloneJson(DEFAULT_PROMPT_CONFIG);
+  const current = normalized && typeof normalized === 'object' ? normalized : normalizePromptConfig({});
+  const next = cloneJson(current);
+  let changed = false;
+
+  const atomizeUser = next?.stages?.atomize?.user;
+  if (typeof atomizeUser === 'string' && atomizeUser.includes('路径不确定用 TBD')) {
+    next.stages.atomize.user = defaults.stages.atomize.user;
+    changed = true;
+  }
+
+  const reportScoreUser = next?.stages?.reportScore?.user;
+  if (
+    typeof reportScoreUser === 'string' &&
+    reportScoreUser.includes('评分维度') &&
+    !reportScoreUser.includes('每条以“必须/禁止/确保”开头')
+  ) {
+    next.stages.reportScore.user = defaults.stages.reportScore.user;
+    changed = true;
+  }
+
+  return { changed, config: next };
+}
+
 function loadPromptConfig() {
   if (!fs.existsSync(PROMPT_CONFIG_FILE)) return normalizePromptConfig({});
   try {
     const raw = JSON.parse(fs.readFileSync(PROMPT_CONFIG_FILE, 'utf8'));
-    return normalizePromptConfig(raw);
+    const normalized = normalizePromptConfig(raw);
+    const migrated = migratePromptConfig(normalized);
+    if (migrated.changed) {
+      try {
+        persistPromptConfig(migrated.config);
+      } catch {
+        // ignore migration write failures
+      }
+      return normalizePromptConfig(migrated.config);
+    }
+    return normalized;
   } catch {
     return normalizePromptConfig({});
   }
@@ -3056,16 +3094,16 @@ function buildTasksMarkdown(prompt, payload) {
 
   const fallbackList = [
     {
-      title: `创建 README 任务说明｜文件：TBD｜验证：阅读并确认理解`,
+      title: `创建 docs/ai_ide_guide.md｜验证：阅读并确认理解`,
       core: '补全任务拆解与执行记录的基本说明。',
       details: '说明 tasks.md 的用途与使用方式。',
-      ac: '在仓库中可找到并阅读该说明。',
+      ac: 'docs/ai_ide_guide.md 存在，且可阅读理解。',
     },
     {
-      title: `创建基础结构｜文件：TBD｜验证：启动并能访问页面`,
+      title: `创建 docs/project_skeleton.md｜验证：启动并能访问页面`,
       core: `梳理与“${fallbackSummary}”相关的最小可运行骨架。`,
       details: '包含基本路由/页面/启动脚本。',
-      ac: '本地能启动并访问。',
+      ac: '本地能启动并访问关键页面（以项目实际端口/路由为准）。',
     },
   ];
 
@@ -3275,6 +3313,120 @@ function truncateText(text, maxLen = 1600) {
   return `${value.slice(0, maxLen)}…`;
 }
 
+const REPO_TREE_CACHE = { updatedAtMs: 0, snapshot: '' };
+const REPO_TREE_EXCLUDES = new Set([
+  '.codex',
+  '.git',
+  '.idea',
+  '.runlogs',
+  '.vscode',
+  'node_modules',
+  'dist',
+  'build',
+  'coverage',
+  'logs',
+  '.next',
+  '.turbo',
+  '.cache',
+  'specs',
+]);
+
+function normalizePathForPrompt(value) {
+  return String(value || '').replace(/\\/g, '/');
+}
+
+function shouldExcludeRepoTreeEntry(name) {
+  const entry = String(name || '').trim();
+  if (!entry) return true;
+  if (entry === '.' || entry === '..') return true;
+  if (REPO_TREE_EXCLUDES.has(entry)) return true;
+  if (/^tmp_/i.test(entry)) return true;
+  if (/^\.env(\..+)?$/i.test(entry)) return true;
+  if (/^(llm-config|prompt-config|prompt-presets)\.json$/i.test(entry)) return true;
+  if (/^events\.jsonl$/i.test(entry)) return true;
+  if (/^(id_rsa|id_ed25519)$/i.test(entry)) return true;
+  if (/\.(pem|key|crt)$/i.test(entry)) return true;
+  return false;
+}
+
+function buildRepoTreeSnapshot(rootDir, options = {}) {
+  const root = String(rootDir || '').trim();
+  if (!root) return '';
+
+  const maxDepth = Number.isFinite(options.maxDepth) ? options.maxDepth : 3;
+  const maxEntries = Number.isFinite(options.maxEntries) ? options.maxEntries : 140;
+  const maxChars = Number.isFinite(options.maxChars) ? options.maxChars : 2200;
+  const maxPerDir = Number.isFinite(options.maxPerDir) ? options.maxPerDir : 32;
+
+  const lines = [];
+  let entryCount = 0;
+  let truncated = false;
+
+  const walk = (dir, depth, indent) => {
+    if (truncated) return;
+    if (depth > maxDepth) return;
+
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    const filtered = entries
+      .filter((e) => !shouldExcludeRepoTreeEntry(e?.name))
+      .sort((a, b) => {
+        const ad = a?.isDirectory?.() ? 0 : 1;
+        const bd = b?.isDirectory?.() ? 0 : 1;
+        if (ad !== bd) return ad - bd;
+        return String(a?.name || '').localeCompare(String(b?.name || ''));
+      });
+
+    const shown = filtered.slice(0, maxPerDir);
+    for (const entry of shown) {
+      if (truncated) break;
+      const abs = path.join(dir, entry.name);
+      const rel = normalizePathForPrompt(path.relative(root, abs));
+      const line = `${indent}- ${rel}${entry.isDirectory() ? '/' : ''}`;
+      lines.push(line);
+      entryCount += 1;
+      if (entryCount >= maxEntries || lines.join('\n').length >= maxChars) {
+        truncated = true;
+        break;
+      }
+      if (entry.isDirectory() && depth < maxDepth) {
+        walk(abs, depth + 1, `${indent}  `);
+      }
+      if (entryCount >= maxEntries || lines.join('\n').length >= maxChars) {
+        truncated = true;
+        break;
+      }
+    }
+
+    const remaining = Math.max(0, filtered.length - shown.length);
+    if (remaining > 0 && !truncated) {
+      lines.push(`${indent}- …（${remaining} 项省略）`);
+      entryCount += 1;
+    }
+  };
+
+  walk(root, 1, '');
+
+  const snapshot = lines.join('\n');
+  return snapshot.length > maxChars ? snapshot.slice(0, maxChars) : snapshot;
+}
+
+function getRepoTreeSnapshotForPrompt() {
+  const now = Date.now();
+  if (REPO_TREE_CACHE.snapshot && now - REPO_TREE_CACHE.updatedAtMs < 60_000) {
+    return REPO_TREE_CACHE.snapshot;
+  }
+  const next = buildRepoTreeSnapshot(REPO_DIR, { maxDepth: 3, maxEntries: 140, maxChars: 2200 });
+  REPO_TREE_CACHE.snapshot = next;
+  REPO_TREE_CACHE.updatedAtMs = now;
+  return next;
+}
+
 function parseTaskSummaries(markdown) {
   const lines = normalizeLineEndings(markdown || '').split('\n');
 
@@ -3403,15 +3555,32 @@ function validateAtomicTasks(tasks) {
   if (notChinese) return { ok: false, error: 'not_zh' };
   const invalidAction = normalized.some((t) => !/^(创建|修改|删除)\s+\S+/.test(t.title));
   if (invalidAction) return { ok: false, error: 'invalid_action' };
-  const invalidPath = normalized.some(
-    (t) =>
-      !(
-        /(TBD|待定)/i.test(t.title) ||
-        /[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/.test(t.title) ||
-        /\\/.test(t.title)
-      ),
-  );
-  if (invalidPath) return { ok: false, error: 'no_paths' };
+  const extractPathToken = (title) => {
+    const text = String(title || '').trim();
+    const match = /^(创建|修改|删除)\s+(.+)$/.exec(text);
+    if (!match) return null;
+    const rest = String(match[2] || '').trim();
+    if (!rest) return null;
+    const firstToken = rest.split(/\s+/)[0] || '';
+    const beforePipe = firstToken.split(/[｜|]/)[0] || '';
+    return beforePipe.replace(/[：:，,。;；]+$/g, '').trim() || null;
+  };
+  const hasFileExtension = (pathToken) => {
+    const token = String(pathToken || '').trim().replace(/[/\\]+$/g, '');
+    if (!token) return false;
+    const base = token.split(/[/\\]/).pop() || '';
+    if (!base) return false;
+    if (base.endsWith('.')) return false;
+    return /\.[A-Za-z0-9]{1,8}$/.test(base);
+  };
+  const invalidPath = normalized.some((t) => {
+    const token = extractPathToken(t.title);
+    if (!token) return true;
+    if (/(TBD|待定|\[path\]|占位)/i.test(token)) return true;
+    if (!hasFileExtension(token)) return true;
+    return false;
+  });
+  if (invalidPath) return { ok: false, error: 'invalid_path' };
   return { ok: true, tasks: normalized };
 }
 
@@ -3423,16 +3592,27 @@ function coerceAtomicTasks(tasks) {
     let title = sanitizeModelText(task.title || '', '').trim();
     if (!/^(创建|修改|删除)\s+\S+/.test(title)) {
       const hint = title ? `｜${title}` : '';
-      title = `修改 TBD${hint}`;
+      title = `创建 docs/assumptions.md${hint}`;
     }
-    if (!/(TBD|待定)/i.test(title) && !/[\/]/.test(title)) {
-      const action = title.split(/\s+/)[0] || '修改';
+    if (/(TBD|待定|\[path\]|占位)/i.test(title) || !/\.[A-Za-z0-9]{1,8}\b/.test(title)) {
+      const action = title.split(/\s+/)[0] || '创建';
       const rest = title.replace(/^(创建|修改|删除)\s+\S+/, '').trim();
-      title = `${action} TBD${rest ? ` ${rest}` : ''}`.trim();
+      title = `${action} docs/assumptions.md${rest ? `｜${rest}` : ''}`.trim();
     }
-    const core = sanitizeModelText(task.core || '', 'TBD').trim() || 'TBD';
-    const details = sanitizeModelText(task.details || '', 'TBD').trim() || 'TBD';
-    const ac = sanitizeModelText(task.ac || '', 'TBD').trim() || 'TBD';
+    const core =
+      sanitizeModelText(task.core || '', '记录本段原子化所需假设与待确认点。').trim() ||
+      '记录本段原子化所需假设与待确认点。';
+    const details =
+      sanitizeModelText(
+        task.details || '',
+        '补充：目录结构/入口文件/关键模块位置/接口约束；并给出下一步继续拆解所需信息。',
+      ).trim() ||
+      '补充：目录结构/入口文件/关键模块位置/接口约束；并给出下一步继续拆解所需信息。';
+    const ac =
+      sanitizeModelText(
+        task.ac || '',
+        'docs/assumptions.md 存在，且包含“待确认点”小节与至少 3 条条目。',
+      ).trim() || 'docs/assumptions.md 存在，且包含“待确认点”小节与至少 3 条条目。';
     return { title, core, details, ac };
   });
 }
@@ -3458,8 +3638,16 @@ function splitSummaryForAtomize(summary, maxParts = 3) {
 
 function buildFallbackAtomicTasks(summary) {
   const hint = sanitizeModelText(summary || '', '').trim();
-  const title = hint ? `修改 TBD｜${hint}` : '修改 TBD';
-  return [{ title, core: 'TBD', details: 'TBD', ac: 'TBD' }];
+  const title = hint ? `创建 docs/assumptions.md｜${hint}` : '创建 docs/assumptions.md';
+  return [
+    {
+      title,
+      core: '记录原子化所需的假设与待确认点，避免生成占位符路径。',
+      details:
+        '在 docs/assumptions.md 写入：1) 当前目标/上下文摘要；2) 需要确认的目录结构/技术栈/约束；3) 下一步建议（例如提供入口文件或文件树）。',
+      ac: 'docs/assumptions.md 存在，且包含“待确认点”小节与至少 3 条条目。',
+    },
+  ];
 }
 
 function shouldSplitFurther(tasks) {
@@ -3551,7 +3739,11 @@ async function requestAtomicTasks(payload, designSnippet, timeoutMs, reason = ''
   const stage = promptConfig.stages.atomize;
 
   const isList = Array.isArray(payload?.tasks);
-  const context = designSnippet ? `设计摘要：${designSnippet}\n\n` : '';
+  const repoTree = getRepoTreeSnapshotForPrompt();
+  const structureContext = repoTree
+    ? `项目结构（自动扫描，仅用于文件路径精确化；已过滤 node_modules/dist 等）：\n${repoTree}\n\n`
+    : '';
+  const context = `${structureContext}${designSnippet ? `设计摘要：${designSnippet}\n\n` : ''}`;
   const main = isList
     ? `当前任务列表（JSON）：\n${JSON.stringify(payload.tasks)}\n\n请进一步拆分为更原子任务；若已足够原子则保持。`
     : `原始任务：${payload.summary}\n\n请拆分为无法再拆的原子任务。`;
