@@ -569,6 +569,30 @@ function normalizeLlmUsage(usage) {
   return { promptTokens, completionTokens, totalTokens };
 }
 
+function isRetryableLlmError(error) {
+  const message = String(error?.message || '');
+  if (!message) return false;
+  if (/LLM response empty/i.test(message)) return true;
+  if (/fetch failed/i.test(message)) return true;
+  if (/ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up/i.test(message)) return true;
+  if (/LLM request failed:\s*(429|500|502|503|504)\b/i.test(message)) return true;
+  if (/request timeout after/i.test(message)) return true;
+  return false;
+}
+
+function getLlmRetryLimit() {
+  const raw = Number(process.env.LLM_RETRY_LIMIT);
+  if (!Number.isFinite(raw)) return 1;
+  return Math.max(0, Math.min(3, Math.floor(raw)));
+}
+
+function getLlmRetryDelayMs(attemptIndex) {
+  const baseRaw = Number(process.env.LLM_RETRY_BASE_MS);
+  const base = Number.isFinite(baseRaw) && baseRaw > 0 ? baseRaw : 500;
+  const multiplier = Math.max(1, attemptIndex + 1);
+  return base * multiplier;
+}
+
 async function callLlm(messages, overrideConfig = null, handlers = {}) {
   const activeConfig = getActiveLlmConfig();
   const mergedConfig = overrideConfig ? { ...activeConfig, ...overrideConfig } : activeConfig;
@@ -707,14 +731,15 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
     const url = `${String(rootUrl || '').replace(/\/$/, '')}/chat/completions`;
     const controller = new AbortController();
     const timeoutMs = timeoutMsOverride || Number(process.env.LLM_TIMEOUT_MS || 60000);
+    let hardTimer = null;
     const hardTimeout = new Promise((_, reject) => {
-      const timer = setTimeout(() => {
+      hardTimer = setTimeout(() => {
         controller.abort();
         const err = new Error(`LLM request timeout after ${timeoutMs}ms`);
         err.llmContext = llmContext;
         reject(err);
       }, timeoutMs);
-      timer.unref?.();
+      hardTimer.unref?.();
     });
 
     const body = {
@@ -794,7 +819,10 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
           if (payload?.usage) {
             onUsage?.(normalizeLlmUsage(payload.usage));
           }
-          const delta = payload?.choices?.[0]?.delta?.content;
+          const delta =
+            payload?.choices?.[0]?.delta?.content ??
+            payload?.choices?.[0]?.delta?.text ??
+            payload?.choices?.[0]?.text;
           emitDelta(delta);
         }
       });
@@ -816,6 +844,8 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
         throw err;
       }
       throw error;
+    } finally {
+      if (hardTimer) clearTimeout(hardTimer);
     }
   };
 
@@ -834,12 +864,27 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
     }
   };
 
-  try {
-    return await withV1Fallback();
-  } catch (error) {
-    console.error('LLM call failed:', error?.message || error, error?.llmContext || llmContext);
-    throw error;
+  const retryLimit = getLlmRetryLimit();
+  for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
+    try {
+      return await withV1Fallback();
+    } catch (error) {
+      const canRetry = attempt < retryLimit && isRetryableLlmError(error);
+      if (!canRetry) {
+        console.error('LLM call failed:', error?.message || error, error?.llmContext || llmContext);
+        throw error;
+      }
+      const delayMs = getLlmRetryDelayMs(attempt);
+      console.warn(
+        `[llm] retry ${attempt + 1}/${retryLimit} after ${delayMs}ms: ${error?.message || error}`,
+        error?.llmContext || llmContext,
+      );
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
   }
+  const unreachable = new Error('LLM call retry loop exhausted');
+  unreachable.llmContext = llmContext;
+  throw unreachable;
 }
 
 function isNdjsonStreamRequest(req) {
@@ -5578,8 +5623,21 @@ app.post('/specs/:name/confirm', async (req, res) => {
     const designContent = fs.existsSync(designPath) ? fs.readFileSync(designPath, 'utf8') : '';
 
     const normalizedCategory = normalizeProjectCategoryValue(status.projectCategory);
-    if (!normalizedCategory && status.prompt) {
+    const projectCategoryMeta =
+      status.projectCategoryMeta && typeof status.projectCategoryMeta === 'object'
+        ? status.projectCategoryMeta
+        : null;
+    const projectCategoryMetaSource =
+      projectCategoryMeta && typeof projectCategoryMeta.source === 'string'
+        ? projectCategoryMeta.source
+        : '';
+    const hasLlmProjectCategoryMeta = projectCategoryMetaSource === 'llm';
+    const shouldInferProjectCategory =
+      Boolean(status.prompt) && (!normalizedCategory || !hasLlmProjectCategoryMeta);
+
+    if (shouldInferProjectCategory) {
       try {
+        ensureActiveFlowRun(specName, status, { reason: 'confirm:design' });
         const result = await inferProjectCategoryFromModel(status.prompt, {
           onTelemetry: (attempt) =>
             appendFlowRunStageAttempt(specName, attempt?.stageKey || 'projectCategory', attempt, {
