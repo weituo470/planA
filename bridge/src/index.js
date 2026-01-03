@@ -1181,6 +1181,20 @@ function sanitizeFilenamePart(value, fallback = 'spec') {
   return cleaned.slice(0, 80) || fallback;
 }
 
+function extractPromptExcerpt(prompt, maxLen = 24) {
+  const cleaned = normalizePrompt(prompt).replace(/\s+/g, ' ').trim();
+  if (!cleaned) return '';
+  if (cleaned.length <= maxLen) return cleaned;
+  return cleaned.slice(0, maxLen).trimEnd();
+}
+
+function buildFlowReportFileName(specName, prompt, runId) {
+  const safeSpec = sanitizeFilenamePart(specName, 'spec');
+  const excerpt = extractPromptExcerpt(prompt, 24);
+  const safePrompt = sanitizeFilenamePart(excerpt, safeSpec);
+  return `flow_${safePrompt}_${runId}.md`;
+}
+
 function formatDurationMs(ms) {
   const value = Number(ms);
   if (!Number.isFinite(value) || value < 0) return 'n/a';
@@ -1485,8 +1499,7 @@ function finalizeFlowReport(specName, options = {}) {
   const markdown = buildFlowReportMarkdown(specName, status, run, artifacts);
 
   fs.mkdirSync(DOCS_DIR, { recursive: true });
-  const safeSpec = sanitizeFilenamePart(specName, 'spec');
-  const fileName = `flow_${safeSpec}_${runId}.md`;
+  const fileName = buildFlowReportFileName(specName, status?.prompt || run?.prompt || '', runId);
   const reportPath = path.join(DOCS_DIR, fileName);
   fs.writeFileSync(reportPath, markdown, 'utf8');
 
@@ -1535,8 +1548,7 @@ function refreshFlowReport(specName, runId) {
   const markdown = buildFlowReportMarkdown(specName, status, run, artifacts);
 
   fs.mkdirSync(DOCS_DIR, { recursive: true });
-  const safeSpec = sanitizeFilenamePart(specName, 'spec');
-  const fileName = `flow_${safeSpec}_${id}.md`;
+  const fileName = buildFlowReportFileName(specName, status?.prompt || run?.prompt || '', id);
   const reportPath =
     run.report && typeof run.report === 'object' && typeof run.report.path === 'string' && run.report.path.trim()
       ? run.report.path
@@ -3788,6 +3800,14 @@ function ensureAtomicFile(specName) {
   return filePath;
 }
 
+function resetAtomicFile(specName) {
+  const filePath = resolveSpecFile(specName, 'tasks_atomic');
+  const header = buildTasksAtomicHeader();
+  fs.mkdirSync(resolveSpecDir(specName), { recursive: true });
+  fs.writeFileSync(filePath, `${header}\n`, 'utf8');
+  return filePath;
+}
+
 function validateAtomicTasks(tasks) {
   if (!Array.isArray(tasks) || tasks.length === 0) return { ok: false, error: 'empty' };
   const normalized = tasks.map(normalizeTaskObject).filter(Boolean);
@@ -4086,18 +4106,27 @@ async function requestAtomicTasks(payload, designSnippet, timeoutMs, reason = ''
   return verdict.tasks;
 }
 
-async function atomizeTaskSummary(summary, designSnippet, maxRounds, timeoutMs, telemetry = null) {
+async function atomizeTaskSummary(
+  summary,
+  designSnippet,
+  maxRounds,
+  timeoutMs,
+  telemetry = null,
+  extraReason = '',
+) {
   let currentTasks = null;
   for (let round = 1; round <= maxRounds; round += 1) {
     const roundTelemetry =
       telemetry && typeof telemetry === 'object'
         ? { ...telemetry, meta: { ...(telemetry.meta || {}), round } }
         : telemetry;
+    const roundReason = currentTasks ? `第 ${round} 轮进一步拆分` : '';
+    const reason = [String(extraReason || '').trim(), roundReason].filter(Boolean).join('\n');
     const tasks = await requestAtomicTasks(
       currentTasks ? { tasks: currentTasks } : { summary },
       designSnippet,
       timeoutMs,
-      currentTasks ? `第 ${round} 轮进一步拆分` : '',
+      reason,
       roundTelemetry,
     );
     currentTasks = tasks;
@@ -4116,7 +4145,14 @@ function logAtomize(job, message) {
 }
 
 
-async function atomizeSummaryParts(parts, designSnippet, timeoutMs, job, telemetry = null) {
+async function atomizeSummaryParts(
+  parts,
+  designSnippet,
+  timeoutMs,
+  job,
+  telemetry = null,
+  extraReason = '',
+) {
   const results = [];
   for (let idx = 0; idx < parts.length; idx += 1) {
     const part = parts[idx];
@@ -4125,7 +4161,14 @@ async function atomizeSummaryParts(parts, designSnippet, timeoutMs, job, telemet
         ? { ...telemetry, meta: { ...(telemetry.meta || {}), splitPart: idx + 1, splitParts: parts.length } }
         : telemetry;
     try {
-      const subTasks = await atomizeTaskSummary(part, designSnippet, 1, timeoutMs, partTelemetry);
+      const subTasks = await atomizeTaskSummary(
+        part,
+        designSnippet,
+        1,
+        timeoutMs,
+        partTelemetry,
+        extraReason,
+      );
       results.push(...subTasks);
     } catch (error) {
       if (error?.partialTasks?.length) {
@@ -4140,7 +4183,15 @@ async function atomizeSummaryParts(parts, designSnippet, timeoutMs, job, telemet
   return results;
 }
 
-async function atomizeTaskSummarySafe(summary, designSnippet, maxRounds, timeoutMs, job, telemetry = null) {
+async function atomizeTaskSummarySafe(
+  summary,
+  designSnippet,
+  maxRounds,
+  timeoutMs,
+  job,
+  telemetry = null,
+  extraReason = '',
+) {
   const cleaned = sanitizeModelText(summary || '', '').trim();
   if (!cleaned) return buildFallbackAtomicTasks(summary);
   const needsSplit = cleaned.length > 180;
@@ -4148,12 +4199,26 @@ async function atomizeTaskSummarySafe(summary, designSnippet, maxRounds, timeout
     const parts = splitSummaryForAtomize(cleaned, 3);
     if (parts.length > 1) {
       logAtomize(job, `原始任务过长，拆分为 ${parts.length} 段处理。`);
-      const results = await atomizeSummaryParts(parts, designSnippet, timeoutMs, job, telemetry);
+      const results = await atomizeSummaryParts(
+        parts,
+        designSnippet,
+        timeoutMs,
+        job,
+        telemetry,
+        extraReason,
+      );
       if (results.length) return results;
     }
   }
   try {
-    return await atomizeTaskSummary(cleaned, designSnippet, maxRounds, timeoutMs, telemetry);
+    return await atomizeTaskSummary(
+      cleaned,
+      designSnippet,
+      maxRounds,
+      timeoutMs,
+      telemetry,
+      extraReason,
+    );
   } catch (error) {
     if (error?.partialTasks?.length) {
       logAtomize(job, `原始任务输出不规范（${error.partialReason || 'invalid'}），已自动降级。`);
@@ -4162,7 +4227,14 @@ async function atomizeTaskSummarySafe(summary, designSnippet, maxRounds, timeout
     const parts = splitSummaryForAtomize(cleaned, 3);
     if (parts.length > 1) {
       logAtomize(job, `原始任务拆分为 ${parts.length} 段后重试。`);
-      const results = await atomizeSummaryParts(parts, designSnippet, timeoutMs, job, telemetry);
+      const results = await atomizeSummaryParts(
+        parts,
+        designSnippet,
+        timeoutMs,
+        job,
+        telemetry,
+        extraReason,
+      );
       if (results.length) return results;
     }
     const reason = truncateText(error?.message || String(error || ''), 180);
@@ -4191,13 +4263,68 @@ function normalizeAtomizeBatchSize(input) {
   return Math.min(20, value);
 }
 
+function buildAtomizeIterationReasonFromReport(run, userNote = '') {
+  const note = sanitizeReviewText(userNote, 1800);
+  const ratings = run?.ratings && typeof run.ratings === 'object' ? run.ratings : {};
+  const byModel =
+    ratings?.byModel && typeof ratings.byModel === 'object' ? ratings.byModel : {};
+  const modelIds = LLM_MODEL_OPTIONS.map((m) => String(m?.id || '')).filter(Boolean);
+
+  const blocks = [];
+  const hasAnyModelResult = modelIds.some((id) => Boolean(byModel?.[id]?.result));
+  if (hasAnyModelResult) {
+    blocks.push('多模型评分意见（针对 tasks_atomic.md，作为本次原子化迭代约束）：');
+    modelIds.forEach((modelId) => {
+      const item =
+        byModel?.[modelId] && typeof byModel[modelId] === 'object' ? byModel[modelId] : null;
+      const result = item?.result && typeof item.result === 'object' ? item.result : null;
+      if (!result) return;
+      const score = Number(result.score);
+      const scoreText =
+        Number.isFinite(score) && score >= 0 && score <= 100 ? String(Math.round(score)) : 'n/a';
+      const summary = sanitizeReviewText(String(result.summary || ''), 180) || '（无）';
+      blocks.push(`- ${getModelLabel(modelId)}：${scoreText}/100｜${summary}`);
+      const weaknesses = Array.isArray(result.weaknesses)
+        ? result.weaknesses.map((x) => sanitizeReviewText(String(x || ''), 140)).filter(Boolean)
+        : [];
+      if (weaknesses.length) {
+        blocks.push(`  - 主要问题：${weaknesses.slice(0, 3).join('； ')}`);
+      }
+      const suggestions = Array.isArray(result.suggestions)
+        ? result.suggestions.map((x) => sanitizeReviewText(String(x || ''), 160)).filter(Boolean)
+        : [];
+      if (suggestions.length) {
+        blocks.push('  - 建议：');
+        suggestions.slice(0, 6).forEach((s) => blocks.push(`    - ${s}`));
+      }
+    });
+  }
+
+  if (note) {
+    blocks.push('');
+    blocks.push('用户补充修改意见：');
+    blocks.push(note);
+  }
+
+  const joined = blocks.join('\n').trim();
+  if (!joined) return '';
+  return joined.length > 3600 ? joined.slice(0, 3600) : joined;
+}
+
 async function runAtomizeJob(specName, job, options = {}) {
   try {
     const specDir = resolveSpecDir(specName);
     if (!fs.existsSync(specDir)) throw new Error('Spec not found');
 
     const status = readSpecStatus(specName);
-    ensureActiveFlowRun(specName, status, { reason: 'atomize' });
+    const flowRunReason =
+      typeof options?.flowRunReason === 'string' && options.flowRunReason.trim()
+        ? options.flowRunReason.trim()
+        : 'atomize';
+    ensureActiveFlowRun(specName, status, {
+      reason: flowRunReason,
+      forceNew: options?.forceNewFlowRun === true,
+    });
 
     let canUseModel = true;
     try {
@@ -4219,7 +4346,7 @@ async function runAtomizeJob(specName, job, options = {}) {
           llmContext: describeLlmConfig(getActiveLlmConfig()),
           error: { message: message || 'LLM config unavailable', context: error?.llmContext || null },
         },
-        { reason: 'atomize' },
+        { reason: flowRunReason },
       );
     }
 
@@ -4255,7 +4382,16 @@ async function runAtomizeJob(specName, job, options = {}) {
 
     const designSnippet = truncateText(designMarkdown, 1200);
 
-    const atomicPath = ensureAtomicFile(specName);
+    const iterationReason =
+      typeof options?.iterationReason === 'string' && options.iterationReason.trim()
+        ? options.iterationReason.trim()
+        : '';
+
+    const atomicPath =
+      options?.resetAtomic === true ? resetAtomicFile(specName) : ensureAtomicFile(specName);
+    if (options?.resetAtomic === true) {
+      logAtomize(job, 'tasks_atomic.md 已重置，将重新生成。');
+    }
     const atomicContent = fs.existsSync(atomicPath) ? fs.readFileSync(atomicPath, 'utf8') : '';
     const doneIndices = parseAtomicDoneIndices(atomicContent);
 
@@ -4280,7 +4416,7 @@ async function runAtomizeJob(specName, job, options = {}) {
         },
         error: null,
       },
-      { reason: 'atomize' },
+      { reason: flowRunReason },
     );
 
     const requestedBatchSize = normalizeAtomizeBatchSize(options.batchSize);
@@ -4307,10 +4443,18 @@ async function runAtomizeJob(specName, job, options = {}) {
       const telemetry = {
         meta: { originalIndex: index, originalTask: summary },
         recordAttempt: (attempt) =>
-          appendFlowRunStageAttempt(specName, 'atomize', attempt, { reason: 'atomize' }),
+          appendFlowRunStageAttempt(specName, 'atomize', attempt, { reason: flowRunReason }),
       };
       const atomized = canUseModel
-        ? await atomizeTaskSummarySafe(summary, designSnippet, maxRounds, timeoutMs, job, telemetry)
+        ? await atomizeTaskSummarySafe(
+            summary,
+            designSnippet,
+            maxRounds,
+            timeoutMs,
+            job,
+            telemetry,
+            iterationReason,
+          )
         : buildFallbackAtomicTasks(summary);
       const section = buildAtomicSection(index, summary, atomized);
       fs.appendFileSync(atomicPath, `\n\n${section}\n`, 'utf8');
@@ -4342,7 +4486,7 @@ async function runAtomizeJob(specName, job, options = {}) {
           },
           error: null,
         },
-        { reason: 'atomize' },
+        { reason: flowRunReason },
       );
       try {
         const reportPath = finalizeFlowReport(specName);
@@ -5832,6 +5976,37 @@ app.post('/specs/:name/tasks/atomize', async (req, res) => {
     req.body?.batchSize ?? req.body?.segmentSize ?? req.query?.batchSize,
   );
 
+  const resetAtomic = req.body?.resetAtomic === true || req.body?.reset === true;
+  const iterateFromRunId = sanitizeRunId(
+    req.body?.iterateFromRunId ?? req.body?.fromReportRunId ?? req.body?.reportRunId,
+  );
+  const iterateUserNote = sanitizeReviewText(
+    req.body?.iterateUserNote ?? req.body?.userNote ?? req.body?.note,
+    1800,
+  );
+
+  let iterationReason = '';
+  let flowRunReason = 'atomize';
+  let forceNewFlowRun = false;
+  if (iterateFromRunId) {
+    const baseRun = readFlowRun(specName, iterateFromRunId);
+    iterationReason = baseRun
+      ? buildAtomizeIterationReasonFromReport(baseRun, iterateUserNote)
+      : iterateUserNote
+        ? `用户补充修改意见：\n${iterateUserNote}`
+        : '';
+    flowRunReason = `atomize_iterate_from:${iterateFromRunId}`;
+    forceNewFlowRun = true;
+  } else if (iterateUserNote) {
+    iterationReason = `用户补充修改意见：\n${iterateUserNote}`;
+    flowRunReason = 'atomize_iterate';
+    forceNewFlowRun = true;
+  }
+  if (resetAtomic && !forceNewFlowRun) {
+    flowRunReason = 'atomize_reset';
+    forceNewFlowRun = true;
+  }
+
   const now = new Date().toISOString();
   const job = existing || {
     specName,
@@ -5845,15 +6020,29 @@ app.post('/specs/:name/tasks/atomize', async (req, res) => {
   };
   job.running = true;
   job.error = null;
+  job.startedAt = now;
   job.updatedAt = now;
+  if (resetAtomic || iterateFromRunId || iterateUserNote) job.logs = [];
   atomizeJobs.set(specName, job);
   logAtomize(
     job,
-    `原子化任务已启动${batchSize ? `（分段：${batchSize} 条）` : '（分段：默认）'}`,
+    [
+      `原子化任务已启动${batchSize ? `（分段：${batchSize} 条）` : '（分段：默认）'}`,
+      resetAtomic ? '重置 tasks_atomic' : null,
+      iterateFromRunId ? `迭代自评分报告 ${iterateFromRunId}` : null,
+    ]
+      .filter(Boolean)
+      .join('｜'),
   );
 
   setImmediate(() => {
-    runAtomizeJob(specName, job, { batchSize });
+    runAtomizeJob(specName, job, {
+      batchSize,
+      resetAtomic,
+      forceNewFlowRun,
+      flowRunReason,
+      iterationReason,
+    });
   });
 
   return res.json(getAtomizeStatus(job));

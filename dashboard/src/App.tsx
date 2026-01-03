@@ -108,6 +108,14 @@ function makeDownloadBaseName(specName: string) {
   return safe ? `${DOWNLOAD_PREFIX}_${safe}` : DOWNLOAD_PREFIX;
 }
 
+function basenameFromAnyPath(input: string) {
+  const raw = String(input || '').trim();
+  if (!raw) return '';
+  const normalized = raw.replace(/\\/g, '/');
+  const parts = normalized.split('/').filter(Boolean);
+  return parts[parts.length - 1] ?? '';
+}
+
 function downloadBlob(filename: string, blob: Blob) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -583,6 +591,7 @@ export default function App() {
   const [reportScoreStatus, setReportScoreStatus] = useState<ReportScoreJobStatus | null>(null);
   const [userReportScoreText, setUserReportScoreText] = useState('');
   const [userReportCommentText, setUserReportCommentText] = useState('');
+  const [iterateUserNoteText, setIterateUserNoteText] = useState('');
   const atomizePrevRef = useRef<{
     specName: string | null;
     running: boolean;
@@ -1545,6 +1554,42 @@ export default function App() {
     }
   }, [atomizeBatchSizeText, selectedSpecName, showToast]);
 
+  const startIterateAtomize = useCallback(async () => {
+    if (!selectedSpecName || !activeReportRunId) return;
+    setToast(null);
+    try {
+      setActiveArtifact('tasks');
+      setTaskView('atomic');
+      setTasksAtomicContent('');
+      const batchSize = Math.min(
+        20,
+        Math.max(1, Number.parseInt(atomizeBatchSizeText || '3', 10) || 3),
+      );
+      const data = await apiJson<AtomizeStatus>(
+        `/specs/${encodeURIComponent(selectedSpecName)}/tasks/atomize`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            batchSize,
+            resetAtomic: true,
+            iterateFromRunId: activeReportRunId,
+            iterateUserNote: iterateUserNoteText,
+          }),
+        },
+      );
+      setAtomizeStatus(data);
+      showToast('已启动迭代原子化', 'info');
+    } catch (e: any) {
+      showToast(humanizeError(e));
+    }
+  }, [
+    activeReportRunId,
+    atomizeBatchSizeText,
+    iterateUserNoteText,
+    selectedSpecName,
+    showToast,
+  ]);
+
   useEffect(() => {
     if (!selectedSpecName) {
       atomizePrevRef.current = null;
@@ -1730,7 +1775,9 @@ export default function App() {
           const reportContent = report.content ?? '';
           if (reportContent.trim()) {
             bump(`写入流程报告（${runId}）…`);
-            folder.file(`flow_report_${runId}.md`, reportContent);
+            const reportName =
+              basenameFromAnyPath(report.reportPath ?? '') || `flow_report_${runId}.md`;
+            folder.file(reportName, reportContent);
           }
         }
       } catch {
@@ -3204,6 +3251,128 @@ export default function App() {
                     </div>
                   )}
 
+                <details className="mt-3 rounded-md border border-slate-800 bg-slate-950/30 p-2">
+                  <summary className="cursor-pointer select-none text-xs font-semibold text-slate-200">
+                    各模型详细评价（用于迭代）
+                  </summary>
+                  <div className="mt-2 space-y-3">
+                    {(llm?.options ?? []).map((opt) => {
+                      const item = activeReport?.ratings?.byModel?.[opt.id] ?? null;
+                      const result = item?.result ?? null;
+                      const statusText = item?.ok
+                        ? 'ok'
+                        : item?.skipped
+                          ? 'skipped'
+                          : item?.error
+                            ? 'error'
+                            : '未评分';
+
+                      if (!result) {
+                        return (
+                          <div
+                            key={opt.id}
+                            className="rounded-md border border-slate-800 bg-slate-950/40 p-2 text-xs text-slate-400"
+                          >
+                            <div className="flex flex-wrap items-center gap-2">
+                              <div className="font-semibold text-slate-200">{opt.label}</div>
+                              <div className="text-slate-500">{statusText}</div>
+                            </div>
+                            <div className="mt-1">暂无详细评价</div>
+                          </div>
+                        );
+                      }
+
+                      return (
+                        <div
+                          key={opt.id}
+                          className="rounded-md border border-slate-800 bg-slate-950/40 p-2 text-xs text-slate-200"
+                        >
+                          <div className="flex flex-wrap items-center gap-2">
+                            <div className="font-semibold">{opt.label}</div>
+                            <div className="text-slate-400">{result.score}/100</div>
+                            <div className="text-slate-500">{statusText}</div>
+                          </div>
+                          <div className="mt-1 text-slate-300">
+                            <span className="text-slate-400">总评：</span>
+                            {result.summary || '（无）'}
+                          </div>
+                          <div className="mt-2 grid gap-2 md:grid-cols-3">
+                            <div>
+                              <div className="text-slate-400">优点</div>
+                              {result.strengths?.length ? (
+                                <ul className="mt-1 list-disc space-y-1 pl-5 text-slate-300">
+                                  {result.strengths.slice(0, 8).map((s, idx) => (
+                                    <li key={idx}>{s}</li>
+                                  ))}
+                                </ul>
+                              ) : (
+                                <div className="mt-1 text-slate-500">（无）</div>
+                              )}
+                            </div>
+                            <div>
+                              <div className="text-slate-400">问题</div>
+                              {result.weaknesses?.length ? (
+                                <ul className="mt-1 list-disc space-y-1 pl-5 text-slate-300">
+                                  {result.weaknesses.slice(0, 8).map((s, idx) => (
+                                    <li key={idx}>{s}</li>
+                                  ))}
+                                </ul>
+                              ) : (
+                                <div className="mt-1 text-slate-500">（无）</div>
+                              )}
+                            </div>
+                            <div>
+                              <div className="text-slate-400">建议</div>
+                              {result.suggestions?.length ? (
+                                <ul className="mt-1 list-disc space-y-1 pl-5 text-slate-300">
+                                  {result.suggestions.slice(0, 10).map((s, idx) => (
+                                    <li key={idx}>{s}</li>
+                                  ))}
+                                </ul>
+                              ) : (
+                                <div className="mt-1 text-slate-500">（无）</div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    {!llm?.options?.length && (
+                      <div className="text-xs text-slate-400">模型列表未加载</div>
+                    )}
+                  </div>
+                </details>
+
+                <div className="mt-3 rounded-md border border-slate-800 bg-slate-950/40 p-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="text-xs font-semibold text-slate-200">迭代生成</div>
+                    <div className="ml-auto text-xs text-slate-400">
+                      当前模型：
+                      {llm?.options?.find((o) => o.id === (llm?.model ?? ''))?.label ??
+                        llm?.model ??
+                        '（未选择）'}
+                    </div>
+                  </div>
+                  <div className="mt-1 text-xs text-slate-400">
+                    点击后会收集上面各模型的评价，并重置 tasks_atomic.md 后用当前模型重新原子化。
+                  </div>
+                  <textarea
+                    className="mt-2 h-24 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100"
+                    value={iterateUserNoteText}
+                    onChange={(e) => setIterateUserNoteText(e.target.value)}
+                    placeholder="可选：补充修改意见（例如：必须补齐缺失边界、禁止出现占位路径、AC 必须包含可执行验证命令等）"
+                  />
+                  <div className="mt-2 flex justify-end">
+                    <Button
+                      size="sm"
+                      onClick={() => void startIterateAtomize()}
+                      disabled={!activeReportRunId || Boolean(atomizeStatus?.running)}
+                    >
+                      迭代原子化
+                    </Button>
+                  </div>
+                </div>
+
                 <div className="mt-3 flex flex-wrap items-end gap-2">
                   <label className="flex items-center gap-2 text-xs text-slate-300">
                     <span className="text-slate-400">用户评分</span>
@@ -3268,10 +3437,10 @@ export default function App() {
                         onClick={() => {
                           if (!selectedSpecName || !activeReportRunId) return;
                           const safe = makeDownloadBaseName(selectedSpecName);
-                          downloadMarkdown(
-                            `${safe}_flow_${activeReportRunId}.md`,
-                            reportMarkdown,
-                          );
+                          const fallback = `${safe}_flow_${activeReportRunId}.md`;
+                          const filename =
+                            basenameFromAnyPath(activeReport?.reportPath ?? '') || fallback;
+                          downloadMarkdown(filename, reportMarkdown);
                         }}
                         disabled={!reportMarkdown.trim() || !activeReportRunId}
                       >
