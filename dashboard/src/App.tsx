@@ -1286,7 +1286,14 @@ export default function App() {
     if (!selectedSpecName) return;
     if (atomizeStatus?.running) return;
     if (!atomizeStatus?.total || atomizeStatus.completed < atomizeStatus.total) return;
-    void refreshReports(selectedSpecName).catch((e) => showToast(humanizeError(e)));
+    void refreshReports(selectedSpecName)
+      .then((nextReports) => {
+        const latestRunId = nextReports?.[0]?.runId ?? '';
+        if (!latestRunId) return;
+        setActiveReportRunId(latestRunId);
+        setReportMarkdown('');
+      })
+      .catch((e) => showToast(humanizeError(e)));
   }, [
     atomizeStatus?.completed,
     atomizeStatus?.running,
@@ -3004,7 +3011,15 @@ export default function App() {
                 <div className="flex flex-wrap items-center gap-2">
                   <div className="text-sm font-semibold text-slate-200">原子化日志</div>
                   <div className="text-xs text-slate-400">
-                    {atomizeStatus?.running ? '进行中' : '未运行'}
+                    {atomizeStatus?.running
+                      ? `进行中${
+                          atomizeEtaSeconds != null
+                            ? `｜剩余约 ${formatDurationSeconds(atomizeEtaSeconds)}`
+                            : '｜剩余时间估算中…'
+                        }`
+                      : atomizeStatus?.total && atomizeStatus.completed >= atomizeStatus.total
+                        ? '已完成'
+                        : '未运行'}
                   </div>
                   <div className="ml-auto text-xs text-slate-400">
                     {atomizeStatus?.total
@@ -3033,11 +3048,8 @@ export default function App() {
                         {Math.round((atomizeStatus.completed / atomizeStatus.total) * 100)}%
                       </div>
                       <div>
-                        {atomizeStatus.running
-                          ? atomizeEtaSeconds != null
-                            ? `剩余约 ${formatDurationSeconds(atomizeEtaSeconds)}`
-                            : '剩余时间估算中…'
-                          : atomizeStatus.completed >= atomizeStatus.total
+                        {!atomizeStatus.running &&
+                        atomizeStatus.completed >= atomizeStatus.total
                             ? '已完成'
                             : ''}
                       </div>
@@ -3099,14 +3111,24 @@ export default function App() {
                       size="sm"
                       onClick={() =>
                         activeReportRunId
-                          ? void startReportScoreJob(selectedSpecName, activeReportRunId).then(() => {
+                          ? void startReportScoreJob(
+                              selectedSpecName,
+                              activeReportRunId,
+                              true,
+                            ).then(() => {
                               showToast('已启动评分任务', 'info');
                             }).catch((e) => showToast(humanizeError(e)))
                           : undefined
                       }
                       disabled={!activeReportRunId || reportScoreStatus?.running}
                     >
-                      {reportScoreStatus?.running ? '评分中' : '对全部模型评分'}
+                      {reportScoreStatus?.running
+                        ? '评分中'
+                        : atomizeStatus?.total &&
+                            !atomizeStatus.running &&
+                            atomizeStatus.completed >= atomizeStatus.total
+                          ? '用模型评分'
+                          : '对全部模型评分'}
                     </Button>
                   </div>
                 </div>

@@ -3765,24 +3765,40 @@ function parseAtomicDoneIndices(markdown) {
 }
 
 function formatAtomicTaskBlock(indexLabel, task) {
-  const title = sanitizeModelText(task.title || task.task || task.name || '', 'TBD').trim();
-  const core = sanitizeModelText(task.core || task.logic || '', 'TBD').trim();
-  const details = sanitizeModelText(task.details || task.tech || '', 'TBD').trim();
-  const ac = sanitizeModelText(task.ac || task.acceptance || task.criteria || '', 'TBD').trim();
+  const normalized = normalizeTaskObject(task) || { title: '', core: '', details: '', ac: '' };
+  const title =
+    sanitizeAtomicField(normalized.title, '创建 docs/assumptions.md｜补充原子化缺失信息').trim() ||
+    '创建 docs/assumptions.md｜补充原子化缺失信息';
+  const core =
+    sanitizeAtomicField(
+      normalized.core,
+      '记录原子化所需的假设与待确认点，补齐缺失信息后继续拆解。',
+    ).trim() || '记录原子化所需的假设与待确认点，补齐缺失信息后继续拆解。';
+  const details =
+    sanitizeAtomicField(
+      normalized.details,
+      '在 docs/assumptions.md 写入：1) 当前目标/上下文摘要；2) 需要确认的目录结构/技术栈/约束；3) 下一步建议（例如提供入口文件或文件树）。',
+    ).trim() ||
+    '在 docs/assumptions.md 写入：1) 当前目标/上下文摘要；2) 需要确认的目录结构/技术栈/约束；3) 下一步建议（例如提供入口文件或文件树）。';
+  const ac =
+    sanitizeAtomicField(
+      normalized.ac,
+      'docs/assumptions.md 存在，且包含“待确认点”小节与至少 3 条条目。',
+    ).trim() || 'docs/assumptions.md 存在，且包含“待确认点”小节与至少 3 条条目。';
   return [
-    `- [ ] **Task ${indexLabel}**: ${title || 'TBD'}`,
-    `  - **核心逻辑**: ${core || 'TBD'}`,
-    `  - **技术细节**: ${details || 'TBD'}`,
-    `  - **验收准则 (AC)**: ${ac || 'TBD'}`,
+    `- [ ] **Task ${indexLabel}**: ${title}`,
+    `  - **核心逻辑**: ${core}`,
+    `  - **技术细节**: ${details}`,
+    `  - **验收准则 (AC)**: ${ac}`,
   ].join('\n');
 }
 
 function buildAtomicSection(originalIndex, summary, tasks) {
-  const title = sanitizeModelText(summary, 'TBD');
+  const title = sanitizeAtomicField(summary, '（未命名）');
   const blocks = tasks
     .map((task, idx) => formatAtomicTaskBlock(`${originalIndex}.${idx + 1}`, task))
     .join('\n\n');
-  return `### 原始任务 ${originalIndex}: ${title || 'TBD'}\n\n${blocks}`;
+  return `### 原始任务 ${originalIndex}: ${title || '（未命名）'}\n\n${blocks}`;
 }
 
 function ensureAtomicFile(specName) {
@@ -3808,12 +3824,50 @@ function resetAtomicFile(specName) {
   return filePath;
 }
 
+const ATOMIC_PLACEHOLDER_RE = /\bTBD\b|待定|\[path\]|占位符/i;
+
+function containsAtomicPlaceholder(text) {
+  return ATOMIC_PLACEHOLDER_RE.test(String(text || ''));
+}
+
+function sanitizeAtomicField(value, fallback) {
+  if (!value) return fallback;
+  let text = String(value);
+  text = text.replace(/<think>[\s\S]*?<\/think>/gi, '');
+  text = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(
+      (line) =>
+        line &&
+        !/Requesting clarification/i.test(line) &&
+        !/请提供完整的需求描述/.test(line) &&
+        !/^```/i.test(line),
+    )
+    .join('\n')
+    .trim();
+  if (!text) return fallback;
+  if (/\?{3,}/.test(text) || /？{3,}/.test(text)) return fallback;
+  if (/�/.test(text)) return fallback;
+  if (!/[a-zA-Z0-9\u4e00-\u9fa5]/.test(text)) return fallback;
+  if (containsAtomicPlaceholder(text)) return fallback;
+  return text;
+}
+
 function validateAtomicTasks(tasks) {
   if (!Array.isArray(tasks) || tasks.length === 0) return { ok: false, error: 'empty' };
   const normalized = tasks.map(normalizeTaskObject).filter(Boolean);
   if (!normalized.length) return { ok: false, error: 'invalid_shape' };
   const missingFields = normalized.some((t) => !t.title || !t.core || !t.details || !t.ac);
   if (missingFields) return { ok: false, error: 'missing_fields' };
+  const containsPlaceholder = normalized.some(
+    (t) =>
+      containsAtomicPlaceholder(t.title) ||
+      containsAtomicPlaceholder(t.core) ||
+      containsAtomicPlaceholder(t.details) ||
+      containsAtomicPlaceholder(t.ac),
+  );
+  if (containsPlaceholder) return { ok: false, error: 'contains_placeholder' };
   const notChinese = normalized.some((t) => !looksLikeChinese(t.title + t.core + t.details + t.ac));
   if (notChinese) return { ok: false, error: 'not_zh' };
   const invalidAction = normalized.some((t) => !/^(创建|修改|删除)\s+\S+/.test(t.title));
@@ -3839,12 +3893,22 @@ function validateAtomicTasks(tasks) {
   const invalidPath = normalized.some((t) => {
     const token = extractPathToken(t.title);
     if (!token) return true;
-    if (/(TBD|待定|\[path\]|占位)/i.test(token)) return true;
+    if (/(TBD|待定|\[path\]|占位符)/i.test(token)) return true;
     if (!hasFileExtension(token)) return true;
     return false;
   });
   if (invalidPath) return { ok: false, error: 'invalid_path' };
-  return { ok: true, tasks: normalized };
+  const seen = new Set();
+  const deduped = [];
+  for (const task of normalized) {
+    const key = task.title.replace(/\s+/g, ' ').trim();
+    if (!key) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(task);
+  }
+  if (!deduped.length) return { ok: false, error: 'deduped_empty' };
+  return { ok: true, tasks: deduped };
 }
 
 
@@ -3852,27 +3916,27 @@ function coerceAtomicTasks(tasks) {
   const normalized = Array.isArray(tasks) ? tasks.map(normalizeTaskObject).filter(Boolean) : [];
   if (!normalized.length) return [];
   return normalized.map((task) => {
-    let title = sanitizeModelText(task.title || '', '').trim();
+    let title = sanitizeAtomicField(task.title || '', '').trim();
     if (!/^(创建|修改|删除)\s+\S+/.test(title)) {
       const hint = title ? `｜${title}` : '';
       title = `创建 docs/assumptions.md${hint}`;
     }
-    if (/(TBD|待定|\[path\]|占位)/i.test(title) || !/\.[A-Za-z0-9]{1,8}\b/.test(title)) {
+    if (/(TBD|待定|\[path\]|占位符)/i.test(title) || !/\.[A-Za-z0-9]{1,8}\b/.test(title)) {
       const action = title.split(/\s+/)[0] || '创建';
       const rest = title.replace(/^(创建|修改|删除)\s+\S+/, '').trim();
       title = `${action} docs/assumptions.md${rest ? `｜${rest}` : ''}`.trim();
     }
     const core =
-      sanitizeModelText(task.core || '', '记录本段原子化所需假设与待确认点。').trim() ||
+      sanitizeAtomicField(task.core || '', '记录本段原子化所需假设与待确认点。').trim() ||
       '记录本段原子化所需假设与待确认点。';
     const details =
-      sanitizeModelText(
+      sanitizeAtomicField(
         task.details || '',
         '补充：目录结构/入口文件/关键模块位置/接口约束；并给出下一步继续拆解所需信息。',
       ).trim() ||
       '补充：目录结构/入口文件/关键模块位置/接口约束；并给出下一步继续拆解所需信息。';
     const ac =
-      sanitizeModelText(
+      sanitizeAtomicField(
         task.ac || '',
         'docs/assumptions.md 存在，且包含“待确认点”小节与至少 3 条条目。',
       ).trim() || 'docs/assumptions.md 存在，且包含“待确认点”小节与至少 3 条条目。';
@@ -3905,7 +3969,7 @@ function buildFallbackAtomicTasks(summary) {
   return [
     {
       title,
-      core: '记录原子化所需的假设与待确认点，避免生成占位符路径。',
+      core: '记录原子化所需的假设与待确认点，补齐缺失信息后继续拆解。',
       details:
         '在 docs/assumptions.md 写入：1) 当前目标/上下文摘要；2) 需要确认的目录结构/技术栈/约束；3) 下一步建议（例如提供入口文件或文件树）。',
       ac: 'docs/assumptions.md 存在，且包含“待确认点”小节与至少 3 条条目。',
