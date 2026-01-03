@@ -85,6 +85,7 @@ type SpecReportSummary = {
 };
 
 const PROMPT_STAGE_ORDER = [
+  { key: 'projectCategory', label: '项目类型识别' },
   { key: 'requirements', label: '需求生成' },
   { key: 'requirementsClarifications', label: '需求确认问题生成' },
   { key: 'design', label: '设计生成' },
@@ -171,12 +172,14 @@ function computeThroughputEtaSeconds(input: {
 }
 
 const MATRIX_GLYPHS =
-  '░▒▓█▌▐▀▄▖▗▘▙▚▛▜▝▞▟' +
-  '┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬═║' +
+  '░▒▓█▇▆▅▄▃▂▁▔▕▖▗▘▙▚▛▜▝▞▟' +
+  '┌┍┎┏┐┑┒┓└┕┖┗┘┙┚┛├┝┞┟┠┡┢┣┤┥┦┧┨┩┪┫┬┭┮┯┰┱┲┳┴┵┶┷┸┹┺┻┼┽┾┿╀╁╂╃╄╅╆╇╈╉╊╋╔╗╚╝╠╣╦╩╬═║' +
   '◆◇◈◉◎●○◊◌◍◐◑◒◓◔◕' +
-  '☰☱☲☳☴☵☶☷' +
+  '⠁⠂⠃⠄⠅⠆⠇⠈⠉⠊⠋⠌⠍⠎⠏⠐⠑⠒⠓⠔⠕⠖⠗⠘⠙⠚⠛⠜⠝⠞⠟' +
   '⌁⌂⌃⌄⌅⌆⌇⌈⌉⌊⌋⌌⌍⌎⌏' +
-  '⟐⟑⟒⟓⟔⟕⟖⟗⟘⟙⟠⟡⟢⟣⟤⟥';
+  '⟊⟋⟌⟍⟎⟏⟐⟑⟒⟓⟔⟕⟖⟗⟘⟙⟚⟛⟜⟝⟞⟟⟠⟡';
+
+const SCRAMBLE_HIDE_ORIGINAL_RE = /[\p{L}\p{N}]/u;
 
 function matrixScrambleSegment(segment: string, phase: number) {
   const len = segment.length;
@@ -186,7 +189,7 @@ function matrixScrambleSegment(segment: string, phase: number) {
   let out = '';
   for (let i = 0; i < len; i += 1) {
     const ch = segment[i];
-    if (ch === '\n' || ch === '\r' || ch === '\t') {
+    if (ch === '\n' || ch === '\r' || ch === '\t' || ch === ' ') {
       out += ch;
       continue;
     }
@@ -194,7 +197,8 @@ function matrixScrambleSegment(segment: string, phase: number) {
     const revealProb = clampNumber(0.92 - t * 0.86, 0.04, 0.98);
     const seed = (phase * 9301 + i * 49297 + ch.charCodeAt(0) * 17) % 233280;
     const r = seed / 233280;
-    if (r < revealProb) {
+    const canRevealOriginal = !SCRAMBLE_HIDE_ORIGINAL_RE.test(ch);
+    if (canRevealOriginal && r < revealProb) {
       out += ch;
       continue;
     }
