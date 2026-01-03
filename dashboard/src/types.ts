@@ -52,6 +52,7 @@ export interface SpecStatus {
   designConfirmed: boolean;
   tasksConfirmed: boolean;
   techStackConfirmed?: boolean;
+  projectCategory?: 'software' | 'non_software' | string;
   requirementsClarifications?: RequirementsClarifications;
   techStackClarifications?: RequirementsClarifications;
   lastError?: SpecLastError | null;

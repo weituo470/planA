@@ -68,6 +68,7 @@ const DEFAULT_SPEC_STATUS = {
   tasksConfirmed: false,
   techStackConfirmed: false,
   prompt: '',
+  projectCategory: 'software',
   requirementsReview: {
     notes: '',
     points: [],
@@ -1821,6 +1822,62 @@ function normalizePrompt(prompt) {
   return prompt.trim();
 }
 
+function inferProjectCategoryFromPrompt(prompt) {
+  const text = normalizePrompt(prompt);
+  if (!text) return 'software';
+  const lower = text.toLowerCase();
+  let softwareScore = 0;
+  let nonSoftwareScore = 0;
+
+  if (/\.(ts|tsx|js|jsx|py|go|java|kt|rs|cs|php|sql|json|ya?ml|toml|md)\b/i.test(text)) {
+    softwareScore += 3;
+  }
+  if (
+    /(^|[\\/])(src|frontend|backend|server|client|api|components|pages|routes)([\\/]|$)/i.test(
+      text,
+    )
+  ) {
+    softwareScore += 2;
+  }
+  if (
+    /(api|接口|前端|后端|数据库|schema|dto|controller|service|router|路由|组件|页面|登录|注册|权限|rbac|oauth|jwt|部署|docker|k8s|kubernetes|nginx|react|vue|angular|nest|node|spring|django|flask|fastapi|prisma|mysql|postgres|redis)/i.test(
+      text,
+    )
+  ) {
+    softwareScore += 2;
+  }
+  if (/(app|网站|网页|小程序|管理端|后台|客户端|服务端|微服务)/i.test(text)) {
+    softwareScore += 1;
+  }
+
+  if (
+    /(旅行|行程|攻略|婚礼|生日|团建|活动|策划|市场|营销|宣传|文案|海报|ppt|投标|采购|招聘|面试|培训|课程|教学|论文|研究|读书|减肥|健身|饮食|菜谱|装修|家装|施工|合同|法律|财务|审计|报税|sop|制度|流程)/i.test(
+      text,
+    )
+  ) {
+    nonSoftwareScore += 2;
+  }
+  if (/(写一篇|写一份|撰写|总结|复盘|方案|计划书|报告)/i.test(text)) {
+    nonSoftwareScore += 1;
+  }
+  if (lower.includes('ppt')) nonSoftwareScore += 1;
+
+  if (softwareScore >= 2) return 'software';
+  if (softwareScore === 0 && nonSoftwareScore >= 2) return 'non_software';
+  return 'software';
+}
+
+function resolveProjectCategory(status) {
+  const raw = status && typeof status === 'object' ? status.projectCategory : null;
+  const normalized = typeof raw === 'string' ? raw.trim() : '';
+  if (normalized === 'software' || normalized === 'non_software') return normalized;
+  return inferProjectCategoryFromPrompt(status?.prompt || '');
+}
+
+function isNonSoftwareProject(status) {
+  return resolveProjectCategory(status) === 'non_software';
+}
+
 function sanitizeReviewText(value, maxLen = 4000) {
   if (typeof value !== 'string') return '';
   const trimmed = value.trim();
@@ -2641,6 +2698,27 @@ function ensureTechStackClarificationsSeeded(specName, status, prompt, designMar
   const current = normalizeRequirementsClarifications(
     normalized.techStackClarifications || {},
   );
+  if (isNonSoftwareProject(normalized)) {
+    if (normalized.techStackConfirmed && current.questions.length === 0) {
+      return { changed: false, status: normalized };
+    }
+    const now = new Date().toISOString();
+    const next = {
+      ...normalized,
+      projectCategory: 'non_software',
+      techStackConfirmed: true,
+      techStackClarifications: {
+        ...current,
+        questions: [],
+        updatedAt: now,
+        confirmedAt: normalized.techStackClarifications?.confirmedAt ?? now,
+        generatedBy: normalized.techStackClarifications?.generatedBy ?? 'skip',
+        generationError: null,
+      },
+    };
+    writeSpecStatus(specName, next);
+    return { changed: true, status: next };
+  }
   if (!normalized.requirementsConfirmed) return { changed: false, status: normalized };
 
   const existingGeneratedBy =
@@ -4383,10 +4461,22 @@ function listSpecs() {
 
 async function createSpecTemplates(name, artifacts = ['requirements'], prompt = '', options = {}) {
   fs.mkdirSync(resolveSpecDir(name), { recursive: true });
-  ensureSpecStatus(name, prompt ? { prompt } : null);
+  const inferredCategory = inferProjectCategoryFromPrompt(prompt);
+  ensureSpecStatus(name, prompt ? { prompt, projectCategory: inferredCategory } : null);
   if (prompt) {
     const status = readSpecStatus(name);
-    ensureActiveFlowRun(name, status, { forceNew: true, reason: 'spec:create' });
+    const nextCategory = inferProjectCategoryFromPrompt(prompt);
+    const needsUpdate = status.projectCategory !== nextCategory;
+    const nextStatus =
+      needsUpdate || (nextCategory === 'non_software' && !status.techStackConfirmed)
+        ? {
+            ...status,
+            projectCategory: nextCategory,
+            techStackConfirmed: nextCategory === 'non_software' ? true : status.techStackConfirmed,
+          }
+        : status;
+    if (nextStatus !== status) writeSpecStatus(name, nextStatus);
+    ensureActiveFlowRun(name, nextStatus, { forceNew: true, reason: 'spec:create' });
   }
   const onLlmToken = typeof options?.onLlmToken === 'function' ? options.onLlmToken : null;
   const onStage = typeof options?.onStage === 'function' ? options.onStage : null;
@@ -5357,77 +5447,148 @@ app.post('/specs/:name/confirm', async (req, res) => {
     const designPath = resolveSpecFile(specName, 'design');
     const designContent = fs.existsSync(designPath) ? fs.readFileSync(designPath, 'utf8') : '';
 
-    // Ensure tech stack confirmation questions exist before generating tasks.
-    status = ensureTechStackClarificationsSeeded(
-      specName,
-      status,
-      status.prompt,
-      designContent,
-    ).status;
+    const skipTechStack = req.body?.skipTechStack === true || isNonSoftwareProject(status);
 
-    const incomingTechStackClarifications =
-      req.body?.techStackClarifications || req.body?.techStack || null;
-    if (incomingTechStackClarifications) {
-      status.techStackClarifications = mergeRequirementsClarifications(
-        status.techStackClarifications,
-        incomingTechStackClarifications,
-      );
-    }
+    if (!skipTechStack) {
+      // Ensure tech stack confirmation questions exist before generating tasks.
+      status = ensureTechStackClarificationsSeeded(
+        specName,
+        status,
+        status.prompt,
+        designContent,
+      ).status;
 
-    if (!areClarificationsComplete(status.techStackClarifications)) {
-      writeSpecStatus(specName, status);
-      return respondError(409, 'Tech stack clarifications incomplete');
-    }
-
-    const now = new Date().toISOString();
-    status.techStackClarifications = {
-      ...normalizeRequirementsClarifications(status.techStackClarifications || {}),
-      updatedAt: now,
-      confirmedAt: now,
-    };
-    status.techStackConfirmed = true;
-    status.designConfirmed = true;
-    const tasksPath = resolveSpecFile(specName, 'tasks');
-    const shouldGenerate =
-      force || !fs.existsSync(tasksPath) || fs.readFileSync(tasksPath, 'utf8').trim() === '';
-    if (shouldGenerate) {
-      try {
-        ensureActiveFlowRun(specName, status, { reason: 'confirm:design' });
-        const supplementalPrompt = [status.prompt, buildTechStackSummary(status.techStackClarifications)]
-          .filter(Boolean)
-          .join('\n\n');
-        stream?.write({ type: 'stage', stage: 'tasks', state: 'start' });
-        const content = await generateTasksWithModel(
-          designContent,
-          supplementalPrompt,
-          stream
-            ? {
-                onToken: (delta) => stream.write({ type: 'delta', stage: 'tasks', delta }),
-                onTelemetry: (attempt) =>
-                  appendFlowRunStageAttempt(specName, 'tasks', attempt, {
-                    reason: 'confirm:design',
-                  }),
-              }
-            : {
-                onTelemetry: (attempt) =>
-                  appendFlowRunStageAttempt(specName, 'tasks', attempt, {
-                    reason: 'confirm:design',
-                  }),
-              },
+      const incomingTechStackClarifications =
+        req.body?.techStackClarifications || req.body?.techStack || null;
+      if (incomingTechStackClarifications) {
+        status.techStackClarifications = mergeRequirementsClarifications(
+          status.techStackClarifications,
+          incomingTechStackClarifications,
         );
-        stream?.write({ type: 'stage', stage: 'tasks', state: 'end' });
-        writeSpecFile(specName, 'tasks', content);
-        status.lastError = null;
+      }
 
-      } catch (error) {
-        recordSpecError(status, 'tasks', error, { timeoutMs: Number(process.env.LLM_TASK_TIMEOUT_MS || 0) || null });
+      if (!areClarificationsComplete(status.techStackClarifications)) {
         writeSpecStatus(specName, status);
-        console.error('Tasks generation failed:', error?.message || error);
-        return respondError(502, error?.message || 'Tasks generation failed', {
-          stage: 'tasks',
-          context: error?.llmContext || null,
-          timeoutMs: Number(process.env.LLM_TASK_TIMEOUT_MS || 0) || null,
-        });
+        return respondError(409, 'Tech stack clarifications incomplete');
+      }
+
+      const now = new Date().toISOString();
+      status.techStackClarifications = {
+        ...normalizeRequirementsClarifications(status.techStackClarifications || {}),
+        updatedAt: now,
+        confirmedAt: now,
+      };
+      status.techStackConfirmed = true;
+      status.designConfirmed = true;
+      const tasksPath = resolveSpecFile(specName, 'tasks');
+      const shouldGenerate =
+        force || !fs.existsSync(tasksPath) || fs.readFileSync(tasksPath, 'utf8').trim() === '';
+      if (shouldGenerate) {
+        try {
+          ensureActiveFlowRun(specName, status, { reason: 'confirm:design' });
+          const supplementalPrompt = [
+            status.prompt,
+            buildTechStackSummary(status.techStackClarifications),
+          ]
+            .filter(Boolean)
+            .join('\n\n');
+          stream?.write({ type: 'stage', stage: 'tasks', state: 'start' });
+          const content = await generateTasksWithModel(
+            designContent,
+            supplementalPrompt,
+            stream
+              ? {
+                  onToken: (delta) => stream.write({ type: 'delta', stage: 'tasks', delta }),
+                  onTelemetry: (attempt) =>
+                    appendFlowRunStageAttempt(specName, 'tasks', attempt, {
+                      reason: 'confirm:design',
+                    }),
+                }
+              : {
+                  onTelemetry: (attempt) =>
+                    appendFlowRunStageAttempt(specName, 'tasks', attempt, {
+                      reason: 'confirm:design',
+                    }),
+                },
+          );
+          stream?.write({ type: 'stage', stage: 'tasks', state: 'end' });
+          writeSpecFile(specName, 'tasks', content);
+          status.lastError = null;
+
+        } catch (error) {
+          recordSpecError(status, 'tasks', error, {
+            timeoutMs: Number(process.env.LLM_TASK_TIMEOUT_MS || 0) || null,
+          });
+          writeSpecStatus(specName, status);
+          console.error('Tasks generation failed:', error?.message || error);
+          return respondError(502, error?.message || 'Tasks generation failed', {
+            stage: 'tasks',
+            context: error?.llmContext || null,
+            timeoutMs: Number(process.env.LLM_TASK_TIMEOUT_MS || 0) || null,
+          });
+        }
+      }
+    } else {
+      const now = new Date().toISOString();
+      status.projectCategory = resolveProjectCategory(status);
+      status.techStackConfirmed = true;
+      status.designConfirmed = true;
+      status.techStackClarifications = {
+        ...normalizeRequirementsClarifications(status.techStackClarifications || {}),
+        questions: [],
+        updatedAt: now,
+        confirmedAt: status.techStackClarifications?.confirmedAt ?? now,
+        generatedBy: status.techStackClarifications?.generatedBy ?? 'skip',
+        generationError: null,
+      };
+
+      const tasksPath = resolveSpecFile(specName, 'tasks');
+      const shouldGenerate =
+        force || !fs.existsSync(tasksPath) || fs.readFileSync(tasksPath, 'utf8').trim() === '';
+
+      if (shouldGenerate) {
+        try {
+          ensureActiveFlowRun(specName, status, { reason: 'confirm:design' });
+          const supplementalPrompt = [
+            status.prompt,
+            '说明：该需求被识别为非软件项目，跳过“技术栈确认”等软件工程专属设定；不要输出前端/后端/数据库/API/代码实现类内容。请以文档/流程/交付物为主进行任务拆解，并给出可验证的验收方式。',
+          ]
+            .filter(Boolean)
+            .join('\n\n');
+          stream?.write({ type: 'stage', stage: 'tasks', state: 'start' });
+          const content = await generateTasksWithModel(
+            designContent,
+            supplementalPrompt,
+            stream
+              ? {
+                  onToken: (delta) => stream.write({ type: 'delta', stage: 'tasks', delta }),
+                  onTelemetry: (attempt) =>
+                    appendFlowRunStageAttempt(specName, 'tasks', attempt, {
+                      reason: 'confirm:design',
+                    }),
+                }
+              : {
+                  onTelemetry: (attempt) =>
+                    appendFlowRunStageAttempt(specName, 'tasks', attempt, {
+                      reason: 'confirm:design',
+                    }),
+                },
+          );
+          stream?.write({ type: 'stage', stage: 'tasks', state: 'end' });
+          writeSpecFile(specName, 'tasks', content);
+          status.lastError = null;
+        } catch (error) {
+          recordSpecError(status, 'tasks', error, {
+            timeoutMs: Number(process.env.LLM_TASK_TIMEOUT_MS || 0) || null,
+          });
+          writeSpecStatus(specName, status);
+          console.error('Tasks generation failed:', error?.message || error);
+          return respondError(502, error?.message || 'Tasks generation failed', {
+            stage: 'tasks',
+            context: error?.llmContext || null,
+            timeoutMs: Number(process.env.LLM_TASK_TIMEOUT_MS || 0) || null,
+          });
+        }
       }
     }
   }
