@@ -3122,13 +3122,7 @@ export default function App() {
                       }
                       disabled={!activeReportRunId || reportScoreStatus?.running}
                     >
-                      {reportScoreStatus?.running
-                        ? '评分中'
-                        : atomizeStatus?.total &&
-                            !atomizeStatus.running &&
-                            atomizeStatus.completed >= atomizeStatus.total
-                          ? '用模型评分'
-                          : '对全部模型评分'}
+                      {reportScoreStatus?.running ? '评分中' : '用模型评分'}
                     </Button>
                   </div>
                 </div>

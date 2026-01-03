@@ -179,7 +179,7 @@ const DEFAULT_PROMPT_CONFIG = {
 	      user:
 	        `设计内容如下：\n{{design}}\n\n补充描述：{{prompt}}\n\n` +
 	        '请输出 {{minTasks}}-{{maxTasks}} 条任务（不要求原子化）。' +
-	        '每条任务必须包含 title/core/details/ac 四个字段，简体中文。\n' +
+	        '每条任务必须包含 title/core/details/ac 四个字段，简体中文；严禁输出 TBD/待定/[path]/占位符。\n' +
 	        'title 写清任务名称与产出（模块/流程级别即可）。\n' +
 	        'core 写清关键目标与范围边界（做什么/不做什么）。\n' +
 	        'details 写清关键技术点/接口/数据结构/页面与路由，不要空泛。\n' +
@@ -205,6 +205,7 @@ const DEFAULT_PROMPT_CONFIG = {
 	        '5) core/details 必须具体可执行，包含关键导出名/函数名/接口字段/API 路由/组件 Props/CSS 类名；避免空泛措辞。\n' +
 	        '6) 遵循定义先行：先 types/interfaces/schema/DTO，再业务逻辑，再 UI/交互。\n' +
 	        '7) ac 必须“机器可验证”，至少包含 1 条可执行的验证方式（命令/接口/页面路径/可观察结果）。\n' +
+	        '   - 禁止仅用 rg/grep/搜索 作为唯一验收；必须至少包含 1 条“行为验证”（接口响应/构建或测试通过/页面交互可观察结果）。\n' +
 	        '8) 信息不足时：先补 1 条“创建 docs/assumptions.md”记录假设/待确认点（写清缺失信息），再继续拆分。\n' +
 	        '9) 简体中文。\n' +
 	        '只输出 JSON：{"tasks":[...]}。',
@@ -1058,6 +1059,7 @@ function createFlowRun(specName, status, reason = '') {
     stages: {},
     ratings: { updatedAt: null, byModel: {} },
     userRatings: [],
+    artifacts: null,
     report: null,
   };
   writeFlowRun(specName, run);
@@ -1402,7 +1404,7 @@ function buildFlowReportMarkdown(specName, status, run, artifacts) {
     '',
     '## 0) 原始需求（prompt）',
     '',
-    status?.prompt ? status.prompt : '（空）',
+    run?.prompt ? String(run.prompt) : status?.prompt ? String(status.prompt) : '（空）',
     '',
     '### 项目类型识别（projectCategory）',
     '',
@@ -1478,6 +1480,108 @@ function buildFlowReportMarkdown(specName, status, run, artifacts) {
   ].join('\n');
 }
 
+function readSpecArtifacts(specName) {
+  const artifacts = {};
+  for (const key of SPEC_ARTIFACTS) {
+    const filePath = resolveSpecFile(specName, key);
+    artifacts[key] = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
+  }
+  return artifacts;
+}
+
+function normalizeFlowRunArtifactsSnapshot(input) {
+  const obj = input && typeof input === 'object' ? input : null;
+  if (!obj) return null;
+  const snapshot = {};
+  let hasAny = false;
+  for (const key of SPEC_ARTIFACTS) {
+    const value = typeof obj[key] === 'string' ? obj[key] : '';
+    snapshot[key] = value;
+    if (value.trim()) hasAny = true;
+  }
+  return hasAny ? snapshot : null;
+}
+
+function extractArtifactsFromFlowReportMarkdown(markdown) {
+  const text = normalizeLineEndings(markdown || '');
+  if (!text.trim()) return null;
+  const lines = text.split('\n');
+
+  const headerByKey = {
+    requirements: 'requirements.md',
+    design: 'design.md',
+    tasks: 'tasks.md',
+    tasks_atomic: 'tasks_atomic.md',
+  };
+  const keyByHeader = Object.fromEntries(Object.entries(headerByKey).map(([k, v]) => [v, k]));
+
+  const out = {};
+  let currentKey = null;
+  let inFence = false;
+  let buffer = [];
+
+  for (const line of lines) {
+    const trimmed = String(line || '').trim();
+    if (!inFence) {
+      const headerMatch = /^###\s+(.+?)\s*$/.exec(trimmed);
+      if (headerMatch && headerMatch[1] && keyByHeader[headerMatch[1]]) {
+        currentKey = keyByHeader[headerMatch[1]];
+        buffer = [];
+        continue;
+      }
+      if (currentKey && /^```/.test(trimmed)) {
+        inFence = true;
+        buffer = [];
+      }
+      continue;
+    }
+
+    if (/^```/.test(trimmed)) {
+      out[currentKey] = buffer.join('\n').replace(/\s+$/g, '');
+      currentKey = null;
+      inFence = false;
+      buffer = [];
+      continue;
+    }
+    buffer.push(line);
+  }
+
+  const snapshot = {};
+  let hasAny = false;
+  for (const key of SPEC_ARTIFACTS) {
+    const value = typeof out[key] === 'string' ? out[key] : '';
+    snapshot[key] = value;
+    if (value.trim()) hasAny = true;
+  }
+  return hasAny ? snapshot : null;
+}
+
+function ensureFlowRunArtifactsSnapshot(specName, run) {
+  const existing = normalizeFlowRunArtifactsSnapshot(run?.artifacts);
+  if (existing) return { run, artifacts: existing };
+
+  const reportPath =
+    run?.report && typeof run.report === 'object' && typeof run.report.path === 'string'
+      ? run.report.path.trim()
+      : '';
+  if (reportPath && fs.existsSync(reportPath)) {
+    try {
+      const content = fs.readFileSync(reportPath, 'utf8');
+      const extracted = extractArtifactsFromFlowReportMarkdown(content);
+      if (extracted) {
+        const now = new Date().toISOString();
+        const updatedRun = { ...run, updatedAt: now, artifacts: extracted };
+        writeFlowRun(specName, updatedRun);
+        return { run: updatedRun, artifacts: extracted };
+      }
+    } catch {
+      // ignore snapshot failures
+    }
+  }
+
+  return { run, artifacts: null };
+}
+
 function finalizeFlowReport(specName, options = {}) {
   const status = readSpecStatus(specName);
   const flowReport = normalizeFlowReportMeta(status.flowReport);
@@ -1488,14 +1592,11 @@ function finalizeFlowReport(specName, options = {}) {
   if (!run) return null;
 
   if (run.report && typeof run.report === 'object' && run.report.path) {
+    ensureFlowRunArtifactsSnapshot(specName, run);
     return run.report.path;
   }
 
-  const artifacts = {};
-  for (const key of SPEC_ARTIFACTS) {
-    const filePath = resolveSpecFile(specName, key);
-    artifacts[key] = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
-  }
+  const artifacts = readSpecArtifacts(specName);
 
   const markdown = buildFlowReportMarkdown(specName, status, run, artifacts);
 
@@ -1508,6 +1609,7 @@ function finalizeFlowReport(specName, options = {}) {
   const updatedRun = {
     ...run,
     updatedAt: now,
+    artifacts,
     report: {
       path: reportPath,
       createdAt: now,
@@ -1540,13 +1642,10 @@ function refreshFlowReport(specName, runId) {
   const run = readFlowRun(specName, id);
   if (!run) return null;
 
-  const artifacts = {};
-  for (const key of SPEC_ARTIFACTS) {
-    const filePath = resolveSpecFile(specName, key);
-    artifacts[key] = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
-  }
+  const ensured = ensureFlowRunArtifactsSnapshot(specName, run);
+  const artifacts = ensured.artifacts || readSpecArtifacts(specName);
 
-  const markdown = buildFlowReportMarkdown(specName, status, run, artifacts);
+  const markdown = buildFlowReportMarkdown(specName, status, ensured.run, artifacts);
 
   fs.mkdirSync(DOCS_DIR, { recursive: true });
   const fileName = buildFlowReportFileName(specName, status?.prompt || run?.prompt || '', id);
@@ -1558,8 +1657,9 @@ function refreshFlowReport(specName, runId) {
 
   const now = new Date().toISOString();
   const updatedRun = {
-    ...run,
+    ...ensured.run,
     updatedAt: now,
+    artifacts: ensured.artifacts || ensured.run?.artifacts || artifacts,
     report: {
       path: reportPath,
       createdAt: run?.report?.createdAt || now,
@@ -1703,7 +1803,7 @@ async function scoreFlowReportWithModel(specName, runId, modelId, context) {
     requirements: truncateTextMiddle(artifacts?.requirements || '', 9000),
     design: truncateTextMiddle(artifacts?.design || '', 9000),
     tasks: truncateTextMiddle(artifacts?.tasks || '', 12000),
-    tasksAtomic: truncateTextMiddle(artifacts?.tasks_atomic || '', 20000),
+    tasksAtomic: truncateTextMiddle(artifacts?.tasks_atomic || '', 60000),
   };
   const promptTemplates = { system: stage.system, user: stage.user };
   const promptRendered = {
@@ -1780,11 +1880,12 @@ async function runReportScoreJob(specName, runId, job, options = {}) {
     const run = readFlowRun(specName, id);
     if (!run) throw new Error('Flow run not found');
 
-    const artifacts = {};
-    for (const key of SPEC_ARTIFACTS) {
-      const filePath = resolveSpecFile(specName, key);
-      artifacts[key] = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
-    }
+    const ensured = ensureFlowRunArtifactsSnapshot(specName, run);
+    const artifacts = ensured.artifacts || readSpecArtifacts(specName);
+    const statusForScore = {
+      ...status,
+      prompt: String(run?.prompt || status?.prompt || ''),
+    };
 
     const modelIds = Array.from(
       new Set(LLM_MODEL_OPTIONS.map((m) => String(m?.id || '')).filter(Boolean)),
@@ -1814,7 +1915,7 @@ async function runReportScoreJob(specName, runId, job, options = {}) {
 
       logReportScore(job, `开始模型评分：${getModelLabel(modelId)}`);
       const verdict = await scoreFlowReportWithModel(specName, id, modelId, {
-        status,
+        status: statusForScore,
         artifacts,
       });
 
@@ -3372,11 +3473,17 @@ function buildTasksMarkdown(prompt, payload) {
       const details = sanitizeModelText(t.details || t.tech || t.technical || t.techDetails || '', '').trim();
       const ac = sanitizeModelText(t.ac || t.acceptance || t.criteria || '', '').trim();
 
+      const safeTitle = title || `创建 docs/assumptions.md｜补齐 Task ${idx + 1} 缺失字段`;
+      const safeCore = core || '记录本任务的核心目标与范围边界（做什么/不做什么）。';
+      const safeDetails = details || '补齐关键技术点/接口/数据结构/页面与路由等实现细节。';
+      const safeAc =
+        ac || '在 docs/assumptions.md 写清可复现的验收步骤（命令/接口/页面路径/可观察结果）。';
+
       return [
-        `- [ ] **Task ${idx + 1}**: ${title || 'TBD'}`,
-        `  - **核心逻辑**: ${core || 'TBD'}`,
-        `  - **技术细节**: ${details || 'TBD'}`,
-        `  - **验收准则 (AC)**: ${ac || 'TBD'}`,
+        `- [ ] **Task ${idx + 1}**: ${safeTitle}`,
+        `  - **核心逻辑**: ${safeCore}`,
+        `  - **技术细节**: ${safeDetails}`,
+        `  - **验收准则 (AC)**: ${safeAc}`,
       ].join('\n');
     })
     .join('\n\n');
@@ -3585,6 +3692,7 @@ const REPO_TREE_EXCLUDES = new Set([
   '.turbo',
   '.cache',
   'specs',
+  'task',
 ]);
 
 function normalizePathForPrompt(value) {
@@ -3744,6 +3852,111 @@ function parseTaskSummaries(markdown) {
   return summaries;
 }
 
+function parseTasksForAtomize(markdown) {
+  const lines = normalizeLineEndings(markdown || '').split('\n');
+  let inTaskList = false;
+  let hasTaskListHeader = false;
+  let current = null;
+  let lastField = null;
+  const tasks = [];
+
+  const pushCurrent = () => {
+    if (!current) return;
+    const title = String(current.title || '').trim();
+    if (title) tasks.push({ ...current, title });
+    current = null;
+    lastField = null;
+  };
+
+  const appendField = (key, value) => {
+    const text = String(value || '').trim();
+    if (!text) return;
+    if (!current[key]) current[key] = text;
+    else current[key] = `${String(current[key]).trim()}\n${text}`.trim();
+    lastField = key;
+  };
+
+  for (const rawLine of lines) {
+    const line = String(rawLine || '').trimEnd();
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    if (/^##\s*任务清单\b/.test(trimmed)) {
+      inTaskList = true;
+      hasTaskListHeader = true;
+      continue;
+    }
+    if (hasTaskListHeader && inTaskList && /^##\s+/.test(trimmed)) {
+      inTaskList = false;
+    }
+    if (hasTaskListHeader && !inTaskList) continue;
+
+    const taskHeader =
+      trimmed.match(/^- \[[ xX]\]\s*\*\*Task\s*\d+\*\*:\s*(.+)$/) ||
+      trimmed.match(/^- \[[ xX]\]\s*(.+)$/);
+    if (taskHeader) {
+      pushCurrent();
+      current = { title: String(taskHeader[1] || '').trim(), core: '', details: '', ac: '' };
+      lastField = null;
+      continue;
+    }
+
+    if (!current) continue;
+    const coreMatch = trimmed.match(/^-+\s*\*\*核心逻辑\*\*:\s*(.+)$/);
+    if (coreMatch) {
+      appendField('core', coreMatch[1]);
+      continue;
+    }
+    const detailsMatch = trimmed.match(/^-+\s*\*\*技术细节\*\*:\s*(.+)$/);
+    if (detailsMatch) {
+      appendField('details', detailsMatch[1]);
+      continue;
+    }
+    const acMatch = trimmed.match(/^-+\s*\*\*验收准则\s*\(AC\)\*\*:\s*(.+)$/);
+    if (acMatch) {
+      appendField('ac', acMatch[1]);
+      continue;
+    }
+
+    // Continuation lines for multi-line blocks.
+    if (lastField && /^\s{2,}/.test(line)) {
+      appendField(lastField, trimmed);
+    }
+  }
+
+  pushCurrent();
+
+  if (tasks.length) return tasks;
+  return parseTaskSummaries(markdown).map((summary) => ({
+    title: String(summary || '').trim(),
+    core: '',
+    details: '',
+    ac: '',
+  }));
+}
+
+function truncateForPrompt(text, maxLen) {
+  const value = String(text || '').trim();
+  if (!value) return '';
+  if (value.length <= maxLen) return value;
+  return `${value.slice(0, maxLen)}…`;
+}
+
+function formatOriginalTaskForAtomize(task) {
+  const title = sanitizeModelText(task?.title || '', '').trim();
+  const core = sanitizeModelText(task?.core || '', '').trim();
+  const details = sanitizeModelText(task?.details || '', '').trim();
+  const ac = sanitizeModelText(task?.ac || '', '').trim();
+
+  const lines = [];
+  if (title) lines.push(`标题：${truncateForPrompt(title, 240)}`);
+  if (core) lines.push(`核心逻辑：${truncateForPrompt(core, 320)}`);
+  if (details) lines.push(`技术细节：${truncateForPrompt(details, 420)}`);
+  if (ac) lines.push(`验收准则：${truncateForPrompt(ac, 320)}`);
+
+  return lines.join('\n').trim() || title;
+}
+
 function buildTasksAtomicHeader() {
   const template = SPEC_TEMPLATES.tasks_atomic || '# 任务原子化（tasks_atomic）';
   const lines = normalizeLineEndings(template).split('\n');
@@ -3767,9 +3980,10 @@ function parseAtomicDoneIndices(markdown) {
 
 function formatAtomicTaskBlock(indexLabel, task) {
   const normalized = normalizeTaskObject(task) || { title: '', core: '', details: '', ac: '' };
-  const title =
-    sanitizeAtomicField(normalized.title, '创建 docs/assumptions.md｜补充原子化缺失信息').trim() ||
-    '创建 docs/assumptions.md｜补充原子化缺失信息';
+  let title =
+    sanitizeAtomicField(normalized.title, '修改 docs/assumptions.md｜补充原子化缺失信息').trim() ||
+    '修改 docs/assumptions.md｜补充原子化缺失信息';
+  title = title.replace(/^创建\s+docs\/assumptions\.md\b/, '修改 docs/assumptions.md');
   const core =
     sanitizeAtomicField(
       normalized.core,
@@ -3909,6 +4123,46 @@ function validateAtomicTasks(tasks) {
     deduped.push(task);
   }
   if (!deduped.length) return { ok: false, error: 'deduped_empty' };
+
+  const assumptionsPath = 'docs/assumptions.md';
+  const assumptions = [];
+  const rest = [];
+  for (const task of deduped) {
+    const token = extractPathToken(task.title);
+    const normalizedToken = token ? token.replace(/\\/g, '/') : null;
+    if (normalizedToken === assumptionsPath) assumptions.push(task);
+    else rest.push(task);
+  }
+
+  if (assumptions.length > 1) {
+    const itemSet = new Set();
+    const items = [];
+    const addItem = (line) => {
+      const text = String(line || '').trim();
+      if (!text) return;
+      const key = text.replace(/\s+/g, ' ').trim();
+      if (!key || itemSet.has(key)) return;
+      itemSet.add(key);
+      items.push(text);
+    };
+    assumptions.forEach((t) => {
+      const hint = String(t.title || '')
+        .replace(/^(创建|修改|删除)\s+docs\/assumptions\.md\s*/i, '')
+        .replace(/^[｜|]\s*/g, '')
+        .trim();
+      if (hint) addItem(hint);
+    });
+    if (!items.length) addItem('补齐原子化所需的缺失信息与约束');
+
+    const merged = {
+      title: '修改 docs/assumptions.md｜汇总待确认点',
+      core: '汇总原子化过程中的待确认点，消除重复 assumptions 任务。',
+      details: ['在 docs/assumptions.md 的“待确认点”小节追加/合并以下条目：', ...items.map((x) => `- ${x}`)].join('\n'),
+      ac: '运行 `rg "待确认点" docs/assumptions.md` 可看到合并后的条目且无重复。',
+    };
+    return { ok: true, tasks: [merged, ...rest] };
+  }
+
   return { ok: true, tasks: deduped };
 }
 
@@ -3916,31 +4170,76 @@ function validateAtomicTasks(tasks) {
 function coerceAtomicTasks(tasks) {
   const normalized = Array.isArray(tasks) ? tasks.map(normalizeTaskObject).filter(Boolean) : [];
   if (!normalized.length) return [];
+
+  const existsInRepo = (relPath) => {
+    const normalizedPath = String(relPath || '').replace(/\\/g, '/').trim();
+    if (!normalizedPath) return false;
+    const abs = path.join(REPO_DIR, ...normalizedPath.split('/'));
+    return fs.existsSync(abs);
+  };
+
+  const pickFallbackPath = (hintText) => {
+    const text = String(hintText || '');
+    if (/(前端|UI|按钮|组件|React|dashboard|App\.tsx|tsx)/i.test(text)) {
+      return existsInRepo('dashboard/src/App.tsx') ? 'dashboard/src/App.tsx' : 'docs/assumptions.md';
+    }
+    if (/(assumptions|待确认点|不确定|缺失|文档|说明|readme)/i.test(text)) {
+      return 'docs/assumptions.md';
+    }
+    return existsInRepo('bridge/src/index.js') ? 'bridge/src/index.js' : 'docs/assumptions.md';
+  };
+
+  const pickAction = (rawTitle) => {
+    const match = /^(创建|修改|删除)\b/.exec(String(rawTitle || '').trim());
+    return match?.[1] || '修改';
+  };
+
+  const extractPathToken = (titleText) => {
+    const match = /^(创建|修改|删除)\s+(\S+)/.exec(String(titleText || '').trim());
+    if (!match) return null;
+    const token = String(match[2] || '').trim().replace(/[：:，,。;；]+$/g, '');
+    if (!token) return null;
+    if (/(TBD|待定|\[path\]|占位符)/i.test(token)) return null;
+    const base = token.split(/[/\\]/).pop() || '';
+    if (!/\.[A-Za-z0-9]{1,8}$/.test(base)) return null;
+    return token.replace(/\\/g, '/');
+  };
+
   return normalized.map((task) => {
-    let title = sanitizeAtomicField(task.title || '', '').trim();
-    if (!/^(创建|修改|删除)\s+\S+/.test(title)) {
-      const hint = title ? `｜${title}` : '';
-      title = `创建 docs/assumptions.md${hint}`;
+    const rawTitle = String(task.title || '').trim();
+    const action = pickAction(rawTitle);
+    const hintSource = [rawTitle, task.core, task.details].filter(Boolean).join('｜');
+    const hint = truncateForPrompt(sanitizeModelText(hintSource, '').trim(), 80);
+
+    const sanitizedTitle = sanitizeAtomicField(rawTitle, '').trim();
+    const fromTitle = extractPathToken(sanitizedTitle);
+    const targetPath = fromTitle || pickFallbackPath(hintSource);
+
+    const title = `${action} ${targetPath}${hint ? `｜${hint}` : ''}`.trim();
+
+    if (targetPath === 'docs/assumptions.md') {
+      const details = [
+        '在 docs/assumptions.md 的“待确认点”小节追加：',
+        hint ? `- ${hint}` : '- 补齐原子化所需的缺失信息与约束',
+      ].join('\n');
+      return {
+        title: title.replace(/^创建\s+docs\/assumptions\.md\b/, '修改 docs/assumptions.md'),
+        core: '记录原子化所需假设与待确认点，补齐缺失信息后继续拆解。',
+        details,
+        ac: '运行 `rg "待确认点" docs/assumptions.md` 可匹配到新增条目。',
+      };
     }
-    if (/(TBD|待定|\[path\]|占位符)/i.test(title) || !/\.[A-Za-z0-9]{1,8}\b/.test(title)) {
-      const action = title.split(/\s+/)[0] || '创建';
-      const rest = title.replace(/^(创建|修改|删除)\s+\S+/, '').trim();
-      title = `${action} docs/assumptions.md${rest ? `｜${rest}` : ''}`.trim();
-    }
+
     const core =
-      sanitizeAtomicField(task.core || '', '记录本段原子化所需假设与待确认点。').trim() ||
-      '记录本段原子化所需假设与待确认点。';
+      sanitizeAtomicField(task.core || '', '').trim() ||
+      `在 ${targetPath} 中落地本任务变更，保证逻辑自洽且可验证。`;
     const details =
-      sanitizeAtomicField(
-        task.details || '',
-        '补充：目录结构/入口文件/关键模块位置/接口约束；并给出下一步继续拆解所需信息。',
-      ).trim() ||
-      '补充：目录结构/入口文件/关键模块位置/接口约束；并给出下一步继续拆解所需信息。';
+      sanitizeAtomicField(task.details || '', '').trim() ||
+      `在 ${targetPath} 中实现与“${hint || '本任务目标'}”相关的改动，并补齐必要的导出/常量/参数约束。`;
     const ac =
-      sanitizeAtomicField(
-        task.ac || '',
-        'docs/assumptions.md 存在，且包含“待确认点”小节与至少 3 条条目。',
-      ).trim() || 'docs/assumptions.md 存在，且包含“待确认点”小节与至少 3 条条目。';
+      sanitizeAtomicField(task.ac || '', '').trim() ||
+      `执行 \`node -e \"const fs=require('fs'); console.log(fs.existsSync('${targetPath}'))\"\` 输出 \`true\`。`;
+
     return { title, core, details, ac };
   });
 }
@@ -3966,7 +4265,7 @@ function splitSummaryForAtomize(summary, maxParts = 3) {
 
 function buildFallbackAtomicTasks(summary) {
   const hint = sanitizeModelText(summary || '', '').trim();
-  const title = hint ? `创建 docs/assumptions.md｜${hint}` : '创建 docs/assumptions.md';
+  const title = hint ? `修改 docs/assumptions.md｜${hint}` : '修改 docs/assumptions.md';
   return [
     {
       title,
@@ -4145,10 +4444,75 @@ async function requestAtomicTasks(payload, designSnippet, timeoutMs, reason = ''
   const first = await callOnce({ label: 'primary' });
   const content = first.content;
 
+  const filterStrictAtomicTasks = (rawTasks) => {
+    const normalized = Array.isArray(rawTasks) ? rawTasks.map(normalizeTaskObject).filter(Boolean) : [];
+    if (!normalized.length) return [];
+
+    const extractPathToken = (title) => {
+      const text = String(title || '').trim();
+      const match = /^(创建|修改|删除)\s+(.+)$/.exec(text);
+      if (!match) return null;
+      const rest = String(match[2] || '').trim();
+      if (!rest) return null;
+      const firstToken = rest.split(/\s+/)[0] || '';
+      const beforePipe = firstToken.split(/[｜|]/)[0] || '';
+      return beforePipe.replace(/[：:，,。;；]+$/g, '').trim() || null;
+    };
+
+    const hasFileExtension = (pathToken) => {
+      const token = String(pathToken || '').trim().replace(/[/\\]+$/g, '');
+      if (!token) return false;
+      const base = token.split(/[/\\]/).pop() || '';
+      if (!base) return false;
+      if (base.endsWith('.')) return false;
+      return /\.[A-Za-z0-9]{1,8}$/.test(base);
+    };
+
+    const filtered = normalized.filter((t) => {
+      if (!t.title || !t.core || !t.details || !t.ac) return false;
+      if (
+        containsAtomicPlaceholder(t.title) ||
+        containsAtomicPlaceholder(t.core) ||
+        containsAtomicPlaceholder(t.details) ||
+        containsAtomicPlaceholder(t.ac)
+      ) {
+        return false;
+      }
+      if (!looksLikeChinese(t.title + t.core + t.details + t.ac)) return false;
+      if (!/^(创建|修改|删除)\s+\S+/.test(t.title)) return false;
+      const token = extractPathToken(t.title);
+      if (!token) return false;
+      if (/(TBD|待定|\[path\]|占位符)/i.test(token)) return false;
+      if (!hasFileExtension(token)) return false;
+      return true;
+    });
+
+    const seen = new Set();
+    const deduped = [];
+    for (const task of filtered) {
+      const key = task.title.replace(/\s+/g, ' ').trim();
+      if (!key) continue;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(task);
+    }
+    return deduped;
+  };
+
   const parsed = tryParseJson(content);
   let candidateTasks = Array.isArray(parsed?.tasks) ? parsed.tasks : [];
   let verdict = validateAtomicTasks(candidateTasks);
   let lastError = verdict.error || null;
+
+  if (!verdict.ok && lastError === 'contains_placeholder') {
+    const filtered = filterStrictAtomicTasks(candidateTasks);
+    const filteredVerdict = validateAtomicTasks(filtered);
+    if (filteredVerdict.ok) {
+      verdict = filteredVerdict;
+      lastError = null;
+    }
+  }
+
   if (!verdict.ok) {
     const repairPrefix = `上一次输出不符合要求（原因：${verdict.error}）。请直接重做。\n\n`;
     const repairedCall = await callOnce({ label: 'repair', userPrefix: repairPrefix });
@@ -4157,6 +4521,15 @@ async function requestAtomicTasks(payload, designSnippet, timeoutMs, reason = ''
     candidateTasks = Array.isArray(repaired?.tasks) ? repaired.tasks : [];
     verdict = validateAtomicTasks(candidateTasks);
     lastError = verdict.error || lastError;
+
+    if (!verdict.ok && verdict.error === 'contains_placeholder') {
+      const filtered = filterStrictAtomicTasks(candidateTasks);
+      const filteredVerdict = validateAtomicTasks(filtered);
+      if (filteredVerdict.ok) {
+        verdict = filteredVerdict;
+        lastError = null;
+      }
+    }
   }
   if (!verdict.ok) {
     const loose = coerceAtomicTasks(candidateTasks);
@@ -4259,7 +4632,11 @@ async function atomizeTaskSummarySafe(
 ) {
   const cleaned = sanitizeModelText(summary || '', '').trim();
   if (!cleaned) return buildFallbackAtomicTasks(summary);
-  const needsSplit = cleaned.length > 180;
+  const looksStructured =
+    /标题：|核心逻辑：|技术细节：|验收准则：/.test(cleaned) ||
+    cleaned.includes('\n');
+  const splitThreshold = looksStructured ? 900 : 180;
+  const needsSplit = cleaned.length > splitThreshold;
   if (needsSplit) {
     const parts = splitSummaryForAtomize(cleaned, 3);
     if (parts.length > 1) {
@@ -4432,18 +4809,18 @@ async function runAtomizeJob(specName, job, options = {}) {
 
     const tasksPath = resolveSpecFile(specName, 'tasks');
     let tasksMarkdown = fs.existsSync(tasksPath) ? fs.readFileSync(tasksPath, 'utf8') : '';
-    let summaries = parseTaskSummaries(tasksMarkdown);
-    if (!summaries.length && (designMarkdown.trim() || status.prompt)) {
+    let originalTasks = parseTasksForAtomize(tasksMarkdown);
+    if (!originalTasks.length && (designMarkdown.trim() || status.prompt)) {
       const fallbackTasksMarkdown = generateTasksContent(designMarkdown, status.prompt);
       writeSpecFile(specName, 'tasks', fallbackTasksMarkdown);
       tasksMarkdown = fallbackTasksMarkdown;
-      summaries = parseTaskSummaries(tasksMarkdown);
-      if (summaries.length) {
+      originalTasks = parseTasksForAtomize(tasksMarkdown);
+      if (originalTasks.length) {
         logAtomize(job, 'tasks.md 缺失/格式不兼容，已自动生成模板任务清单。');
       }
     }
 
-    if (!summaries.length) throw new Error('任务列表为空，无法原子化');
+    if (!originalTasks.length) throw new Error('任务列表为空，无法原子化');
 
     const designSnippet = truncateText(designMarkdown, 1200);
 
@@ -4460,9 +4837,9 @@ async function runAtomizeJob(specName, job, options = {}) {
     const atomicContent = fs.existsSync(atomicPath) ? fs.readFileSync(atomicPath, 'utf8') : '';
     const doneIndices = parseAtomicDoneIndices(atomicContent);
 
-    job.total = summaries.length;
+    job.total = originalTasks.length;
     job.completed = doneIndices.size;
-    logAtomize(job, `检测到 ${summaries.length} 条任务，已完成 ${job.completed} 条。`);
+    logAtomize(job, `检测到 ${originalTasks.length} 条任务，已完成 ${job.completed} 条。`);
     appendFlowRunStageAttempt(
       specName,
       'atomize',
@@ -4475,7 +4852,7 @@ async function runAtomizeJob(specName, job, options = {}) {
         usage: null,
         llmContext: describeLlmConfig(getActiveLlmConfig()),
         meta: {
-          total: summaries.length,
+          total: originalTasks.length,
           completed: doneIndices.size,
           batchSize: options?.batchSize ?? null,
         },
@@ -4492,27 +4869,32 @@ async function runAtomizeJob(specName, job, options = {}) {
     job.batchSize = batchSize;
 
     const maxRounds = Number(process.env.LLM_TASK_ATOMIZE_ROUNDS || 3);
-    const timeoutMs = Number(process.env.LLM_TASK_ATOMIZE_TIMEOUT_MS || 60000);
+    const timeoutMs = Math.min(
+      Math.max(8000, Number(process.env.LLM_TASK_ATOMIZE_TIMEOUT_MS || 120000)),
+      240000,
+    );
 
     let processedThisRun = 0;
 
-    for (let i = 0; i < summaries.length; i += 1) {
+    for (let i = 0; i < originalTasks.length; i += 1) {
       const index = i + 1;
       if (doneIndices.has(index)) {
         logAtomize(job, `跳过原始任务 ${index}（已完成）`);
         continue;
       }
       if (processedThisRun >= batchSize) break;
-      const summary = summaries[i];
-      logAtomize(job, `开始原始任务 ${index}/${summaries.length}：${summary}`);
+      const original = originalTasks[i] || {};
+      const originalTitle = sanitizeModelText(original?.title || '', '').trim() || '（未命名）';
+      const summaryForModel = formatOriginalTaskForAtomize(original);
+      logAtomize(job, `开始原始任务 ${index}/${originalTasks.length}：${originalTitle}`);
       const telemetry = {
-        meta: { originalIndex: index, originalTask: summary },
+        meta: { originalIndex: index, originalTask: originalTitle, originalTaskDetail: summaryForModel },
         recordAttempt: (attempt) =>
           appendFlowRunStageAttempt(specName, 'atomize', attempt, { reason: flowRunReason }),
       };
       const atomized = canUseModel
         ? await atomizeTaskSummarySafe(
-            summary,
+            summaryForModel,
             designSnippet,
             maxRounds,
             timeoutMs,
@@ -4520,19 +4902,19 @@ async function runAtomizeJob(specName, job, options = {}) {
             telemetry,
             iterationReason,
           )
-        : buildFallbackAtomicTasks(summary);
-      const section = buildAtomicSection(index, summary, atomized);
+        : buildFallbackAtomicTasks(originalTitle);
+      const section = buildAtomicSection(index, originalTitle, atomized);
       fs.appendFileSync(atomicPath, `\n\n${section}\n`, 'utf8');
       doneIndices.add(index);
       job.completed = doneIndices.size;
       processedThisRun += 1;
-      logAtomize(job, `完成原始任务 ${index}/${summaries.length}`);
+      logAtomize(job, `完成原始任务 ${index}/${originalTasks.length}`);
     }
 
     job.running = false;
     job.error = null;
 
-    if (doneIndices.size >= summaries.length) {
+    if (doneIndices.size >= originalTasks.length) {
       logAtomize(job, '原子化完成');
       appendFlowRunStageAttempt(
         specName,
@@ -4546,7 +4928,7 @@ async function runAtomizeJob(specName, job, options = {}) {
           usage: null,
           llmContext: describeLlmConfig(getActiveLlmConfig()),
           meta: {
-            total: summaries.length,
+            total: originalTasks.length,
             completed: doneIndices.size,
           },
           error: null,
@@ -4565,10 +4947,10 @@ async function runAtomizeJob(specName, job, options = {}) {
       return;
     }
 
-    const remaining = Math.max(0, summaries.length - doneIndices.size);
+    const remaining = Math.max(0, originalTasks.length - doneIndices.size);
     logAtomize(
       job,
-      `本次分段完成（处理 ${processedThisRun} 条），已完成 ${doneIndices.size}/${summaries.length}，剩余 ${remaining} 条。`,
+      `本次分段完成（处理 ${processedThisRun} 条），已完成 ${doneIndices.size}/${originalTasks.length}，剩余 ${remaining} 条。`,
     );
   } catch (error) {
     job.running = false;
@@ -4618,7 +5000,6 @@ async function generateTasksWithModelAtomicLegacy(design, prompt) {
     const invalidPath = normalized.some(
       (t) =>
         !(
-          /(TBD|待定)/i.test(t.title) ||
           /[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/.test(t.title) ||
           /\\/.test(t.title)
         ),
@@ -4645,7 +5026,7 @@ async function generateTasksWithModelAtomicLegacy(design, prompt) {
     `   - details: 字符串，写清依赖、API、命令、CSS 类名等\n` +
     `   - ac: 字符串，写清验收标准（如何证明成功）\n` +
     `8) 任务必须为简体中文。\n` +
-    `9) 如果某些文件路径不确定，用 TBD 占位，但仍必须以“创建/修改/删除”开头。\n`;
+    `9) 如果某些文件路径不确定：不要用 TBD；改为创建/修改 docs/assumptions.md 记录“待确认点：...”并先补齐可执行信息。\n`;
 
   const PHASE_MIN_TASKS = Number(process.env.LLM_TASK_PHASE_MIN || 6);
   const PHASE_MAX_TASKS = Number(process.env.LLM_TASK_PHASE_MAX || 18);
