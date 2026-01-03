@@ -171,10 +171,12 @@ function computeThroughputEtaSeconds(input: {
 }
 
 const MATRIX_GLYPHS =
-  'ﾊﾐﾋｰｳｼﾅﾓﾆｻﾜﾂｵﾘｱﾎﾃﾏｹﾒｴｦｧｨｩｪｫｬｭｮｯ' +
-  '0123456789' +
-  'ABCDEFGHIJKLMNOPQRSTUVWXYZ' +
-  '#$%&*+-<>/\\|=';
+  '░▒▓█▌▐▀▄▖▗▘▙▚▛▜▝▞▟' +
+  '┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬═║' +
+  '◆◇◈◉◎●○◊◌◍◐◑◒◓◔◕' +
+  '☰☱☲☳☴☵☶☷' +
+  '⌁⌂⌃⌄⌅⌆⌇⌈⌉⌊⌋⌌⌍⌎⌏' +
+  '⟐⟑⟒⟓⟔⟕⟖⟗⟘⟙⟠⟡⟢⟣⟤⟥';
 
 function matrixScrambleSegment(segment: string, phase: number) {
   const len = segment.length;
@@ -1449,7 +1451,7 @@ export default function App() {
     showToast,
   ]);
 
-  const generateTasksFromDesign = useCallback(async () => {
+  const generateTasksFromDesign = useCallback(async (options?: { skipTechStack?: boolean }) => {
     if (!selectedSpecName) return;
     setToast(null);
     setBusyLabel('生成中');
@@ -1460,11 +1462,16 @@ export default function App() {
         const ok = window.confirm('将覆盖现有任务文档（tasks），是否继续？');
         if (!ok) return;
       }
-      if (!areClarificationsComplete(techStackClarifications)) {
-        throw new Error('请先完成所有必填的技术栈确认');
+      const skipTechStack =
+        options?.skipTechStack === true ||
+        selectedSpec?.status?.projectCategory === 'non_software';
+      if (!skipTechStack) {
+        if (!areClarificationsComplete(techStackClarifications)) {
+          throw new Error('请先完成所有必填的技术栈确认');
+        }
+        await saveTechStackClarifications();
+        await applyTechStackToDesign();
       }
-      await saveTechStackClarifications();
-      await applyTechStackToDesign();
       await apiNdjsonStream(
         `/specs/${encodeURIComponent(selectedSpecName)}/confirm?stream=1`,
         {
@@ -1472,7 +1479,10 @@ export default function App() {
           body: JSON.stringify({
             artifact: 'design',
             force: true,
-            techStackClarifications: { questions: techStackClarifications },
+            ...(skipTechStack ? { skipTechStack: true } : {}),
+            ...(skipTechStack
+              ? {}
+              : { techStackClarifications: { questions: techStackClarifications } }),
           }),
         },
         handleNdjsonEvent,
@@ -1879,6 +1889,7 @@ export default function App() {
   const activeModelId = llm?.model ?? '';
   const activePing = activeModelId ? modelPing[activeModelId] : null;
   const isAtomicView = activeArtifact === 'tasks' && taskView === 'atomic';
+  const isNonSoftwareProject = selectedSpec?.status?.projectCategory === 'non_software';
   const displayContent = isAtomicView
     ? tasksAtomicContent
     : artifactContent[activeArtifact] ?? '';
@@ -1975,8 +1986,8 @@ export default function App() {
       if (
         artifactContent.design.trim() &&
         !artifactContent.tasks.trim() &&
-        techStackClarifications.length &&
-        areClarificationsComplete(techStackClarifications)
+        (isNonSoftwareProject ||
+          (techStackClarifications.length && areClarificationsComplete(techStackClarifications)))
       ) {
         return 'generateTasks';
       }
@@ -2006,6 +2017,7 @@ export default function App() {
     clarifications,
     rawPrompt,
     selectedSpec?.files?.tasks_atomic,
+    selectedSpec?.status?.projectCategory,
     selectedSpecName,
     shouldTypewriter,
     tasksAtomicContent,
@@ -2673,15 +2685,23 @@ export default function App() {
             {selectedSpecName && activeArtifact === 'design' && (
               <div className="mb-4 space-y-3 rounded-md border border-slate-800 bg-slate-900/30 p-3">
                 <div className="flex flex-wrap items-center gap-2">
-                  <div className="text-sm font-semibold text-slate-200">技术栈确认</div>
+                  <div className="text-sm font-semibold text-slate-200">
+                    {isNonSoftwareProject ? '项目类型：非软件项目' : '技术栈确认'}
+                  </div>
                   <div className="text-xs text-slate-400">
-                    {areClarificationsComplete(techStackClarifications)
-                      ? '已完成'
-                      : '未完成'}
+                    {isNonSoftwareProject
+                      ? '已自动跳过软件工程专属步骤'
+                      : areClarificationsComplete(techStackClarifications)
+                        ? '已完成'
+                        : '未完成'}
                   </div>
                 </div>
 
-                {techStackClarifications.length ? (
+                {isNonSoftwareProject ? (
+                  <div className="text-sm text-slate-400">
+                    当前原始需求被识别为“非软件项目”，系统将直接生成任务（以文档/交付物/流程为主），不进入技术栈选择。
+                  </div>
+                ) : techStackClarifications.length ? (
                   <div className="space-y-3">
                     {techStackClarifications.map((q, idx) => (
                       <div
@@ -2807,17 +2827,22 @@ export default function App() {
                 <div className="flex justify-end gap-2 pt-1">
                   <Button
                     size="sm"
-                    onClick={() => void generateTasksFromDesign()}
+                    onClick={() =>
+                      void generateTasksFromDesign(
+                        isNonSoftwareProject ? { skipTechStack: true } : undefined,
+                      )
+                    }
                     disabled={
                       !selectedSpecName ||
                       Boolean(busyLabel) ||
                       !artifactContent.design.trim() ||
-                      !techStackClarifications.length ||
-                      !areClarificationsComplete(techStackClarifications)
+                      (!isNonSoftwareProject &&
+                        (!techStackClarifications.length ||
+                          !areClarificationsComplete(techStackClarifications)))
                     }
                     className={nextAction === 'generateTasks' ? guidedButtonClass : ''}
                   >
-                    确认技术栈并生成任务
+                    {isNonSoftwareProject ? '生成任务' : '确认技术栈并生成任务'}
                   </Button>
                 </div>
               </div>
