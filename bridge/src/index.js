@@ -180,10 +180,24 @@ const DEFAULT_PROMPT_CONFIG = {
 	        `设计内容如下：\n{{design}}\n\n补充描述：{{prompt}}\n\n` +
 	        '请输出 {{minTasks}}-{{maxTasks}} 条任务（不要求原子化）。' +
 	        '每条任务必须包含 title/core/details/ac 四个字段，简体中文；严禁输出 TBD/待定/[path]/占位符。\n' +
-	        'title 写清任务名称与产出（模块/流程级别即可）。\n' +
-	        'core 写清关键目标与范围边界（做什么/不做什么）。\n' +
-	        'details 写清关键技术点/接口/数据结构/页面与路由，不要空泛。\n' +
-	        'ac 必须可验证：写清验证步骤（命令/接口/页面路径/可观察结果）。\n' +
+	        '1) title：写清任务名称与产出（页面级/组件级/模块级即可）。\n' +
+	        '2) core：写清关键目标与范围边界（做什么/不做什么），必要时写明“顺序/依赖”。\n' +
+	        '3) details：写清关键技术点/接口/数据结构/页面与路由；优先写明确的文件路径（例如 docs/*.md、*.html、css/*.css、js/*.js、assets/*）。\n' +
+	        '   - 重要：每条任务的 details 只能列出“本任务直接创建/修改”的文件路径；依赖/引用的其他文件不要在该任务里写路径（用“后续任务提供”描述），避免原子化重复/冲突。\n' +
+	        '   - 若本任务涉及多个页面/文件：details 必须列出全部文件路径，禁止只写一个代表文件。\n' +
+	        '   - ac 中禁止引入 details 未出现的新文件路径/页面名（跨任务验证放到对应任务里）。\n' +
+	        '4) ac：必须可验证，且尽量客观：写清“页面/元素/操作/预期结果”，并至少包含 1 条可执行的验证方式（命令/页面路径/控制台断言/可观察结果）。\n' +
+	        '5) 文档类产出（信息架构/路由/内容清单/假设）必须写入 docs/*.md（推荐 docs/ia.md），禁止把文档内容写进 index.html。\n' +
+	        '6) 若存在多页面重复结构（header/footer/nav 等），必须设计成可复用片段或脚本注入（确保核心结构只改一处）。\n' +
+	        '7) 任务顺序建议：先规划文档与目录结构 -> 再全局样式与共享结构 -> 再页面内容与交互 -> 最后补响应式与验收/冒烟检查。\n' +
+	        '8) 禁止输出互斥的多套实现方案（例如同时出现“header.html 片段方案”与“JS 注入方案”）；必须选择一套实现路线并全程保持一致。\n' +
+	        '9) 若技术栈为“纯 HTML/CSS/JS 且不引入构建工具”，推荐固定路线：\n' +
+	        '   - 页面：index.html、about.html、services.html、cases.html、case-detail.html、news.html、news-detail.html、careers.html、contact.html\n' +
+	        '   - 样式：css/style.css（先定义全局变量/排版/网格，再做页面区块样式）\n' +
+	        '   - 数据：js/data.js（统一用 window.__SITE_DATA__ 暴露，禁止 export/import 与 window 挂载混用）\n' +
+	        '   - 共享头尾：js/partials.js（渲染到 #site-header / #site-footer），禁止创建 header.html/footer.html 片段文件\n' +
+	        '   - 交互入口：js/main.js（集中初始化导航/表单/详情渲染；禁止拆成 js/pages/*.js 多入口）\n' +
+	        '   - 验收：scripts/verify.js（node scripts/verify.js；仅用 Node 内置模块，禁止 jsdom/puppeteer 等第三方依赖）+ 本地预览命令（python -m http.server 8000，访问 http://localhost:8000/）\n' +
 	        '请严格输出 JSON：{"tasks":[{title,core,details,ac}]}。',
 	    },
 	    atomize: {
@@ -194,20 +208,31 @@ const DEFAULT_PROMPT_CONFIG = {
 	      user:
 	        `{{context}}{{main}}\n\n{{reasonBlock}}` +
 	        '要求：\n' +
-	        '1) 输出为原子级任务，不要摘要，拆到无法再拆；单条任务建议 5-10 分钟内可完成。\n' +
+	        '1) 输出为原子级任务，不要摘要；拆到“可独立实现并可验收”为止；单条任务建议 10-20 分钟内可完成（目标约 15 分钟）。\n' +
+	        '   - 禁止为追求更小而拆到单个 DOM 节点（如单个 <li>/<span>）、单个 class/单个 CSS 属性等微改。\n' +
+	        '   - 同一文件内围绕同一功能/区块/交互，尽量一次完成其结构/样式/文案/数据绑定；只有当同一文件内存在明显可独立验收的多个功能点时才拆分。\n' +
 	        '2) 任务对象字段：title/core/details/ac。\n' +
 	        '3) title 必须以“创建/修改/删除 <相对文件路径>”开头，且 <相对文件路径> 必须是动作后的第一个 token（后续说明用“｜”追加）。\n' +
 	        '   - 文件路径必须包含扩展名（.ts/.tsx/.js/.md/.css/.json 等），且必须为最终可用路径。\n' +
 	        '   - 绝对禁止使用 TBD/待定/[path]/占位符。\n' +
 	        '   - 绝对禁止在 title/core/details/ac 任一字段中出现 TBD/待定/[path]/占位符（需要表达不确定性时，用“待确认点：...”并写入 docs/assumptions.md）。\n' +
-	        '   - 若 {{context}} 中包含“项目结构/文件树”，路径必须优先从中选择；若需新建文件，也必须落在合理目录并与现有结构一致。\n' +
+	        '   - 若 {{context}} 中包含“路径约束/目标文件路径”，路径必须从中选择；若需新建文件，必须落在合理目录并与现有结构一致。\n' +
+	        '   - 禁止在输出任务中描述“路径约束/范围限制”或以此为理由调整需求；仅按范围内路径继续拆解。\n' +
 	        '4) 一条任务只允许涉及 1 个文件；若需要改多个文件，拆成多条。\n' +
 	        '5) core/details 必须具体可执行，包含关键导出名/函数名/接口字段/API 路由/组件 Props/CSS 类名；避免空泛措辞。\n' +
-	        '6) 遵循定义先行：先 types/interfaces/schema/DTO，再业务逻辑，再 UI/交互。\n' +
-	        '7) ac 必须“机器可验证”，至少包含 1 条可执行的验证方式（命令/接口/页面路径/可观察结果）。\n' +
-	        '   - 禁止仅用 rg/grep/搜索 作为唯一验收；必须至少包含 1 条“行为验证”（接口响应/构建或测试通过/页面交互可观察结果）。\n' +
-	        '8) 信息不足时：先补 1 条“创建 docs/assumptions.md”记录假设/待确认点（写清缺失信息），再继续拆分。\n' +
-	        '9) 简体中文。\n' +
+	        '6) 遵循定义先行：先定义数据结构/常量/DOM id 与 class/接口契约，再实现渲染与交互逻辑；若涉及 TS/后端/DB，依然遵循 types/schema -> logic -> UI。\n' +
+	        '7) 文档类任务必须输出到 docs/*.md（推荐 docs/ia.md），禁止把信息架构/路由说明写进 HTML 页面。\n' +
+	        '8) 一致性约束：同一 spec 内必须选择唯一实现路线并保持一致（尤其是 header/footer 复用方式、数据组织方式、类名命名）。禁止同时输出两套互斥方案。\n' +
+	        '9) 对“纯 HTML/CSS/JS 且不引入构建工具”的场景：\n' +
+	        '   - 数据文件统一采用 js/data.js，并以 window.__SITE_DATA__ 暴露；后续任务必须一致引用，禁止 export/import 与 window 挂载混用。\n' +
+	        '   - 共享结构优先采用 js/partials.js 注入（渲染到 #site-header/#site-footer），禁止创建 header.html/footer.html 片段文件。\n' +
+	        '   - 交互入口统一采用 js/main.js（按页面识别执行初始化）；禁止引入 js/pages/*.js 或 home.js/index.js 等多入口脚本。\n' +
+	        '10) ac 必须“机器可验证”，且尽量客观：优先提供 CLI 可脚本化验证（例如 node scripts/verify.js）；必要时可补充页面验证（页面路径+元素+操作+预期）。\n' +
+	        '   - 验收脚本必须仅依赖 Node 内置模块（fs/path/assert 等），禁止 jsdom/puppeteer 等第三方依赖。\n' +
+	        '   - 禁止仅用 rg/grep/搜索 作为唯一验收；必须至少包含 1 条“行为验证”（脚本运行结果/构建或测试通过/页面交互可观察结果）。\n' +
+	        '11) 依赖/顺序：若该任务依赖前置容器/数据/样式变量，必须在 details 中写明“前置条件：...”，确保执行顺序一致。\n' +
+	        '12) 信息不足时：先补 1 条“创建 docs/assumptions.md”记录假设/待确认点（写清缺失信息），再继续拆分。\n' +
+	        '13) 简体中文。\n' +
 	        '只输出 JSON：{"tasks":[...]}。',
 	    },
     reportScore: {
@@ -3132,7 +3157,29 @@ async function generateClarificationsWithModel(prompt, options = {}) {
       if (!payload) throw new Error(`LLM output not JSON: ${String(content).slice(0, 200)}`);
       const normalized = normalizeRequirementsClarifications(payload);
       if (!isValidClarifications(normalized)) {
-        throw new Error(`LLM questions invalid: ${String(content).slice(0, 200)}`);
+        const filtered = {
+          ...normalized,
+          questions: Array.isArray(normalized.questions)
+            ? normalized.questions
+                .filter((q) => {
+                  if (isBadQuestionText(q?.question)) return false;
+                  if (!Array.isArray(q?.options) || q.options.length < 2) return false;
+                  return q.options.every(
+                    (opt) => typeof opt?.label === 'string' && opt.label.trim(),
+                  );
+                })
+                .slice(0, 10)
+            : [],
+        };
+        if (!isValidClarifications(filtered)) {
+          throw new Error(`LLM questions invalid: ${String(content).slice(0, 200)}`);
+        }
+        recordTelemetry(null);
+        return {
+          questions: filtered.questions,
+          generatedBy: 'llm_filtered',
+          generationError: null,
+        };
       }
       recordTelemetry(null);
       return { questions: normalized.questions, generatedBy: 'llm', generationError: null };
@@ -3146,6 +3193,69 @@ async function generateClarificationsWithModel(prompt, options = {}) {
   }
 }
 
+function buildDefaultRequirementsClarifications(prompt) {
+  const text = normalizePrompt(prompt);
+  const now = new Date().toISOString();
+
+  const make = (id, question, optionLabels) => ({
+    id,
+    question,
+    mode: 'single',
+    required: true,
+    allowOther: true,
+    options: optionLabels.map((label, index) => ({
+      id: String.fromCharCode('a'.charCodeAt(0) + index),
+      label,
+    })),
+    answer: { selectedOptionIds: [], otherText: '' },
+    createdAt: now,
+  });
+
+  if (/(企业)?官网|网站|网页/i.test(text)) {
+    return {
+      questions: [
+        make('q1', '企业官网的主要目标是什么？', [
+          '品牌展示与形象提升',
+          '获客与线索收集',
+          '产品/服务介绍与转化',
+          '招聘与企业文化传播',
+        ]),
+        make('q2', '企业官网的目标受众是谁？', [
+          'B2B 采购/合作伙伴',
+          'B2C 终端客户',
+          '投资人/媒体',
+          '求职者',
+        ]),
+        make('q3', '计划包含哪些核心栏目？', [
+          '首页 + 关于我们 + 产品/服务 + 联系我们',
+          '加上案例/客户故事',
+          '加上新闻/博客',
+          '加上招聘/加入我们',
+        ]),
+        make('q4', '内容管理需求如何？', [
+          '无需后台，静态内容即可',
+          '需要简单后台（新闻/案例更新）',
+          '需要完整 CMS（多角色/权限）',
+          '由外部系统提供内容接口',
+        ]),
+        make('q5', '企业官网是否需要多语言？', ['仅中文', '中英双语', '三语及以上', '暂不确定']),
+        make('q6', '希望的视觉风格偏好？', ['科技/现代感', '商务/稳重', '简约/留白', '活泼/创意']),
+      ],
+    };
+  }
+
+  return {
+    questions: [
+      make('q1', '这个需求的主要目标是什么？', ['效率提升', '对外展示/获客', '数据统计/分析', '其他']),
+      make('q2', '主要使用者是谁？', ['内部员工', '外部客户', '管理员', '其他']),
+      make('q3', '必须包含哪些核心能力？', ['基础展示/查询', '表单提交/交互', '账号/权限', '其他']),
+      make('q4', '内容/数据更新频率如何？', ['几乎不变', '偶尔更新', '频繁更新', '暂不确定']),
+      make('q5', '有哪些非功能需求优先级？', ['性能/加载速度', '兼容性/移动端', '安全/权限', '可访问性/SEO']),
+      make('q6', '交付形态倾向是什么？', ['静态站', '单页应用', '后端 API', '脚本/自动化']),
+    ],
+  };
+}
+
 function ensureRequirementsClarificationsSeeded(specName, status, prompt) {
   const normalized = { ...DEFAULT_SPEC_STATUS, ...status };
   const current = normalizeRequirementsClarifications(
@@ -3153,7 +3263,26 @@ function ensureRequirementsClarificationsSeeded(specName, status, prompt) {
   );
   if (normalized.requirementsConfirmed) return { changed: false, status: normalized };
   if (current.questions.length > 0) return { changed: false, status: normalized };
-  return { changed: false, status: normalized };
+
+  const seeded = buildDefaultRequirementsClarifications(prompt);
+  if (!Array.isArray(seeded?.questions) || seeded.questions.length === 0) {
+    return { changed: false, status: normalized };
+  }
+
+  const now = new Date().toISOString();
+  const next = {
+    ...normalized,
+    requirementsClarifications: {
+      ...current,
+      questions: seeded.questions,
+      updatedAt: now,
+      confirmedAt: normalized.requirementsClarifications?.confirmedAt ?? null,
+      generatedBy: 'default',
+      generationError: null,
+    },
+  };
+  writeSpecStatus(specName, next);
+  return { changed: true, status: next };
 }
 
 function slugifyPrompt(prompt) {
@@ -3935,6 +4064,65 @@ function parseTasksForAtomize(markdown) {
   }));
 }
 
+const ATOMIZE_PATH_CANDIDATE_RE =
+  /(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:ts|tsx|js|jsx|md|json|css|scss|less|html|htm|svg|png|jpg|jpeg|gif|ico|txt)\b/g;
+
+function normalizePathForPolicy(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\.\/+/, '')
+    .replace(/^\/+/, '');
+}
+
+function buildAtomizePathPolicy(originalTasks) {
+  const allowedExactSet = new Set();
+  const allowedPrefixSet = new Set();
+
+  const addPath = (raw) => {
+    const normalized = normalizePathForPolicy(raw);
+    if (!normalized) return;
+    if (normalized.includes('..')) return;
+    allowedExactSet.add(normalized);
+    const parts = normalized.split('/').filter(Boolean);
+    if (parts.length <= 1) return;
+    for (let i = 1; i < parts.length; i += 1) {
+      allowedPrefixSet.add(`${parts.slice(0, i).join('/')}/`);
+    }
+  };
+
+  const tasks = Array.isArray(originalTasks) ? originalTasks : [];
+  for (const task of tasks) {
+    // NOTE: Path policy scopes should come from the task's implementation scope (title/core/details),
+    // not from AC examples which often include URLs or cross-task verification references.
+    const haystack = [task?.title, task?.core, task?.details]
+      .filter(Boolean)
+      .join('\n');
+    const matches = haystack.matchAll(ATOMIZE_PATH_CANDIDATE_RE);
+    for (const match of matches) {
+      const raw = match?.[0];
+      if (!raw) continue;
+      const index = typeof match.index === 'number' ? match.index : -1;
+      if (index >= 0) {
+        const prefix = haystack.slice(Math.max(0, index - 48), index);
+        // Exclude URL paths like http://localhost:8000/index.html -> 8000/index.html
+        if (/(https?:\/\/|localhost:|127\.0\.0\.1:)/i.test(prefix)) continue;
+      }
+      addPath(raw);
+    }
+  }
+
+  // Allow assumptions as the only doc escape hatch.
+  allowedExactSet.add('docs/assumptions.md');
+
+  const allowedExact = Array.from(allowedExactSet).sort();
+  const allowedPrefixes = Array.from(allowedPrefixSet)
+    .map((p) => (p.endsWith('/') ? p : `${p}/`))
+    .sort((a, b) => b.length - a.length);
+
+  return { allowedExact, allowedPrefixes };
+}
+
 function truncateForPrompt(text, maxLen) {
   const value = String(text || '').trim();
   if (!value) return '';
@@ -4069,7 +4257,31 @@ function sanitizeAtomicField(value, fallback) {
   return text;
 }
 
-function validateAtomicTasks(tasks) {
+function normalizeAtomizePathPolicy(policy) {
+  if (!policy || typeof policy !== 'object') return null;
+  const allowedExact = Array.isArray(policy.allowedExact) ? policy.allowedExact : [];
+  const allowedPrefixes = Array.isArray(policy.allowedPrefixes) ? policy.allowedPrefixes : [];
+
+  const exact = new Set(
+    allowedExact
+      .map((p) => normalizePathForPolicy(p))
+      .filter((p) => p && !p.includes('..')),
+  );
+  const prefixes = Array.from(
+    new Set(
+      allowedPrefixes
+        .map((p) => normalizePathForPolicy(p))
+        .filter((p) => p && !p.includes('..')),
+    ),
+  )
+    .map((p) => (p.endsWith('/') ? p : `${p}/`))
+    .sort((a, b) => b.length - a.length);
+
+  if (exact.size === 0 && prefixes.length === 0) return null;
+  return { exact, prefixes };
+}
+
+function validateAtomicTasks(tasks, pathPolicy = null) {
   if (!Array.isArray(tasks) || tasks.length === 0) return { ok: false, error: 'empty' };
   const normalized = tasks.map(normalizeTaskObject).filter(Boolean);
   if (!normalized.length) return { ok: false, error: 'invalid_shape' };
@@ -4113,6 +4325,20 @@ function validateAtomicTasks(tasks) {
     return false;
   });
   if (invalidPath) return { ok: false, error: 'invalid_path' };
+
+  const normalizedPolicy = normalizeAtomizePathPolicy(pathPolicy);
+  if (normalizedPolicy) {
+    const outOfScope = normalized.some((t) => {
+      const token = extractPathToken(t.title);
+      if (!token) return true;
+      const normalizedToken = normalizePathForPolicy(token);
+      if (!normalizedToken) return true;
+      if (normalizedPolicy.exact.has(normalizedToken)) return false;
+      return !normalizedPolicy.prefixes.some((prefix) => normalizedToken.startsWith(prefix));
+    });
+    if (outOfScope) return { ok: false, error: 'path_out_of_scope' };
+  }
+
   const seen = new Set();
   const deduped = [];
   for (const task of normalized) {
@@ -4367,10 +4593,38 @@ async function requestAtomicTasks(payload, designSnippet, timeoutMs, reason = ''
 
   const isList = Array.isArray(payload?.tasks);
   const repoTree = getRepoTreeSnapshotForPrompt();
-  const structureContext = repoTree
-    ? `项目结构（自动扫描，仅用于文件路径精确化；已过滤 node_modules/dist 等）：\n${repoTree}\n\n`
+  const normalizedPolicy = normalizeAtomizePathPolicy(telemetry?.pathPolicy || null);
+  const policyContext = normalizedPolicy
+    ? (() => {
+        const exactList = Array.from(normalizedPolicy.exact).sort();
+        const prefixList = normalizedPolicy.prefixes.slice();
+
+        const shownExact = exactList.slice(0, 60);
+        const moreExact = Math.max(0, exactList.length - shownExact.length);
+        const shownPrefix = prefixList.slice(0, 12);
+        const morePrefix = Math.max(0, prefixList.length - shownPrefix.length);
+
+        const blocks = [
+          '本原始任务可输出的文件路径范围：',
+          `- 允许精确文件：${shownExact.slice(0, 18).join('、')}${exactList.length > 18 ? ` 等（共 ${exactList.length} 个）` : ''}`,
+          `- 允许目录前缀：${shownPrefix.join('、')}${morePrefix ? ` 等（共 ${prefixList.length} 个）` : ''}`,
+          '- 仅在该范围内选择 title 的 <相对文件路径>，不要在输出中描述该范围本身。',
+          '',
+          '目标文件路径（可用于 title 的 <相对文件路径>）：',
+          ...shownExact.map((p) => `- ${p}`),
+          ...(moreExact ? [`- …（${moreExact} 项省略）`] : []),
+          '',
+        ];
+        return `${blocks.join('\n')}\n\n`;
+      })()
     : '';
-  const context = `${structureContext}${designSnippet ? `设计摘要：${designSnippet}\n\n` : ''}`;
+
+  const structureContext =
+    !normalizedPolicy && repoTree
+      ? `项目结构（自动扫描，仅用于文件路径精确化；已过滤 node_modules/dist 等）：\n${repoTree}\n\n`
+      : '';
+
+  const context = `${policyContext}${structureContext}${designSnippet ? `设计摘要：${designSnippet}\n\n` : ''}`;
   const main = isList
     ? `当前任务列表（JSON）：\n${JSON.stringify(payload.tasks)}\n\n请进一步拆分为更原子任务；若已足够原子则保持。`
     : `原始任务：${payload.summary}\n\n请拆分为无法再拆的原子任务。`;
@@ -4501,12 +4755,12 @@ async function requestAtomicTasks(payload, designSnippet, timeoutMs, reason = ''
 
   const parsed = tryParseJson(content);
   let candidateTasks = Array.isArray(parsed?.tasks) ? parsed.tasks : [];
-  let verdict = validateAtomicTasks(candidateTasks);
+  let verdict = validateAtomicTasks(candidateTasks, telemetry?.pathPolicy || null);
   let lastError = verdict.error || null;
 
   if (!verdict.ok && lastError === 'contains_placeholder') {
     const filtered = filterStrictAtomicTasks(candidateTasks);
-    const filteredVerdict = validateAtomicTasks(filtered);
+    const filteredVerdict = validateAtomicTasks(filtered, telemetry?.pathPolicy || null);
     if (filteredVerdict.ok) {
       verdict = filteredVerdict;
       lastError = null;
@@ -4519,12 +4773,12 @@ async function requestAtomicTasks(payload, designSnippet, timeoutMs, reason = ''
     const repair = repairedCall.content;
     const repaired = tryParseJson(repair);
     candidateTasks = Array.isArray(repaired?.tasks) ? repaired.tasks : [];
-    verdict = validateAtomicTasks(candidateTasks);
+    verdict = validateAtomicTasks(candidateTasks, telemetry?.pathPolicy || null);
     lastError = verdict.error || lastError;
 
     if (!verdict.ok && verdict.error === 'contains_placeholder') {
       const filtered = filterStrictAtomicTasks(candidateTasks);
-      const filteredVerdict = validateAtomicTasks(filtered);
+      const filteredVerdict = validateAtomicTasks(filtered, telemetry?.pathPolicy || null);
       if (filteredVerdict.ok) {
         verdict = filteredVerdict;
         lastError = null;
@@ -4889,6 +5143,7 @@ async function runAtomizeJob(specName, job, options = {}) {
       logAtomize(job, `开始原始任务 ${index}/${originalTasks.length}：${originalTitle}`);
       const telemetry = {
         meta: { originalIndex: index, originalTask: originalTitle, originalTaskDetail: summaryForModel },
+        pathPolicy: buildAtomizePathPolicy([original]),
         recordAttempt: (attempt) =>
           appendFlowRunStageAttempt(specName, 'atomize', attempt, { reason: flowRunReason }),
       };
@@ -5245,21 +5500,47 @@ async function createSpecTemplates(name, artifacts = ['requirements'], prompt = 
     if (SPEC_ARTIFACTS.includes(artifact)) {
       if (artifact === 'requirements') {
         onStage?.('requirements', 'start');
-        const content = await generateRequirementsWithModel(prompt, {
-          onToken: onLlmToken ? (delta) => onLlmToken('requirements', delta) : null,
-          onTelemetry,
-        });
+        let content = '';
+        try {
+          content = await generateRequirementsWithModel(prompt, {
+            onToken: onLlmToken ? (delta) => onLlmToken('requirements', delta) : null,
+            onTelemetry,
+          });
+        } catch (error) {
+          const message = truncateText(error?.message || String(error || ''), 240);
+          console.warn('Requirements generation failed, fallback to template:', message);
+          content = generateRequirementsContent(prompt);
+        }
         onStage?.('requirements', 'end');
         writeSpecFile(name, artifact, content);
         const status = readSpecStatus(name);
         ensureRequirementsReviewSeeded(name, status, content);
         onStage?.('requirementsClarifications', 'start');
-        const clarifications = await generateClarificationsWithModel(prompt, {
-          onToken: onLlmToken
-            ? (delta) => onLlmToken('requirementsClarifications', delta)
-            : null,
-          onTelemetry,
-        });
+        let clarifications = null;
+        let clarificationsMeta = { generatedBy: 'llm', generationError: null };
+        const shouldUseDefaultWebsiteClarifications = /(企业)?官网|网站|网页/i.test(prompt || '');
+
+        if (shouldUseDefaultWebsiteClarifications) {
+          clarifications = buildDefaultRequirementsClarifications(prompt);
+          clarificationsMeta = { generatedBy: 'default_website', generationError: null };
+        } else {
+          try {
+            clarifications = await generateClarificationsWithModel(prompt, {
+              onToken: onLlmToken
+                ? (delta) => onLlmToken('requirementsClarifications', delta)
+                : null,
+              onTelemetry,
+            });
+          } catch (error) {
+            const message = truncateText(error?.message || String(error || ''), 240);
+            console.warn('Clarifications generation failed, fallback to default:', message);
+            clarifications = buildDefaultRequirementsClarifications(prompt);
+            clarificationsMeta = {
+              generatedBy: 'default_fallback',
+              generationError: message || 'LLM clarifications failed',
+            };
+          }
+        }
         onStage?.('requirementsClarifications', 'end');
         const normalizedClarifications = normalizeRequirementsClarifications(clarifications);
         const nextStatus = readSpecStatus(name);
@@ -5268,8 +5549,8 @@ async function createSpecTemplates(name, artifacts = ['requirements'], prompt = 
           questions: normalizedClarifications.questions.length
             ? normalizedClarifications.questions
             : [],
-          generatedBy: 'llm',
-          generationError: null,
+          generatedBy: clarificationsMeta.generatedBy,
+          generationError: clarificationsMeta.generationError,
           updatedAt: new Date().toISOString(),
           confirmedAt: nextStatus.requirementsClarifications?.confirmedAt ?? null,
         };
@@ -5283,14 +5564,43 @@ async function createSpecTemplates(name, artifacts = ['requirements'], prompt = 
   if (categoryPromise) {
     const result = await categoryPromise;
     const fallbackCategory = inferProjectCategoryFromPrompt(prompt);
-    const decided = result?.projectCategory || fallbackCategory;
+    const llmCategory = normalizeProjectCategoryValue(result?.projectCategory);
+    const confidence =
+      result && Number.isFinite(result.confidence)
+        ? Math.max(0, Math.min(1, Number(result.confidence)))
+        : null;
+
+    let decided = llmCategory || fallbackCategory;
+
+    // If LLM confidence is low, trust heuristic to reduce misclassification.
+    if (confidence !== null && confidence < 0.55) {
+      decided = fallbackCategory;
+    }
+    // Specifically guard common false positives: website prompts misjudged as non-software.
+    if (
+      decided === 'non_software' &&
+      fallbackCategory === 'software' &&
+      (confidence === null || confidence < 0.85)
+    ) {
+      decided = fallbackCategory;
+    }
     const now = new Date().toISOString();
     const status = readSpecStatus(name);
     const nextStatus = {
       ...status,
       projectCategory: decided,
       projectCategoryMeta: result
-        ? { ...result, judgedAt: now, source: 'llm' }
+        ? {
+            ...result,
+            projectCategory: decided,
+            confidence,
+            reason:
+              llmCategory && decided !== llmCategory
+                ? `${String(result.reason || '').trim()}（低置信度，已按启发式纠正）`.trim()
+                : result.reason || '',
+            judgedAt: now,
+            source: 'llm',
+          }
         : { projectCategory: decided, confidence: null, reason: '', judgedAt: now, source: 'heuristic' },
       techStackConfirmed: decided === 'non_software' ? true : status.techStackConfirmed,
     };
@@ -6624,6 +6934,11 @@ watcher.on('unlink', (filePath) => {
     source: 'watcher',
     message: `[file removed] ${relativePath}`,
   });
+});
+watcher.on('error', (error) => {
+  const message = error?.message || String(error || '');
+  console.error('Watcher error:', message);
+  emitEvent('log:append', { source: 'watcher', message: `[watcher error] ${message}` });
 });
 
 emitEvent('log:append', {
