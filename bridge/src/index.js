@@ -227,6 +227,7 @@ const DEFAULT_PROMPT_CONFIG = {
 	        '   - 数据文件统一采用 js/data.js，并以 window.__SITE_DATA__ 暴露；后续任务必须一致引用，禁止 export/import 与 window 挂载混用。\n' +
 	        '   - 共享结构优先采用 js/partials.js 注入（渲染到 #site-header/#site-footer），禁止创建 header.html/footer.html 片段文件。\n' +
 	        '   - 交互入口统一采用 js/main.js（按页面识别执行初始化）；禁止引入 js/pages/*.js 或 home.js/index.js 等多入口脚本。\n' +
+	        '   - 重要：文档/任务中描述“路由/链接”时必须使用实际文件名（例如 about.html、services.html）；详情页必须用 `case-detail.html?id=...` / `news-detail.html?id=...` 这类 query 参数形式；禁止使用 /about、/products、:id 这类伪路由表达。\n' +
 	        '10) ac 必须“机器可验证”，且尽量客观：优先提供 CLI 可脚本化验证（例如 node scripts/verify.js）；必要时可补充页面验证（页面路径+元素+操作+预期）。\n' +
 	        '   - 验收脚本必须仅依赖 Node 内置模块（fs/path/assert 等），禁止 jsdom/puppeteer 等第三方依赖。\n' +
 	        '   - 禁止仅用 rg/grep/搜索 作为唯一验收；必须至少包含 1 条“行为验证”（脚本运行结果/构建或测试通过/页面交互可观察结果）。\n' +
@@ -3344,6 +3345,135 @@ function generateTasksContent(design, prompt) {
   if (!summary) {
     return SPEC_TEMPLATES.tasks;
   }
+
+  const designText = typeof design === 'string' ? design : '';
+  const combined = `${designText}\n${normalizePrompt(prompt)}`.trim();
+  const looksLikeStaticSite =
+    /(纯\s*HTML|HTML\s*\/\s*CSS\s*\/\s*JS|静态(站点|页面|托管)|无后端|不接数据库)/i.test(
+      combined,
+    );
+
+  if (looksLikeStaticSite) {
+    const includeCases = /(案例|客户故事|客户)/.test(combined);
+    const includeNews = /(新闻|动态|博客)/.test(combined);
+    const includeCareers = /(招聘|加入我们|岗位)/.test(combined);
+    const pages = [
+      'index.html',
+      'about.html',
+      'services.html',
+      ...(includeCases ? ['cases.html', 'case-detail.html'] : []),
+      ...(includeNews ? ['news.html', 'news-detail.html'] : []),
+      ...(includeCareers ? ['careers.html'] : []),
+      'contact.html',
+    ];
+    const pageListText = pages.join('、');
+
+    const tasks = [
+      {
+        title: `创建 docs/ia.md｜信息架构与页面清单`,
+        core: `明确企业官网的信息架构、页面清单与导航口径（后续页面与脚本严格以此为准）。`,
+        details: [
+          '创建 docs/ia.md，至少包含：',
+          `- 页面清单：${pageListText}`,
+          '- 导航结构：顶栏导航项与对应页面路径（使用上述页面文件名）。',
+          '- 每页主要区块大纲（首页/关于/服务/案例/新闻/招聘/联系按需）。',
+          '- 数据字段约定：统一 id/title/summary（可选 body），news 额外 date；后续写入 js/data.js。',
+          '- 约束：纯静态站点；不开发后端/数据库/登录；联系表单仅前端校验 + mailto（不落库）。',
+        ].join('\n'),
+        ac:
+          '运行 `node -e "const fs=require(\'fs\');const c=fs.readFileSync(\'docs/ia.md\',\'utf8\');if(!c.includes(\'页面清单\')) throw new Error(\'missing\');"` 退出码为 0。',
+      },
+      {
+        title: `创建 ${pages[0]} 等页面骨架｜统一共享挂载点`,
+        core: '初始化全部页面文件，统一引入样式与脚本，并预留共享 header/footer 挂载点。',
+        details: [
+          `创建/修改以下页面：${pageListText}`,
+          '- 每页包含：`<header id="site-header"></header>`、`<footer id="site-footer"></footer>`、`<main id="page-content"></main>`。',
+          '- 每页引入：`css/style.css`、`js/data.js`、`js/partials.js`、`js/main.js`（按该顺序）。',
+          '- 每页设置 `<title>` 与 `meta description`（内容可先用占位文案，但禁止 TBD/待定）。',
+        ].join('\n'),
+        ac:
+          '运行 `node -e "const fs=require(\'fs\');const pages=' +
+          JSON.stringify(pages) +
+          ';for(const p of pages){const c=fs.readFileSync(p,\'utf8\');if(!c.includes(\'site-header\')||!c.includes(\'site-footer\')) throw new Error(p+\' missing header/footer\');}console.log(\'ok\');"` 输出 `ok`。',
+      },
+      {
+        title: '创建 css/style.css｜全局样式与响应式',
+        core: '提供统一的视觉风格（商务稳重 + 简约留白）与响应式布局基础。',
+        details: [
+          '创建 css/style.css，至少包含：',
+          '- `:root` 颜色/间距/字号等 CSS 变量。',
+          '- `body`/`a`/`button`/`input` 基础排版与可读性（行高、字体栈）。',
+          '- 通用容器与网格（例如 `.container`、`.grid`）。',
+          '- header/nav/footer 基础样式与移动端折叠（可用简单菜单按钮）。',
+        ].join('\n'),
+        ac:
+          '运行 `node -e "const fs=require(\'fs\');const c=fs.readFileSync(\'css/style.css\',\'utf8\');if(!c.includes(\':root\')||!c.includes(\'.container\')) throw new Error(\'missing\');"` 退出码为 0。',
+      },
+      {
+        title: '创建 js/data.js｜站点数据源',
+        core: '提供页面渲染所需的结构化数据，统一字段口径，避免散落在页面内。',
+        details: [
+          '创建 js/data.js：',
+          '- 以 `window.__SITE_DATA__ = { ... }` 暴露（禁止 export/import 与 window 挂载混用）。',
+          '- 提供 `services` 数组（至少 3 条）。',
+          ...(includeCases
+            ? ['- 提供 `cases` 数组（至少 3 条），字段：id/title/summary/body。']
+            : []),
+          ...(includeNews
+            ? ['- 提供 `news` 数组（至少 3 条），字段：id/title/summary/date/body。']
+            : []),
+          ...(includeCareers
+            ? ['- 提供 `jobs` 数组（至少 3 条），字段：id/title/summary/body。']
+            : []),
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        ac:
+          '运行 `node -e "global.window={};require(\'./js/data.js\');if(!window.__SITE_DATA__||!Array.isArray(window.__SITE_DATA__.services)) throw new Error(\'missing\');console.log(window.__SITE_DATA__.services.length);"` 输出为大于等于 3 的数字。',
+      },
+      {
+        title: '创建 js/partials.js｜共享头尾渲染',
+        core: '在所有页面复用统一 header/footer（只改一处即可影响全站）。',
+        details: [
+          '创建 js/partials.js：',
+          '- 渲染 header 到 `#site-header`，footer 到 `#site-footer`。',
+          '- 导航链接与 docs/ia.md 的页面清单一致（使用固定文件名）。',
+          '- 当前页高亮：根据 `location.pathname` 或 `document.body.dataset.page` 判断。',
+        ].join('\n'),
+        ac:
+          '运行 `node -e "const fs=require(\'fs\');const c=fs.readFileSync(\'js/partials.js\',\'utf8\');if(!c.includes(\'site-header\')||!c.includes(\'site-footer\')) throw new Error(\'missing\');"` 退出码为 0。',
+      },
+      {
+        title: '创建 js/main.js｜页面渲染与交互',
+        core: '实现各页面的核心渲染逻辑与交互（列表/详情/表单），并与数据源保持一致。',
+        details: [
+          '创建 js/main.js：',
+          '- 初始化时先调用 `partials.js` 渲染共享头尾。',
+          '- 列表页从 `window.__SITE_DATA__` 渲染 services/cases/news/jobs 列表（按页面存在决定）。',
+          '- 详情页（case-detail.html/news-detail.html）通过 `?id=` 从数据中查找并渲染详情。',
+          '- contact.html 联系表单：前端必填校验；通过 `mailto:` 生成邮件草稿（不落库/不调用后端）。',
+        ].join('\n'),
+        ac:
+          '运行 `node -e "const fs=require(\'fs\');const c=fs.readFileSync(\'js/main.js\',\'utf8\');if(!c.includes(\'mailto:\')) throw new Error(\'missing mailto\');"` 退出码为 0。',
+      },
+      {
+        title: '创建 scripts/verify.js｜冒烟验收脚本',
+        core: '提供机器可验证的冒烟检查，避免仅靠人工打开页面。',
+        details: [
+          '创建 scripts/verify.js（仅用 Node 内置模块 fs/path/assert/url）：',
+          `- REQUIRED_FILES 至少包含：${pageListText}、css/style.css、js/data.js、js/partials.js、js/main.js、scripts/verify.js`,
+          `- HTML_PAGES 至少包含：${pageListText}`,
+          '- 检查每个 HTML 页面都包含 `#site-header`、`#site-footer`、并引入 css/style.css 与 js/main.js。',
+          '- 失败时 `process.exit(1)` 并输出原因；全部通过 `process.exit(0)`。',
+        ].join('\n'),
+        ac: '运行 `node scripts/verify.js` 退出码为 0。',
+      },
+    ];
+
+    return buildTasksMarkdown(prompt || design, { tasks });
+  }
+
   return `# 任务（tasks）\n\n## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务总览与回写入口（范围约束 / 验收记录）。\n- AI IDE 开发时优先按 tasks_atomic.md（原子化任务表单）逐条执行；完成情况与关键变更回写到 tasks.md，保持任务与代码同步。\n- 如发现遗漏或范围变化：先更新 tasks.md，再重新生成 tasks_atomic.md 后继续。\n\n## 任务清单\n- [ ] 1. 梳理“${summary}”的模块清单与页面/服务边界。\n- [ ] 2. 明确最小可运行结构（入口、路由/页面、核心依赖）。\n- [ ] 3. 拆分关键流程并标注对应代码落点。\n- [ ] 4. 明确数据结构/接口草案（字段、命名、约束）。\n- [ ] 5. 记录需要的环境变量/配置项。\n- [ ] 6. 列出需要补齐的边界与异常场景。\n`;
 }
 
@@ -4075,9 +4205,21 @@ function normalizePathForPolicy(value) {
     .replace(/^\/+/, '');
 }
 
+function extractAtomicTaskTitlePathToken(titleText) {
+  const title = String(titleText || '').trim();
+  const match = /^(创建|修改|删除)\s+(.+)$/.exec(title);
+  if (!match) return null;
+  const rest = String(match[2] || '').trim();
+  if (!rest) return null;
+  const firstToken = rest.split(/\s+/)[0] || '';
+  const beforePipe = firstToken.split(/[｜|]/)[0] || '';
+  return beforePipe.replace(/[：:，,。;；]+$/g, '').trim() || null;
+}
+
 function buildAtomizePathPolicy(originalTasks) {
   const allowedExactSet = new Set();
   const allowedPrefixSet = new Set();
+  let sawAnyPath = false;
 
   const addPath = (raw) => {
     const normalized = normalizePathForPolicy(raw);
@@ -4093,23 +4235,36 @@ function buildAtomizePathPolicy(originalTasks) {
 
   const tasks = Array.isArray(originalTasks) ? originalTasks : [];
   for (const task of tasks) {
-    // NOTE: Path policy scopes should come from the task's implementation scope (title/core/details),
-    // not from AC examples which often include URLs or cross-task verification references.
-    const haystack = [task?.title, task?.core, task?.details]
-      .filter(Boolean)
-      .join('\n');
-    const matches = haystack.matchAll(ATOMIZE_PATH_CANDIDATE_RE);
-    for (const match of matches) {
-      const raw = match?.[0];
-      if (!raw) continue;
-      const index = typeof match.index === 'number' ? match.index : -1;
-      if (index >= 0) {
-        const prefix = haystack.slice(Math.max(0, index - 48), index);
-        // Exclude URL paths like http://localhost:8000/index.html -> 8000/index.html
-        if (/(https?:\/\/|localhost:|127\.0\.0\.1:)/i.test(prefix)) continue;
+    // NOTE: Prefer title/details for path scoping. core often contains dependency paths (e.g. "依赖：docs/ia.md")
+    // which should not expand the allowed file set for this original task.
+    const scanHaystack = (haystack) => {
+      let sawAny = false;
+      const matches = String(haystack || '').matchAll(ATOMIZE_PATH_CANDIDATE_RE);
+      for (const match of matches) {
+        const raw = match?.[0];
+        if (!raw) continue;
+        const index = typeof match.index === 'number' ? match.index : -1;
+        if (index >= 0) {
+          const prefix = String(haystack || '').slice(Math.max(0, index - 48), index);
+          // Exclude URL paths like http://localhost:8000/index.html -> 8000/index.html
+          if (/(https?:\/\/|localhost:|127\.0\.0\.1:)/i.test(prefix)) continue;
+        }
+        sawAny = true;
+        addPath(raw);
       }
-      addPath(raw);
+      return sawAny;
+    };
+
+    const primaryHaystack = [task?.title, task?.details].filter(Boolean).join('\n');
+    const sawPrimary = scanHaystack(primaryHaystack);
+    if (sawPrimary) sawAnyPath = true;
+    if (!sawPrimary && task?.core) {
+      if (scanHaystack(task.core)) sawAnyPath = true;
     }
+  }
+
+  if (!sawAnyPath) {
+    return null;
   }
 
   // Allow assumptions as the only doc escape hatch.
@@ -4164,6 +4319,307 @@ function parseAtomicDoneIndices(markdown) {
     if (!Number.isNaN(value)) done.add(value);
   }
   return done;
+}
+
+function mergeAssumptionsTasksInTasksAtomicMarkdown(markdown) {
+  const text = normalizeLineEndings(markdown || '');
+  if (!text.trim()) return text;
+
+  const lines = text.split('\n');
+  const taskStartRe = /^- \[ \] \*\*Task\s+(\d+(?:\.\d+)?)\*\*[:：]\s*(.+)$/;
+  const assumptionsPath = 'docs/assumptions.md';
+
+  const items = [];
+  const itemSet = new Set();
+  const addItem = (value) => {
+    const textValue = String(value || '').trim();
+    if (!textValue) return;
+    const key = textValue.replace(/\s+/g, ' ').trim();
+    if (!key || itemSet.has(key)) return;
+    itemSet.add(key);
+    items.push(textValue);
+  };
+
+  let firstAssumptionsLabel = null;
+  let assumptionsCount = 0;
+
+  for (const line of lines) {
+    const match = taskStartRe.exec(line);
+    if (!match) continue;
+    const label = match[1];
+    const titleText = match[2];
+    const token = extractAtomicTaskTitlePathToken(titleText);
+    if (!token) continue;
+    const normalized = normalizePathForPolicy(token);
+    if (normalized !== assumptionsPath) continue;
+    assumptionsCount += 1;
+    if (!firstAssumptionsLabel) firstAssumptionsLabel = label;
+    const hint = String(titleText || '')
+      .replace(/^(创建|修改|删除)\s+docs\/assumptions\.md\s*/i, '')
+      .replace(/^[｜|]\s*/g, '')
+      .trim();
+    if (hint) addItem(hint);
+  }
+
+  if (assumptionsCount <= 1) return text;
+  if (!items.length) addItem('补齐原子化所需的缺失信息与约束');
+
+  const mergedBlockLines = [
+    `- [ ] **Task ${firstAssumptionsLabel || '1.1'}**: 修改 docs/assumptions.md｜汇总待确认点`,
+    '  - **核心逻辑**: 汇总原子化过程中的待确认点，消除重复 assumptions 任务。',
+    '  - **技术细节**: 在 docs/assumptions.md 补齐默认值与待确认点，避免后续任务出现“基址/路径/字段/交互规则不确定”。建议结构：1) 基址 baseUrl（默认 http://localhost:8000/，用于 canonical/预览）；2) 页面清单（列出全部 HTML 文件）；3) 详情页参数约定（统一 ?id=）；4) 数据字段命名（统一 id/title/summary/cover/date/body）；5) 导航高亮规则（统一基于 location.pathname，含 / 与 /index.html）；6) 待确认点条目（追加/合并如下）：',
+    ...items.map((x) => `    - ${x}`),
+    '  - **验收准则 (AC)**: 运行 `node -e "const fs=require(\\\"fs\\\");const t=fs.readFileSync(\\\"docs/assumptions.md\\\",\\\"utf8\\\");const must=[\\\"基址\\\",\\\"页面清单\\\",\\\"?id=\\\",\\\"cover\\\",\\\"location.pathname\\\",\\\"待确认点\\\"];if(!must.every(k=>t.includes(k)))process.exit(1);console.log(\\\"ok\\\")"` 输出 `ok`。',
+  ];
+
+  const output = [];
+  let skipping = false;
+  let emitted = false;
+
+  for (const line of lines) {
+    if (skipping && /^###\s*原始任务\s*\d+\s*:/.test(line)) {
+      skipping = false;
+      output.push(line);
+      continue;
+    }
+
+    const match = taskStartRe.exec(line);
+    if (match) {
+      skipping = false;
+      const titleText = match[2];
+      const token = extractAtomicTaskTitlePathToken(titleText);
+      const normalized = token ? normalizePathForPolicy(token) : null;
+      const isAssumptions = normalized === assumptionsPath;
+      if (isAssumptions) {
+        if (!emitted) {
+          output.push(...mergedBlockLines);
+          emitted = true;
+        }
+        skipping = true;
+        continue;
+      }
+      output.push(line);
+      continue;
+    }
+
+    if (skipping) continue;
+    output.push(line);
+  }
+
+  return output.join('\n').trimEnd();
+}
+
+function ensureVerifyScriptCoversAllHtmlPagesInTasksAtomicMarkdown(markdown) {
+  const text = normalizeLineEndings(markdown || '');
+  if (!text.trim()) return text;
+
+  const lines = text.split('\n');
+  const taskStartRe = /^- \[ \] \*\*Task\s+(\d+(?:\.\d+)?)\*\*[:：]\s*(.+)$/;
+
+  const htmlPages = [];
+  const htmlPageSet = new Set();
+  const addHtmlPage = (value) => {
+    const normalized = normalizePathForPolicy(value);
+    if (!normalized) return;
+    if (!/\.(?:html|htm)$/i.test(normalized)) return;
+    const key = normalized.toLowerCase();
+    if (htmlPageSet.has(key)) return;
+    htmlPageSet.add(key);
+    htmlPages.push(normalized);
+  };
+
+  let hasVerifyTask = false;
+  for (const line of lines) {
+    const match = taskStartRe.exec(line);
+    if (!match) continue;
+    const token = extractAtomicTaskTitlePathToken(match[2]);
+    if (!token) continue;
+    const normalized = normalizePathForPolicy(token);
+    if (normalized === 'scripts/verify.js') hasVerifyTask = true;
+    addHtmlPage(normalized);
+  }
+
+  if (!hasVerifyTask) return text;
+  if (htmlPages.length <= 1) return text;
+
+  const pageListText = htmlPages.join('、');
+
+  const output = [];
+  let inVerifyTask = false;
+
+  for (const line of lines) {
+    const match = taskStartRe.exec(line);
+    if (match) {
+      const token = extractAtomicTaskTitlePathToken(match[2]);
+      const normalized = token ? normalizePathForPolicy(token) : '';
+      inVerifyTask = normalized === 'scripts/verify.js';
+      output.push(line);
+      continue;
+    }
+
+    if (inVerifyTask && /^  - \*\*技术细节\*\*:\s*/.test(line)) {
+      output.push(line);
+      const hasAllPagesHint =
+        text.includes('最终校验必须覆盖以下全部 HTML 页面：') ||
+        output.some((x) => x.includes('最终校验必须覆盖以下全部 HTML 页面：'));
+      if (!hasAllPagesHint) {
+        output.push(`    最终校验必须覆盖以下全部 HTML 页面：${pageListText}。`);
+      }
+      const hasKeyDomHint =
+        text.includes('关键约定（静态字符串检查即可）：') ||
+        output.some((x) => x.includes('关键约定（静态字符串检查即可）：'));
+      if (!hasKeyDomHint) {
+        output.push(
+          "    关键约定（静态字符串检查即可）：每个页面必须包含 id=\"site-header\"、id=\"site-footer\"，并包含 <main ...> 主内容容器（id 以骨架任务约定为准）；js/partials.js 必须包含 id=\"site-nav\"、id=\"nav-toggle\" 与 '.nav-link'。",
+        );
+      }
+      continue;
+    }
+
+    output.push(line);
+  }
+
+  return output.join('\n').trimEnd();
+}
+
+function ensureAtomicTaskTitleVerbMatchesFileExistence(markdown) {
+  const text = normalizeLineEndings(markdown || '');
+  if (!text.trim()) return text;
+
+  const lines = text.split('\n');
+  const taskStartRe = /^- \[ \] \*\*Task\s+(\d+(?:\.\d+)?)\*\*[:：]\s*(.+)$/;
+  const seenPaths = new Set();
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const match = taskStartRe.exec(line);
+    if (!match) continue;
+
+    const titleText = match[2] || '';
+    const verbMatch = /^(创建|修改|删除)\s+/.exec(titleText);
+    const verb = verbMatch ? verbMatch[1] : null;
+    const token = extractAtomicTaskTitlePathToken(titleText);
+    if (!token) continue;
+    const normalized = normalizePathForPolicy(token);
+    if (!normalized) continue;
+
+    const absPath = path.join(REPO_DIR, ...normalized.split('/'));
+    const existedOnDisk = fs.existsSync(absPath);
+    const hasSeen = seenPaths.has(normalized);
+
+    if (!hasSeen) {
+      seenPaths.add(normalized);
+      if (verb === '修改' && !existedOnDisk) {
+        lines[i] = line.replace(
+          /^(- \[ \] \*\*Task\s+\d+(?:\.\d+)?\*\*[:：]\s*)修改(\s+)/,
+          '$1创建$2',
+        );
+      }
+      continue;
+    }
+
+    if (verb === '创建') {
+      lines[i] = line.replace(
+        /^(- \[ \] \*\*Task\s+\d+(?:\.\d+)?\*\*[:：]\s*)创建(\s+)/,
+        '$1修改$2',
+      );
+    }
+  }
+
+  return lines.join('\n').trimEnd();
+}
+
+function ensurePartialsTaskDeclaresNavDomConventions(markdown) {
+  const text = normalizeLineEndings(markdown || '');
+  if (!text.trim()) return text;
+
+  const injectedNavHint = '约定：header HTML 必须包含 `<nav id="site-nav">`';
+  const injectedAcHint = "fs.readFileSync('js/partials.js'";
+
+  const lines = text.split('\n');
+  const taskStartRe = /^- \[ \] \*\*Task\s+(\d+(?:\.\d+)?)\*\*[:：]\s*(.+)$/;
+  const output = [];
+  let inPartialsTask = false;
+
+  for (const line of lines) {
+    const match = taskStartRe.exec(line);
+    if (match) {
+      const token = extractAtomicTaskTitlePathToken(match[2]);
+      const normalized = token ? normalizePathForPolicy(token) : '';
+      inPartialsTask = normalized === 'js/partials.js';
+      output.push(line);
+      continue;
+    }
+
+    if (inPartialsTask && /^  - \*\*技术细节\*\*:\s*/.test(line)) {
+      output.push(line);
+      if (!text.includes(injectedNavHint)) {
+        output.push(
+          '    约定：header HTML 必须包含 `<nav id="site-nav">` 与 `<button id="nav-toggle" aria-expanded="false">`，导航链接统一使用 `.nav-link`（供导航高亮与移动端展开逻辑使用）。',
+        );
+      }
+      continue;
+    }
+
+    if (inPartialsTask && /^  - \*\*验收准则 \(AC\)\*\*:\s*/.test(line)) {
+      output.push(line);
+      if (!text.includes(injectedAcHint)) {
+        output.push(
+          "    可执行验证：运行 `node -e \"const fs=require('fs');const c=fs.readFileSync('js/partials.js','utf8');if(!c.includes('site-nav')||!c.includes('nav-toggle')||!c.includes('nav-link'))process.exit(1);console.log('ok')\"` 输出 `ok`。",
+        );
+      }
+      continue;
+    }
+
+    output.push(line);
+  }
+
+  return output.join('\n').trimEnd();
+}
+
+function normalizeTasksAtomicTextConsistency(markdown) {
+  const text = normalizeLineEndings(markdown || '');
+  if (!text.trim()) return text;
+
+  let next = text;
+  next = next.replace(
+    /路径或\s*body\s*\[data-page\]/g,
+    'location.pathname（含 / 与 /index.html 作为首页）',
+  );
+  next = next.replace(/路径或\s*data-page/g, 'location.pathname（含 / 与 /index.html 作为首页）');
+  next = next.replace(/\bheroImage\b/g, 'cover');
+  next = next.replace(/\bcaseId\b/g, 'id');
+  next = next.replace(/\bnewsId\b/g, 'id');
+  return next.trimEnd();
+}
+
+function renumberTasksAtomicMarkdown(markdown) {
+  const text = normalizeLineEndings(markdown || '');
+  if (!text.trim()) return text;
+
+  const lines = text.split('\n');
+  const originalHeaderRe = /^###\s*原始任务\s*(\d+)\s*:/;
+  const taskLineRe = /^(- \[ \] \*\*Task\s+)(\d+(?:\.\d+)?)(\*\*[:：]\s*)(.+)$/;
+
+  let currentOriginalIndex = null;
+  let counter = 0;
+
+  const output = lines.map((line) => {
+    const headerMatch = originalHeaderRe.exec(line);
+    if (headerMatch) {
+      currentOriginalIndex = headerMatch[1];
+      counter = 0;
+      return line;
+    }
+    const taskMatch = taskLineRe.exec(line);
+    if (taskMatch && currentOriginalIndex) {
+      counter += 1;
+      return `${taskMatch[1]}${currentOriginalIndex}.${counter}${taskMatch[3]}${taskMatch[4]}`;
+    }
+    return line;
+  });
+
+  return output.join('\n').trimEnd();
 }
 
 function formatAtomicTaskBlock(indexLabel, task) {
@@ -4513,7 +4969,16 @@ async function generateTasksWithModel(design, prompt, options = {}) {
 
   const minTasks = Number(process.env.LLM_TASK_MIN || 8);
   const maxTasks = Number(process.env.LLM_TASK_MAX || 16);
-  const timeoutMs = Math.min(Number(process.env.LLM_TASK_TIMEOUT_MS || 60000), 120000);
+  const timeoutDefaultMs = 120000;
+  const rawTimeoutMs = Number(process.env.LLM_TASK_TIMEOUT_MS || timeoutDefaultMs);
+  const baseTimeoutMs = Math.min(
+    Math.max(Number.isFinite(rawTimeoutMs) ? rawTimeoutMs : timeoutDefaultMs, 60000),
+    180000,
+  );
+  const retryTimeoutMs = Math.min(
+    Math.max(baseTimeoutMs, timeoutDefaultMs) + 60000,
+    180000,
+  );
 
   const promptConfig = loadPromptConfig();
   const stage = promptConfig.stages.tasks;
@@ -4533,58 +4998,86 @@ async function generateTasksWithModel(design, prompt, options = {}) {
     { role: 'user', content: promptRendered.user },
   ];
 
-  const startedAt = new Date().toISOString();
-  const startedMs = Date.now();
-  let usage = null;
-  const recordTelemetry = (error) => {
-    const endedAt = new Date().toISOString();
-    onTelemetry?.({
-      stageKey,
-      stream: Boolean(onToken),
-      startedAt,
-      endedAt,
-      durationMs: Date.now() - startedMs,
-      usage,
-      llmContext: describeLlmConfig(getActiveLlmConfig()),
-      prompt: { templates: promptTemplates, rendered: promptRendered, variables },
-      error: error
-        ? { message: error?.message || String(error || ''), context: error?.llmContext || null }
-        : null,
-    });
+  const isTimeoutError = (error) => {
+    const message = String(error?.message || error || '');
+    return /timeout/i.test(message);
   };
 
-  try {
-    const content = onToken
-      ? await callLlmStream(messages, { timeoutMs }, {
-          onToken,
-          onUsage: (u) => {
-            usage = u;
-          },
-        })
-      : await callLlm(messages, { timeoutMs }, {
-          onUsage: (u) => {
-            usage = u;
-          },
-        });
-
-    const payload = tryParseJson(content);
-    const rawTasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
-    const normalized = rawTasks.map(normalizeTaskObject).filter(Boolean);
-    const hasEnough = normalized.length >= Math.min(minTasks, maxTasks);
-    const isChinese = normalized.every((t) =>
-      looksLikeChinese(`${t.title} ${t.core} ${t.details} ${t.ac}`),
-    );
-    if (!hasEnough || !isChinese) {
-      recordTelemetry(null);
-      return generateTasksContent(design, prompt);
+  const callOnce = async (timeoutMs, label) => {
+    const startedAt = new Date().toISOString();
+    const startedMs = Date.now();
+    let usage = null;
+    try {
+      const content = onToken
+        ? await callLlmStream(messages, { timeoutMs }, {
+            onToken,
+            onUsage: (u) => {
+              usage = u;
+            },
+          })
+        : await callLlm(messages, { timeoutMs }, {
+            onUsage: (u) => {
+              usage = u;
+            },
+          });
+      const endedAt = new Date().toISOString();
+      onTelemetry?.({
+        stageKey,
+        label,
+        stream: Boolean(onToken),
+        startedAt,
+        endedAt,
+        durationMs: Date.now() - startedMs,
+        usage,
+        llmContext: describeLlmConfig(getActiveLlmConfig()),
+        prompt: { templates: promptTemplates, rendered: promptRendered, variables },
+        error: null,
+      });
+      return content;
+    } catch (error) {
+      const endedAt = new Date().toISOString();
+      onTelemetry?.({
+        stageKey,
+        label,
+        stream: Boolean(onToken),
+        startedAt,
+        endedAt,
+        durationMs: Date.now() - startedMs,
+        usage,
+        llmContext: describeLlmConfig(getActiveLlmConfig()),
+        prompt: { templates: promptTemplates, rendered: promptRendered, variables },
+        error: {
+          message: error?.message || String(error || ''),
+          context: error?.llmContext || null,
+        },
+      });
+      throw error;
     }
-    const trimmed = normalized.slice(0, maxTasks);
-    recordTelemetry(null);
-    return buildTasksMarkdown(prompt || design, { tasks: trimmed });
+  };
+
+  let content = '';
+  try {
+    content = await callOnce(baseTimeoutMs, 'primary');
   } catch (error) {
-    recordTelemetry(error);
-    throw error;
+    if (isTimeoutError(error) && retryTimeoutMs > baseTimeoutMs) {
+      content = await callOnce(retryTimeoutMs, 'retry');
+    } else {
+      throw error;
+    }
   }
+
+  const payload = tryParseJson(content);
+  const rawTasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
+  const normalized = rawTasks.map(normalizeTaskObject).filter(Boolean);
+  const hasEnough = normalized.length >= Math.min(minTasks, maxTasks);
+  const isChinese = normalized.every((t) =>
+    looksLikeChinese(`${t.title} ${t.core} ${t.details} ${t.ac}`),
+  );
+  if (!hasEnough || !isChinese) {
+    return generateTasksContent(design, prompt);
+  }
+  const trimmed = normalized.slice(0, maxTasks);
+  return buildTasksMarkdown(prompt || design, { tasks: trimmed });
 }
 
 async function requestAtomicTasks(payload, designSnippet, timeoutMs, reason = '', telemetry = null) {
@@ -5191,6 +5684,21 @@ async function runAtomizeJob(specName, job, options = {}) {
         { reason: flowRunReason },
       );
       try {
+        try {
+          const before = fs.existsSync(atomicPath) ? fs.readFileSync(atomicPath, 'utf8') : '';
+          let after = mergeAssumptionsTasksInTasksAtomicMarkdown(before);
+          after = ensureVerifyScriptCoversAllHtmlPagesInTasksAtomicMarkdown(after);
+          after = ensurePartialsTaskDeclaresNavDomConventions(after);
+          after = normalizeTasksAtomicTextConsistency(after);
+          after = ensureAtomicTaskTitleVerbMatchesFileExistence(after);
+          after = renumberTasksAtomicMarkdown(after);
+          if (after && after !== before) {
+            fs.writeFileSync(atomicPath, `${after}\n`, 'utf8');
+          }
+        } catch (error) {
+          const message = truncateText(error?.message || String(error || ''), 240);
+          logAtomize(job, `tasks_atomic 后处理失败：${message}`);
+        }
         const reportPath = finalizeFlowReport(specName);
         if (reportPath) {
           logAtomize(job, `流程报告已生成：${reportPath}`);
