@@ -191,12 +191,14 @@ const DEFAULT_PROMPT_CONFIG = {
 	        '6) 若存在多页面重复结构（header/footer/nav 等），必须设计成可复用片段或脚本注入（确保核心结构只改一处）。\n' +
 	        '7) 任务顺序建议：先规划文档与目录结构 -> 再全局样式与共享结构 -> 再页面内容与交互 -> 最后补响应式与验收/冒烟检查。\n' +
 	        '8) 禁止输出互斥的多套实现方案（例如同时出现“header.html 片段方案”与“JS 注入方案”）；必须选择一套实现路线并全程保持一致。\n' +
-	        '9) 若技术栈为“纯 HTML/CSS/JS 且不引入构建工具”，推荐固定路线：\n' +
-	        '   - 页面：index.html、about.html、services.html、cases.html、case-detail.html、news.html、news-detail.html、careers.html、contact.html\n' +
-	        '   - 样式：css/style.css（先定义全局变量/排版/网格，再做页面区块样式）\n' +
-	        '   - 数据：js/data.js（统一用 window.__SITE_DATA__ 暴露，禁止 export/import 与 window 挂载混用）\n' +
-	        '   - 共享头尾：js/partials.js（渲染到 #site-header / #site-footer），禁止创建 header.html/footer.html 片段文件\n' +
-	        '   - 交互入口：js/main.js（集中初始化导航/表单/详情渲染；禁止拆成 js/pages/*.js 多入口）\n' +
+		        '9) 若技术栈为“纯 HTML/CSS/JS 且不引入构建工具”，推荐固定路线：\n' +
+		        '   - 页面：index.html、about.html、services.html、cases.html、case-detail.html、news.html、news-detail.html、careers.html、contact.html\n' +
+		        '   - 列表页文件名固定：cases.html 与 news.html；禁止使用 case-list.html/news-list.html。\n' +
+		        '   - 联系表单交互只在 js/main.js 中实现；contact.html 禁止内嵌 <script> 逻辑（页面只引入脚本）。\n' +
+		        '   - 样式：css/style.css（先定义全局变量/排版/网格，再做页面区块样式）\n' +
+		        '   - 数据：js/data.js（统一用 window.__SITE_DATA__ 暴露，禁止 export/import 与 window 挂载混用）\n' +
+		        '   - 共享头尾：js/partials.js（渲染到 #site-header / #site-footer），禁止创建 header.html/footer.html 片段文件\n' +
+		        '   - 交互入口：js/main.js（集中初始化导航/表单/详情渲染；禁止拆成 js/pages/*.js 多入口）\n' +
 	        '   - 验收：scripts/verify.js（node scripts/verify.js；仅用 Node 内置模块，禁止 jsdom/puppeteer 等第三方依赖）+ 本地预览命令（python -m http.server 8000，访问 http://localhost:8000/）\n' +
 	        '请严格输出 JSON：{"tasks":[{title,core,details,ac}]}。',
 	    },
@@ -226,11 +228,13 @@ const DEFAULT_PROMPT_CONFIG = {
 	        '9) 对“纯 HTML/CSS/JS 且不引入构建工具”的场景：\n' +
 	        '   - 数据文件统一采用 js/data.js，并以 window.__SITE_DATA__ 暴露；后续任务必须一致引用，禁止 export/import 与 window 挂载混用。\n' +
 	        '   - 共享结构优先采用 js/partials.js 注入（渲染到 #site-header/#site-footer），禁止创建 header.html/footer.html 片段文件。\n' +
-	        '   - 交互入口统一采用 js/main.js（按页面识别执行初始化）；禁止引入 js/pages/*.js 或 home.js/index.js 等多入口脚本。\n' +
-	        '   - 重要：文档/任务中描述“路由/链接”时必须使用实际文件名（例如 about.html、services.html）；详情页必须用 `case-detail.html?id=...` / `news-detail.html?id=...` 这类 query 参数形式；禁止使用 /about、/products、:id 这类伪路由表达。\n' +
-	        '10) ac 必须“机器可验证”，且尽量客观：优先提供 CLI 可脚本化验证（例如 node scripts/verify.js）；必要时可补充页面验证（页面路径+元素+操作+预期）。\n' +
-	        '   - 验收脚本必须仅依赖 Node 内置模块（fs/path/assert 等），禁止 jsdom/puppeteer 等第三方依赖。\n' +
-	        '   - 禁止仅用 rg/grep/搜索 作为唯一验收；必须至少包含 1 条“行为验证”（脚本运行结果/构建或测试通过/页面交互可观察结果）。\n' +
+		        '   - 交互入口统一采用 js/main.js（按页面识别执行初始化）；禁止引入 js/pages/*.js 或 home.js/index.js 等多入口脚本。\n' +
+		        '   - 重要：文档/任务中描述“路由/链接”时必须使用实际文件名（例如 about.html、services.html）；详情页必须用 `case-detail.html?id=...` / `news-detail.html?id=...` 这类 query 参数形式；禁止使用 /about、/products、:id 这类伪路由表达。\n' +
+		        '   - 列表页文件名固定：cases.html 与 news.html；禁止使用 case-list.html/news-list.html。\n' +
+		        '   - 联系表单交互只允许在 js/main.js 中实现；contact.html 禁止内嵌 <script> 逻辑。\n' +
+		        '10) ac 必须“机器可验证”，且尽量客观：优先提供 CLI 可脚本化验证（例如 node scripts/verify.js）；必要时可补充页面验证（页面路径+元素+操作+预期）。\n' +
+		        '   - 验收脚本必须仅依赖 Node 内置模块（fs/path/assert 等），禁止 jsdom/puppeteer 等第三方依赖。\n' +
+		        '   - 禁止仅用 rg/grep/搜索 作为唯一验收；必须至少包含 1 条“行为验证”（脚本运行结果/构建或测试通过/页面交互可观察结果）。\n' +
 	        '11) 依赖/顺序：若该任务依赖前置容器/数据/样式变量，必须在 details 中写明“前置条件：...”，确保执行顺序一致。\n' +
 	        '12) 信息不足时：先补 1 条“创建 docs/assumptions.md”记录假设/待确认点（写清缺失信息），再继续拆分。\n' +
 	        '13) 简体中文。\n' +
@@ -4409,6 +4413,110 @@ function mergeAssumptionsTasksInTasksAtomicMarkdown(markdown) {
   return output.join('\n').trimEnd();
 }
 
+function ensureAssumptionsTaskDeclaresPageNamingInTasksAtomicMarkdown(markdown) {
+  const text = normalizeLineEndings(markdown || '');
+  if (!text.trim()) return text;
+
+  const lines = text.split('\n');
+  const taskStartRe = /^- \[ \] \*\*Task\s+(\d+(?:\.\d+)?)\*\*[:：]\s*(.+)$/;
+
+  const htmlPages = [];
+  const htmlPageSet = new Set();
+  const addHtmlPage = (value) => {
+    const normalized = normalizePathForPolicy(value);
+    if (!normalized) return;
+    if (!/\.(?:html|htm)$/i.test(normalized)) return;
+    const key = normalized.toLowerCase();
+    if (htmlPageSet.has(key)) return;
+    htmlPageSet.add(key);
+    htmlPages.push(normalized);
+  };
+
+  for (const line of lines) {
+    const match = taskStartRe.exec(line);
+    if (!match) continue;
+    const token = extractAtomicTaskTitlePathToken(match[2]);
+    if (!token) continue;
+    addHtmlPage(token);
+  }
+
+  if (!htmlPages.length) return text;
+
+  const markerPages = '页面文件名唯一清单：';
+  const markerBrand = '企业名称（title/meta）：';
+  const markerContactFields = '联系表单字段：';
+  const markerSelectors = '关键容器与选择器：';
+
+  const injectionPages = `    ${markerPages}${htmlPages.join('、')}。禁止使用 case-list.html/news-list.html/products.html/product-detail.html 等未在清单中的文件名。`;
+  const injectionBrand = `    ${markerBrand}星云科技（可调整但必须全站一致）。`;
+  const injectionContactFields = `    ${markerContactFields}name/email/phone/message；协议：mailto:/tel:。`;
+  const injectionSelectors = `    ${markerSelectors}#site-header #site-footer #site-nav #nav-toggle .nav-link <main id=\"page-content\">。`;
+
+  const output = [];
+  let inAssumptionsTask = false;
+
+  for (const line of lines) {
+    const match = taskStartRe.exec(line);
+    if (match) {
+      const token = extractAtomicTaskTitlePathToken(match[2]);
+      const normalized = token ? normalizePathForPolicy(token) : '';
+      inAssumptionsTask = normalized === 'docs/assumptions.md';
+      output.push(line);
+      continue;
+    }
+
+    if (inAssumptionsTask && /^  - \*\*技术细节\*\*:\s*/.test(line)) {
+      output.push(line);
+      if (!text.includes(markerPages)) output.push(injectionPages);
+      if (!text.includes(markerBrand)) output.push(injectionBrand);
+      if (!text.includes(markerContactFields)) output.push(injectionContactFields);
+      if (!text.includes(markerSelectors)) output.push(injectionSelectors);
+      continue;
+    }
+
+    output.push(line);
+  }
+
+  return output.join('\n').trimEnd();
+}
+
+function ensureContactFormSingleEntryInTasksAtomicMarkdown(markdown) {
+  const text = normalizeLineEndings(markdown || '');
+  if (!text.trim()) return text;
+
+  const lines = text.split('\n');
+  const taskStartRe = /^- \[ \] \*\*Task\s+(\d+(?:\.\d+)?)\*\*[:：]\s*(.+)$/;
+  const output = [];
+  let inContactTask = false;
+
+  for (const line of lines) {
+    const match = taskStartRe.exec(line);
+    if (match) {
+      const token = extractAtomicTaskTitlePathToken(match[2]);
+      const normalized = token ? normalizePathForPolicy(token) : '';
+      inContactTask = normalized === 'contact.html';
+      output.push(line);
+      continue;
+    }
+
+    if (inContactTask && /^  - \*\*技术细节\*\*:\s*/.test(line)) {
+      const alreadyPinned = line.includes('contact.html 仅负责表单') && line.includes('js/main.js');
+      const mentionsInline = /页内脚本|<script|内嵌脚本|script\s*标签/i.test(line);
+      const mentionsMain = /js\/main\.js|main\.js|统一入口/i.test(line);
+      if (!alreadyPinned && (mentionsInline || mentionsMain)) {
+        output.push(
+          '  - **技术细节**: contact.html 仅负责表单 DOM 结构与 data-* 标识，不写页内脚本；所有校验/提交逻辑统一放在 js/main.js（按 location.pathname 识别 contact.html 初始化）。',
+        );
+        continue;
+      }
+    }
+
+    output.push(line);
+  }
+
+  return output.join('\n').trimEnd();
+}
+
 function ensureVerifyScriptCoversAllHtmlPagesInTasksAtomicMarkdown(markdown) {
   const text = normalizeLineEndings(markdown || '');
   if (!text.trim()) return text;
@@ -4471,6 +4579,13 @@ function ensureVerifyScriptCoversAllHtmlPagesInTasksAtomicMarkdown(markdown) {
       if (!hasKeyDomHint) {
         output.push(
           "    关键约定（静态字符串检查即可）：每个页面必须包含 id=\"site-header\"、id=\"site-footer\"，并包含 <main ...> 主内容容器（id 以骨架任务约定为准）；js/partials.js 必须包含 id=\"site-nav\"、id=\"nav-toggle\" 与 '.nav-link'。",
+        );
+      }
+      const hasMixedContentHint =
+        text.includes('混合内容检查：') || output.some((x) => x.includes('混合内容检查：'));
+      if (!hasMixedContentHint) {
+        output.push(
+          '    混合内容检查：必须在 scripts/verify.js 中静态检查所有 HTML 页面不包含 `http://`（应使用 https://），以避免混合内容。',
         );
       }
       continue;
@@ -4587,6 +4702,8 @@ function normalizeTasksAtomicTextConsistency(markdown) {
     'location.pathname（含 / 与 /index.html 作为首页）',
   );
   next = next.replace(/路径或\s*data-page/g, 'location.pathname（含 / 与 /index.html 作为首页）');
+  next = next.replace(/\bcase-list\.html\b/gi, 'cases.html');
+  next = next.replace(/\bnews-list\.html\b/gi, 'news.html');
   next = next.replace(/\bheroImage\b/g, 'cover');
   next = next.replace(/\bcaseId\b/g, 'id');
   next = next.replace(/\bnewsId\b/g, 'id');
@@ -5685,16 +5802,18 @@ async function runAtomizeJob(specName, job, options = {}) {
       );
       try {
         try {
-          const before = fs.existsSync(atomicPath) ? fs.readFileSync(atomicPath, 'utf8') : '';
-          let after = mergeAssumptionsTasksInTasksAtomicMarkdown(before);
-          after = ensureVerifyScriptCoversAllHtmlPagesInTasksAtomicMarkdown(after);
-          after = ensurePartialsTaskDeclaresNavDomConventions(after);
-          after = normalizeTasksAtomicTextConsistency(after);
-          after = ensureAtomicTaskTitleVerbMatchesFileExistence(after);
-          after = renumberTasksAtomicMarkdown(after);
-          if (after && after !== before) {
-            fs.writeFileSync(atomicPath, `${after}\n`, 'utf8');
-          }
+	          const before = fs.existsSync(atomicPath) ? fs.readFileSync(atomicPath, 'utf8') : '';
+	          let after = mergeAssumptionsTasksInTasksAtomicMarkdown(before);
+	          after = ensureVerifyScriptCoversAllHtmlPagesInTasksAtomicMarkdown(after);
+	          after = ensurePartialsTaskDeclaresNavDomConventions(after);
+	          after = normalizeTasksAtomicTextConsistency(after);
+	          after = ensureAssumptionsTaskDeclaresPageNamingInTasksAtomicMarkdown(after);
+	          after = ensureContactFormSingleEntryInTasksAtomicMarkdown(after);
+	          after = ensureAtomicTaskTitleVerbMatchesFileExistence(after);
+	          after = renumberTasksAtomicMarkdown(after);
+	          if (after && after !== before) {
+	            fs.writeFileSync(atomicPath, `${after}\n`, 'utf8');
+	          }
         } catch (error) {
           const message = truncateText(error?.message || String(error || ''), 240);
           logAtomize(job, `tasks_atomic 后处理失败：${message}`);
