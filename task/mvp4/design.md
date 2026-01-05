@@ -1,3 +1,5 @@
+
+
 # MVP4 设计：浏览器内嵌终端（Codex/Claude Code）
 
 ## 架构概览

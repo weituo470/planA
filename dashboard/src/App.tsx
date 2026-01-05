@@ -4,6 +4,7 @@ import JSZip from 'jszip';
 import { Button } from './components/ui/button';
 import { ExplorerSidebar } from './ExplorerSidebar';
 import { TerminalPanel, type TerminalPanelHandle } from './TerminalPanel';
+import { TaskOrchestrator } from './components/mvp5';
 import type {
   ClarificationQuestion,
   LlmInfo,
@@ -711,6 +712,8 @@ export default function App() {
   const [userReportScoreText, setUserReportScoreText] = useState('');
   const [userReportCommentText, setUserReportCommentText] = useState('');
   const [iterateUserNoteText, setIterateUserNoteText] = useState('');
+  // MVP5: 智能任务编排状态
+  const [orchestratorOpen, setOrchestratorOpen] = useState(false);
   const atomizePrevRef = useRef<{
     specName: string | null;
     running: boolean;
@@ -2116,6 +2119,11 @@ export default function App() {
 
   const atomicTaskGroups = useMemo(
     () => parseTasksAtomicMarkdown(tasksAtomicContent),
+    [tasksAtomicContent],
+  );
+  // MVP5: 原子任务行数组（用于依赖分析）
+  const atomicTaskLines = useMemo(
+    () => tasksAtomicContent.split('\n').filter(line => line.trim()),
     [tasksAtomicContent],
   );
   const terminalPanelRef = useRef<TerminalPanelHandle | null>(null);
@@ -3744,7 +3752,41 @@ export default function App() {
                     }`}
                   >
                     {atomicTaskGroups.length ? (
-                      <div className="space-y-5">
+                      <>
+                        {/* MVP5: 智能任务编排按钮 */}
+                        <div className="mb-4 flex items-center justify-between rounded-md border border-purple-900/50 bg-purple-950/30 p-3">
+                          <div className="flex items-center gap-2">
+                            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-purple-900/50 text-purple-300">
+                              <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                              </svg>
+                            </div>
+                            <div>
+                              <div className="text-sm font-medium text-purple-200">智能任务编排</div>
+                              <div className="text-xs text-purple-400">AI 分析依赖关系并推荐执行方案</div>
+                            </div>
+                          </div>
+                          <Button
+                            size="sm"
+                            onClick={() => setOrchestratorOpen(!orchestratorOpen)}
+                            disabled={!selectedSpecName}
+                            className="bg-purple-700 hover:bg-purple-600"
+                          >
+                            {orchestratorOpen ? '收起' : '打开'}
+                          </Button>
+                        </div>
+
+                        {/* MVP5: TaskOrchestrator 组件 */}
+                        {orchestratorOpen && (
+                          <div className="mb-4">
+                            <TaskOrchestrator
+                              specId={selectedSpecName || ''}
+                              atomicTasks={atomicTaskLines}
+                            />
+                          </div>
+                        )}
+
+                        <div className="space-y-5">
                         {atomicTaskGroups.map((group, groupIdx) => (
                           <div key={`${group.originalIndex ?? 'na'}-${groupIdx}`}>
                             <div className="flex flex-wrap items-baseline gap-2">
@@ -3801,10 +3843,11 @@ export default function App() {
                             </div>
                           </div>
                         ))}
-                      </div>
+                        </div>
+                      </>
                     ) : (
                       <div className="text-sm text-slate-400">
-                        暂无可解析的原子任务（请先点击“开始原子化”生成 tasks_atomic.md）
+                        暂无可解析的原子任务（请先点击"开始原子化"生成 tasks_atomic.md）
                       </div>
                     )}
                   </div>

@@ -10,6 +10,17 @@ const chokidar = require('chokidar');
 const { createTwoFilesPatch } = require('diff');
 const pty = require('node-pty');
 
+// MVP5: 智能任务编排服务
+const pathAdapter = require('./services/path-adapter.service');
+const dependencyAnalyzer = require('./services/dependency-analyzer.service');
+const dagBuilder = require('./services/dag-builder.service');
+const recommender = require('./services/recommender.service');
+
+// MVP5: 依赖分析结果存储
+const analysisResults = new Map();
+const executionPlans = new Map();
+const executionStates = new Map();
+
 function nanoid(size = 21) {
   return crypto.randomBytes(size).toString('base64url').slice(0, size);
 }
@@ -187,12 +198,16 @@ const DEFAULT_PROMPT_CONFIG = {
 	      user:
 	        `设计内容如下：\n{{design}}\n\n补充描述：{{prompt}}\n\n` +
 	        '请输出 {{minTasks}}-{{maxTasks}} 条任务（不要求原子化）。' +
-	        '每条任务必须包含 title/core/details/ac 四个字段，简体中文；严禁输出 TBD/待定/[path]/占位符。\n' +
+	        '每条任务必须包含 title/core/details/ac/depends 五个字段，简体中文；严禁输出 TBD/待定/[path]/占位符。\n' +
 	        'title 写清任务名称与产出（模块/流程级别即可）。\n' +
 	        'core 写清关键目标与范围边界（做什么/不做什么）。\n' +
 	        'details 写清关键技术点/接口/数据结构/页面与路由，不要空泛。\n' +
 	        'ac 必须可验证：写清验证步骤（命令/接口/页面路径/可观察结果）。\n' +
-	        '请严格输出 JSON：{"tasks":[{title,core,details,ac}]}。',
+	        'depends 声明依赖关系：如果本任务依赖其他任务完成后才能执行，填写依赖任务在 JSON 数组中的索引（从 0 开始）。\n' +
+	        '   - 示例：depends:[0] 表示依赖第 1 个任务；depends:[0,2] 表示依赖第 1 和第 3 个任务。\n' +
+	        '   - 如果任务可以独立执行（无依赖），填写 depends:[]。\n' +
+	        '   - 重要：文件写入冲突（多任务操作同一文件）必须串行；API 依赖（调用上一任务创建的接口）必须声明依赖。\n' +
+	        '请严格输出 JSON：{"tasks":[{title,core,details,ac,depends}]}。',
 	    },
 	    atomize: {
 	      label: '任务原子化',
@@ -203,8 +218,9 @@ const DEFAULT_PROMPT_CONFIG = {
 	        `{{context}}{{main}}\n\n{{reasonBlock}}` +
 	        '要求：\n' +
 	        '1) 输出为原子级任务，不要摘要，拆到无法再拆；单条任务建议 5-10 分钟内可完成。\n' +
-	        '2) 任务对象字段：title/core/details/ac。\n' +
-	        '3) title 必须以“创建/修改/删除 <相对文件路径>”开头，且 <相对文件路径> 必须是动作后的第一个 token（后续说明用“｜”追加）。\n' +
+	        '2) 任务对象字段：title/core/details/ac/depends。\n' +
+	        '3) title 必须以"创建/修改/删除 <相对文件路径>"开头，且 <相对文件路径> 必须是动作后的第一个 token（后续说明用"｜"追加）。\n' +
+	        '   - depends 声明依赖：填写依赖任务的索引数组，无依赖填 []。文件写入冲突或 API 调用依赖必须声明。\n' +
 	        '   - 文件路径必须包含扩展名（.ts/.tsx/.js/.md/.css/.json 等），且必须为最终可用路径。\n' +
 	        '   - 绝对禁止使用 TBD/待定/[path]/占位符。\n' +
 	        '   - 绝对禁止在 title/core/details/ac 任一字段中出现 TBD/待定/[path]/占位符（需要表达不确定性时，用“待确认点：...”并写入 docs/assumptions.md）。\n' +
@@ -216,7 +232,7 @@ const DEFAULT_PROMPT_CONFIG = {
 	        '   - 禁止仅用 rg/grep/搜索 作为唯一验收；必须至少包含 1 条“行为验证”（接口响应/构建或测试通过/页面交互可观察结果）。\n' +
 	        '8) 信息不足时：先补 1 条“创建 docs/assumptions.md”记录假设/待确认点（写清缺失信息），再继续拆分。\n' +
 	        '9) 简体中文。\n' +
-	        '只输出 JSON：{"tasks":[...]}。',
+	        '只输出 JSON：{"tasks":[{title,core,details,ac,depends}]}。',
 	    },
     reportScore: {
       label: '流程报告评分',
@@ -7502,6 +7518,290 @@ app.post('/cli/input', (req, res) => {
   }
   res.json({ ok: true });
 });
+
+// ========== MVP5: 智能任务编排 API ==========
+
+/**
+ * POST /api/mvp5/analyze-dependencies
+ * 分析任务依赖关系
+ */
+app.post('/api/mvp5/analyze-dependencies', (req, res) => {
+  try {
+    const { specId, atomicTasks, options = {} } = req.body;
+
+    if (!atomicTasks || !Array.isArray(atomicTasks)) {
+      return res.status(400).json({ error: 'atomicTasks 数组缺失' });
+    }
+
+    // 解析任务（如果是字符串内容）
+    const tasks = typeof atomicTasks[0] === 'string'
+      ? dependencyAnalyzer.parseAtomicTasks(atomicTasks.join('\n'))
+      : atomicTasks;
+
+    if (tasks.length === 0) {
+      return res.status(400).json({ error: '没有有效的任务' });
+    }
+
+    // 分析依赖关系
+    const analysis = dependencyAnalyzer.analyzeAllDependencies(tasks);
+
+    // 构建 DAG
+    const dag = dagBuilder.buildDAG(tasks, analysis.dependencies);
+
+    // 生成推荐方案
+    const recommendations = recommender.generateRecommendations(dag, {
+      cliAvailability: options.cliAvailability,
+    });
+
+    // 跨平台路径检查
+    const allPaths = [
+      ...analysis.tasks.flatMap(t => [
+        ...t.fileOperations.read,
+        ...t.fileOperations.write,
+        ...t.fileOperations.delete,
+      ]),
+    ];
+    const compatibility = pathAdapter.checkCompatibility(
+      allPaths,
+      options.devPlatform || 'windows',
+      options.targetPlatform || 'linux'
+    );
+
+    // 生成分析结果
+    const analysisId = nanoid(10);
+    const result = {
+      analysisId,
+      specId,
+      analyzedAt: new Date().toISOString(),
+      tasks: tasks.map(t => ({
+        id: t.id,
+        title: t.title,
+        description: t.description,
+        riskLevel: recommender.assessTaskRisk(t),
+        requiresInteraction: recommender.requiresInteraction(t),
+      })),
+      graph: dag,
+      recommendations,
+      warnings: analysis.warnings,
+      platformNotes: compatibility.issues.length > 0 ? compatibility : undefined,
+      summary: recommender.generateExecutionSummary({ graph: dag, warnings: analysis.warnings }),
+    };
+
+    analysisResults.set(analysisId, result);
+
+    res.json(result);
+  } catch (error) {
+    console.error('[MVP5] 依赖分析错误:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * GET /api/mvp5/analyze-dependencies/:id
+ * 获取分析结果
+ */
+app.get('/api/mvp5/analyze-dependencies/:id', (req, res) => {
+  const { id } = req.params;
+  const result = analysisResults.get(id);
+
+  if (!result) {
+    return res.status(404).json({ error: '分析结果不存在' });
+  }
+
+  res.json(result);
+});
+
+/**
+ * POST /api/mvp5/execution-plans
+ * 创建执行计划
+ */
+app.post('/api/mvp5/execution-plans', (req, res) => {
+  try {
+    const { specId, analysisId, selectedRecommendation, modifications = {} } = req.body;
+
+    // 获取分析结果
+    const analysis = analysisResults.get(analysisId);
+    if (!analysis) {
+      return res.status(404).json({ error: '分析结果不存在' });
+    }
+
+    // 获取选中的推荐方案
+    const recommendation = analysis.recommendations[selectedRecommendation] || analysis.recommendations[0];
+    if (!recommendation) {
+      return res.status(400).json({ error: '无效的推荐方案' });
+    }
+
+    // 应用修改
+    let cliAllocation = { ...recommendation.cliAllocation };
+    if (modifications.taskCliOverrides) {
+      cliAllocation = { ...cliAllocation, ...modifications.taskCliOverrides };
+    }
+
+    let phases = [...recommendation.phases];
+    if (modifications.excludedTasks && modifications.excludedTasks.length > 0) {
+      phases = phases.map(phase => ({
+        ...phase,
+        taskIds: phase.taskIds.filter(id => !modifications.excludedTasks.includes(id)),
+      })).filter(phase => phase.taskIds.length > 0);
+    }
+
+    // 创建执行计划
+    const planId = nanoid(10);
+    const plan = {
+      planId,
+      specId,
+      analysisId,
+      createdAt: new Date().toISOString(),
+      status: 'pending',
+      phases,
+      cliAllocation,
+      modifications,
+      estimatedDuration: phases.reduce((sum, p) => sum + (p.estimatedDuration || 0), 0),
+    };
+
+    executionPlans.set(planId, plan);
+
+    res.json(plan);
+  } catch (error) {
+    console.error('[MVP5] 创建执行计划错误:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * GET /api/mvp5/execution-plans/:id
+ * 获取执行计划
+ */
+app.get('/api/mvp5/execution-plans/:id', (req, res) => {
+  const { id } = req.params;
+  const plan = executionPlans.get(id);
+
+  if (!plan) {
+    return res.status(404).json({ error: '执行计划不存在' });
+  }
+
+  res.json(plan);
+});
+
+/**
+ * POST /api/mvp5/execution-plans/:id/start
+ * 启动执行
+ */
+app.post('/api/mvp5/execution-plans/:id/start', (req, res) => {
+  try {
+    const { id } = req.params;
+    const plan = executionPlans.get(id);
+
+    if (!plan) {
+      return res.status(404).json({ error: '执行计划不存在' });
+    }
+
+    if (plan.status === 'running') {
+      return res.status(400).json({ error: '执行计划已在运行中' });
+    }
+
+    // 创建执行状态
+    const executionId = nanoid(10);
+    const executionState = {
+      executionId,
+      planId: id,
+      specId: plan.specId,
+      status: 'running',
+      currentPhase: 0,
+      tasks: {},
+      failures: [],
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    // 初始化任务状态
+    plan.phases.forEach(phase => {
+      phase.taskIds.forEach(taskId => {
+        executionState.tasks[taskId] = {
+          taskId,
+          status: 'pending',
+          cli: plan.cliAllocation[taskId] || 'codex',
+          retryCount: 0,
+        };
+      });
+    });
+
+    executionStates.set(executionId, executionState);
+    plan.status = 'running';
+    plan.executionId = executionId;
+
+    // TODO: 启动第一阶段任务执行
+    // 这里需要集成实际的 CLI 执行逻辑
+
+    res.json({
+      executionId,
+      status: 'started',
+      message: '执行已启动',
+    });
+  } catch (error) {
+    console.error('[MVP5] 启动执行错误:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * GET /api/mvp5/execution/:id/status
+ * 获取执行状态
+ */
+app.get('/api/mvp5/execution/:id/status', (req, res) => {
+  const { id } = req.params;
+  const state = executionStates.get(id);
+
+  if (!state) {
+    return res.status(404).json({ error: '执行状态不存在' });
+  }
+
+  res.json(state);
+});
+
+/**
+ * POST /api/mvp5/execution/:id/retry/:taskId
+ * 重启失败的任务
+ */
+app.post('/api/mvp5/execution/:id/retry/:taskId', (req, res) => {
+  try {
+    const { id, taskId } = req.params;
+    const state = executionStates.get(id);
+
+    if (!state) {
+      return res.status(404).json({ error: '执行状态不存在' });
+    }
+
+    const task = state.tasks[taskId];
+    if (!task) {
+      return res.status(404).json({ error: '任务不存在' });
+    }
+
+    if (task.status !== 'failed') {
+      return res.status(400).json({ error: '只能重启失败的任务' });
+    }
+
+    // 重置任务状态
+    task.status = 'pending';
+    task.retryCount += 1;
+    task.error = undefined;
+    state.updatedAt = new Date().toISOString();
+
+    // TODO: 重新执行任务
+
+    res.json({
+      taskId,
+      status: 'pending',
+      retryCount: task.retryCount,
+      message: '任务已重新加入队列',
+    });
+  } catch (error) {
+    console.error('[MVP5] 重启任务错误:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ========== MVP5: API 结束 ==========
 
 io.on('connection', (socket) => {
   socket.emit('state:init', {
