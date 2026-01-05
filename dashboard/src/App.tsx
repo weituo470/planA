@@ -12,7 +12,7 @@ import type {
   SpecSummary,
 } from './types';
 
-const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
+const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:3030';
 const API_TIMEOUT_MS = Number(import.meta.env.VITE_API_TIMEOUT_MS || 90000);
 const TASK_TIMEOUT_MS = Number(import.meta.env.VITE_TASK_TIMEOUT_MS || 180000);
 const DOWNLOAD_PREFIX = 'planA-v0.1';
@@ -2399,7 +2399,7 @@ export default function App() {
               </ol>
 
               <div className="text-xs text-slate-400">
-                默认地址：Bridge {BRIDGE_URL} · Dashboard 一般为 http://localhost:5174/
+                默认地址：Bridge {BRIDGE_URL} · Dashboard 一般为 http://localhost:3031/
               </div>
             </div>
           </details>

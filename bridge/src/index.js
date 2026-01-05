@@ -13,7 +13,7 @@ function nanoid(size = 21) {
   return crypto.randomBytes(size).toString('base64url').slice(0, size);
 }
 
-const PORT = process.env.WORKFLOW_BRIDGE_PORT || 4100;
+const PORT = process.env.WORKFLOW_BRIDGE_PORT || 3030;
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const EVENT_LOG = path.join(DATA_DIR, 'events.jsonl');
 const LLM_CONFIG_FILE = path.join(DATA_DIR, 'llm-config.json');
@@ -671,6 +671,30 @@ function getLlmRetryDelayMs(attemptIndex) {
   return base * multiplier;
 }
 
+function getLlmUserAgent() {
+  const configured = String(process.env.LLM_USER_AGENT || '').trim();
+  if (configured) return configured;
+  // Some OpenAI-compatible gateways sit behind Cloudflare and may block requests
+  // with missing/unknown User-Agent headers (e.g. undici). Use a browser-like UA by default.
+  return (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+    'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+    'Chrome/120.0.0.0 Safari/537.36'
+  );
+}
+
+function looksLikeCloudflareBlockPage(text) {
+  const value = String(text || '');
+  if (!value) return false;
+  if (!/cloudflare/i.test(value)) return false;
+  return (
+    /Attention Required!\s*\|\s*Cloudflare/i.test(value) ||
+    /Sorry,\s*you have been blocked/i.test(value) ||
+    /cf-error-details/i.test(value) ||
+    /cdn-cgi\/styles\/cf\.errors/i.test(value)
+  );
+}
+
 async function callLlm(messages, overrideConfig = null, handlers = {}) {
   const activeConfig = getActiveLlmConfig();
   const mergedConfig = overrideConfig ? { ...activeConfig, ...overrideConfig } : activeConfig;
@@ -707,6 +731,8 @@ async function callLlm(messages, overrideConfig = null, handlers = {}) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'User-Agent': getLlmUserAgent(),
           Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify(body),
@@ -714,7 +740,11 @@ async function callLlm(messages, overrideConfig = null, handlers = {}) {
       });
       if (!response.ok) {
         const text = await response.text();
-        const message = text ? `${response.status}: ${text}` : `${response.status}`;
+        const message = looksLikeCloudflareBlockPage(text)
+          ? `${response.status}: Cloudflare 已拦截当前网关请求（baseUrl=${baseUrl}）。可尝试更换 baseUrl/网络，或设置 LLM_USER_AGENT。`
+          : text
+            ? `${response.status}: ${truncateText(text, 1200)}`
+            : `${response.status}`;
         const err = new Error(`LLM request failed: ${message}`);
         err.llmContext = llmContext;
         throw err;
@@ -745,21 +775,26 @@ async function callLlm(messages, overrideConfig = null, handlers = {}) {
   };
 
   const withV1Fallback = async () => {
-    // Some gateways require /v1 prefix; retry once if the first attempt fails.
     const trimmed = String(baseUrl || '').replace(/\/$/, '');
     const v1Url = trimmed.endsWith('/v1') ? trimmed : `${trimmed}/v1`;
 
     try {
-      return await tryOnce(trimmed);
-    } catch (error) {
-      if (trimmed === v1Url) {
-        throw error;
-      }
+      // Prefer trying /v1 first: many gateways only implement v1 endpoints.
+      // This also avoids Cloudflare rules that sometimes block the non-v1 path.
+      return await tryOnce(v1Url);
+    } catch (v1Error) {
+      if (trimmed === v1Url) throw v1Error;
       try {
-        return await tryOnce(v1Url);
-      } catch (error2) {
-        // Preserve the original error for easier debugging when both fail.
-        throw error;
+        return await tryOnce(trimmed);
+      } catch (baseError) {
+        // When both fail, prefer the error that is not a Cloudflare block page.
+        const v1Msg = String(v1Error?.message || '');
+        const baseMsg = String(baseError?.message || '');
+        const v1IsCf = /Cloudflare/i.test(v1Msg);
+        const baseIsCf = /Cloudflare/i.test(baseMsg);
+        if (baseIsCf && !v1IsCf) throw v1Error;
+        if (v1IsCf && !baseIsCf) throw baseError;
+        throw v1Error;
       }
     }
   };
@@ -837,6 +872,7 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
         headers: {
           'Content-Type': 'application/json',
           Accept: 'text/event-stream',
+          'User-Agent': getLlmUserAgent(),
           Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify(body),
@@ -844,7 +880,11 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
       });
       if (!response.ok) {
         const text = await response.text();
-        const message = text ? `${response.status}: ${text}` : `${response.status}`;
+        const message = looksLikeCloudflareBlockPage(text)
+          ? `${response.status}: Cloudflare 已拦截当前网关请求（baseUrl=${baseUrl}）。可尝试更换 baseUrl/网络，或设置 LLM_USER_AGENT。`
+          : text
+            ? `${response.status}: ${truncateText(text, 1200)}`
+            : `${response.status}`;
         const err = new Error(`LLM request failed: ${message}`);
         err.llmContext = llmContext;
         throw err;
@@ -931,13 +971,21 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
     const trimmed = String(baseUrl || '').replace(/\/$/, '');
     const v1Url = trimmed.endsWith('/v1') ? trimmed : `${trimmed}/v1`;
     try {
-      return await tryOnce(trimmed);
-    } catch (error) {
-      if (trimmed === v1Url) throw error;
+      // Prefer trying /v1 first: many gateways only implement v1 endpoints.
+      // This also avoids Cloudflare rules that sometimes block the non-v1 path.
+      return await tryOnce(v1Url);
+    } catch (v1Error) {
+      if (trimmed === v1Url) throw v1Error;
       try {
-        return await tryOnce(v1Url);
-      } catch {
-        throw error;
+        return await tryOnce(trimmed);
+      } catch (baseError) {
+        const v1Msg = String(v1Error?.message || '');
+        const baseMsg = String(baseError?.message || '');
+        const v1IsCf = /Cloudflare/i.test(v1Msg);
+        const baseIsCf = /Cloudflare/i.test(baseMsg);
+        if (baseIsCf && !v1IsCf) throw v1Error;
+        if (v1IsCf && !baseIsCf) throw baseError;
+        throw v1Error;
       }
     }
   };
