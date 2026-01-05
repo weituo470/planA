@@ -103,6 +103,9 @@ export function ExplorerSidebar({
   const [opError, setOpError] = useState<string | null>(null);
   const [clipboard, setClipboard] = useState<ClipboardState | null>(null);
 
+  const dirCacheRef = useRef<Record<string, FsListing>>({});
+  const loadingRef = useRef<Set<string>>(new Set());
+
   const [menu, setMenu] = useState<{
     open: boolean;
     x: number;
@@ -129,32 +132,38 @@ export function ExplorerSidebar({
     async (dirPath: string, options?: { force?: boolean }) => {
       const key = String(dirPath || '').trim();
       if (!key) return;
-      if (!options?.force && dirCache[key]) return;
-      if (loadingByDir[key]) return;
+      if (!options?.force && dirCacheRef.current[key]) return;
+      if (loadingRef.current.has(key)) return;
 
+      loadingRef.current.add(key);
       setLoadingByDir((prev) => ({ ...prev, [key]: true }));
       setErrorByDir((prev) => ({ ...prev, [key]: null }));
       try {
         const qs = `?path=${encodeURIComponent(key)}`;
         const data = await apiJson<FsListing>(`/fs/list${qs}`, undefined, 12000);
-        setDirCache((prev) => ({
-          ...prev,
-          [key]: {
-            path: data?.path ?? key,
-            parent: data?.parent ?? null,
-            entries: Array.isArray(data?.entries) ? data.entries : [],
-          },
-        }));
+        setDirCache((prev) => {
+          const next = {
+            ...prev,
+            [key]: {
+              path: data?.path ?? key,
+              parent: data?.parent ?? null,
+              entries: Array.isArray(data?.entries) ? data.entries : [],
+            },
+          };
+          dirCacheRef.current = next;
+          return next;
+        });
       } catch (e: any) {
         setErrorByDir((prev) => ({
           ...prev,
           [key]: e?.message ? String(e.message) : 'Failed to load directory',
         }));
       } finally {
+        loadingRef.current.delete(key);
         setLoadingByDir((prev) => ({ ...prev, [key]: false }));
       }
     },
-    [dirCache, loadingByDir],
+    [],
   );
 
   const refreshTree = useCallback(async () => {
@@ -162,9 +171,13 @@ export function ExplorerSidebar({
     const ws = await refreshWorkspace().catch(() => null);
     const root = String(ws?.effectiveCwd || '').trim();
     if (!root) return;
-    setDirCache({});
+    setDirCache(() => {
+      dirCacheRef.current = {};
+      return {};
+    });
     setErrorByDir({});
     setLoadingByDir({});
+    loadingRef.current.clear();
     setExpanded({ [root]: true });
     await loadDir(root, { force: true });
   }, [loadDir, refreshWorkspace]);
@@ -620,4 +633,3 @@ export function ExplorerSidebar({
     </aside>
   );
 }
-
