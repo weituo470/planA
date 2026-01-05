@@ -3867,7 +3867,11 @@ function buildTasksMarkdown(prompt, payload) {
     })
     .join('\n\n');
 
-  return `# 任务（tasks）\n\n${guide}\n\n${blocks}\n`;
+  let markdown = `# 任务（tasks）\n\n${guide}\n\n${blocks}\n`;
+  if (isWebsitePrompt) {
+    markdown = markdown.replace(/\.cards-grid\b/g, '.grid').replace(/\bcards-grid\b/g, 'grid');
+  }
+  return markdown;
 }
 
 async function generateRequirementsWithModel(prompt, options = {}) {
@@ -4605,7 +4609,7 @@ function ensureAssumptionsTaskDeclaresPageNamingInTasksAtomicMarkdown(markdown) 
   const injectionLeadKey = `    ${markerLeadKey}nebula_leads（localStorage 数组），展示容器：#leads-list。`;
   const injectionAssets = `    ${markerAssets}运行前提：Node >= 18，命令默认在仓库根目录执行。每个 HTML 页面 head 引入 css/style.css；body 末尾按顺序引入 js/data.js → js/i18n.js → js/partials.js → js/main.js（缺失或乱序视为不通过）。`;
   const injectionSelectors = `    ${markerSelectors}#site-header #site-footer #site-nav #nav-toggle #lang-toggle .nav-list .nav-link <main id=\"page-content\"> #services-list #cases-list #news-list #careers-list #contact-form #contact-success #contact-error #leads-list #case-detail #case-title #case-content #case-back-link #news-detail #news-title #news-date #news-content #news-back-link .card .card-title .card-content .empty-state [data-id] [data-empty]。`;
-	  const injectionI18n = `    ${markerI18n}默认 <html lang="zh-CN">；header 提供 #lang-toggle；待翻译文案用 data-i18n-key 标记；localStorage key：nebula_lang（zh-CN/en-US）；词条最小集必须覆盖 nav.* 与 common.submit/common.learn_more/common.language；js/i18n.js 必须暴露 window.I18N（getText/applyI18n/initI18n/setLang/getCurrentLang），setLang/getCurrentLang 仅使用 zh-CN/en-US，并由 js/main.js 统一调用（禁止 window.applyI18n/window.initI18n 等未定义接口）。`;
+	  const injectionI18n = `    ${markerI18n}默认 <html lang="zh-CN">；header 提供 #lang-toggle；待翻译文案用 data-i18n-key 标记；localStorage key：nebula_lang（zh-CN/en-US）；词条最小集必须覆盖 nav.* 与 common.submit/common.learn_more/common.language；最小映射：导航 a.nav-link 分别标记 data-i18n-key=nav.home/nav.about/nav.services/nav.cases/nav.news/nav.careers/nav.contact，#lang-toggle 标记 common.language，contact.html 提交按钮标记 common.submit，列表页“了解更多”按钮标记 common.learn_more；其余正文内容暂不强制加 data-i18n-key；js/i18n.js 必须暴露 window.I18N（getText/applyI18n/initI18n/setLang/getCurrentLang），setLang/getCurrentLang 仅使用 zh-CN/en-US，并由 js/main.js 统一调用（禁止 window.applyI18n/window.initI18n 等未定义接口）。`;
   const injectionRenderRules = `    ${markerRenderRules}列表渲染：每条卡片根节点为 <article class="card" data-id="...">，并包含 .card-title/.card-content；空数组时在列表容器内渲染 <p class="empty-state" data-empty="true">...</p>；详情页未命中 id 时渲染同样 empty-state。`;
   const injectionNavRules = `    ${markerNavRules}基于 location.pathname 取文件名；把 / 与 /index.html 视为同一页面；忽略 query/hash；case-detail.html/news-detail.html 高亮对应列表页（cases.html/news.html）。`;
 
@@ -5179,6 +5183,7 @@ function normalizeTasksAtomicTextConsistency(markdown) {
   next = next.replace(/#case-list\b/g, '#cases-list');
   next = next.replace(/\blist-grid\b/g, 'grid');
   next = next.replace(/\bcard-grid\b/g, 'grid');
+  next = next.replace(/\bcards-grid\b/g, 'grid');
   next = next.replace(/\.nav\s+\.active\b/g, '#site-nav .nav-link.active');
   next = next.replace(/\.nav\s+a\b/g, '#site-nav .nav-link');
   next = next.replace(/\.nav(?!-(?:link|list))\b/g, '#site-nav');
