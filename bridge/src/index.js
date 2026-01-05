@@ -60,7 +60,7 @@ const SPEC_TEMPLATES = {
   requirements: `# 需求（requirements）\n\n## 背景\n\n## 用户故事\n\n## 验收标准（EARS）\n- 当[条件/事件]时，系统应[期望行为]。\n`,
   design: `# 设计（design）\n\n## 架构概览\n\n## 关键流程/时序\n\n## 实现考虑\n`,
   tasks: `# 任务（tasks）\n\n## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务总览与回写入口（范围约束 / 验收记录）。\n- AI IDE 开发时优先按 tasks_atomic.md 逐条执行；完成情况与关键变更回写到 tasks.md，保持任务与代码同步。\n- 如发现遗漏或范围变化：先更新 tasks.md，再重新生成 tasks_atomic.md 后继续。\n\n## 任务清单\n\n- [ ] 1. \n- [ ] 2. \n- [ ] 3. \n`,
-  tasks_atomic: `# 任务原子化（tasks_atomic）\n\n## 使用说明\n- 本文件由 tasks.md 原子化拆解生成，作为 AI IDE 开发的首选执行清单（逐条勾选、逐条验收）。\n- 原子化过程会按条追加写入，若中断可再次“开始原子化”继续。\n\n## 原子任务清单\n\n- [ ] 1. \n- [ ] 2. \n- [ ] 3. \n`,
+  tasks_atomic: `# 任务原子化（tasks_atomic）\n\n## 使用说明\n- 本文件由 tasks.md 原子化拆解生成，作为 AI IDE 开发的首选执行清单（逐条勾选、逐条验收）。\n- 原子化过程会按条追加写入，若中断可再次“开始原子化”继续。\n- 完成关键原子任务后将执行结果回写到 tasks.md（勾选+记录关键约定/验收结论）。\n\n## 原子任务清单\n\n- [ ] 1. \n- [ ] 2. \n- [ ] 3. \n`,
 };
 const DEFAULT_SPEC_STATUS = {
   requirementsConfirmed: false,
@@ -146,6 +146,7 @@ const DEFAULT_PROMPT_CONFIG = {
         `需求描述：{{prompt}}\n\n` +
         '请只输出 JSON，必须包含字段：background（字符串）, user_stories（字符串数组）, acceptance（字符串数组）。\n' +
         '要求：所有内容必须为简体中文；acceptance 每条为“当...时，系统应...”风格的可验证语句。\n' +
+        '默认假设：若需求为“企业官网/官网/网站”且未明确提出“后台/CMS/登录/管理端”，则不要编造后台管理需求；内容更新默认通过改静态数据文件/文案完成，并在 user_stories/acceptance 中体现。\n' +
         '不要输出除 JSON 以外的任何内容。',
     },
     requirementsClarifications: {
@@ -171,7 +172,7 @@ const DEFAULT_PROMPT_CONFIG = {
         `需求内容如下：\n{{requirements}}\n\n补充描述：{{prompt}}\n\n` +
         '请只输出 JSON，字段：overview（字符串）, flows（字符串数组）, considerations（字符串数组）。不要输出除 JSON 以外的任何内容。',
     },
-	    tasks: {
+ 	    tasks: {
 	      label: '任务生成',
 	      variables: ['design', 'prompt', 'minTasks', 'maxTasks'],
 	      system:
@@ -191,15 +192,33 @@ const DEFAULT_PROMPT_CONFIG = {
 	        '6) 若存在多页面重复结构（header/footer/nav 等），必须设计成可复用片段或脚本注入（确保核心结构只改一处）。\n' +
 	        '7) 任务顺序建议：先规划文档与目录结构 -> 再全局样式与共享结构 -> 再页面内容与交互 -> 最后补响应式与验收/冒烟检查。\n' +
 	        '8) 禁止输出互斥的多套实现方案（例如同时出现“header.html 片段方案”与“JS 注入方案”）；必须选择一套实现路线并全程保持一致。\n' +
-		        '9) 若技术栈为“纯 HTML/CSS/JS 且不引入构建工具”，推荐固定路线：\n' +
-		        '   - 页面：index.html、about.html、services.html、cases.html、case-detail.html、news.html、news-detail.html、careers.html、contact.html\n' +
+			        '9) 若技术栈为“纯 HTML/CSS/JS 且不引入构建工具”，推荐固定路线：\n' +
+			        '   - 页面：index.html、about.html、services.html、cases.html、case-detail.html、news.html、news-detail.html、careers.html、contact.html\n' +
+			        '   - 路径范围：仅允许在仓库根创建/修改 *.html，以及在 docs/、css/、js/、scripts/、assets/ 下创建/修改文件；禁止触碰 bridge/、dashboard/、deploy/、specs/、task/ 等本项目工具目录。\n' +
+			        '   - 页面骨架：每个页面必须包含 #site-header、<main id="page-content">、#site-footer；只放容器，不写业务卡片/详情内容。\n' +
+			        '   - SEO/可访问性最小集：每个 HTML 页面 head 必须包含 <title> 与 <meta name="description">；#nav-toggle 必须为 <button> 且包含 aria-expanded/aria-controls；联系表单字段必须有 <label for>，校验失败时设置 aria-invalid。\n' +
+			        '   - 资源引入：每个 HTML 页面 head 引入 css/style.css；body 末尾按顺序引入 js/data.js → js/i18n.js → js/partials.js → js/main.js；禁止缺失与乱序。\n' +
+		        '   - 详情/归属：case-detail.html 仅用于“案例”详情（URL 固定为 case-detail.html?id=... 且返回链接必须指向 cases.html）；news-detail.html 仅用于新闻详情（news-detail.html?id=...）；产品/服务详情统一在 services.html 内通过 services.html?id=... 或同页展开实现，禁止新建 service-detail.html 也禁止复用 case-detail.html。\n' +
+		        '   - 导航高亮：把 / 与 /index.html 视为同一页面；忽略 query/hash；在 case-detail.html/news-detail.html 上高亮对应列表页（cases.html/news.html）；active 类加在 .nav-link。\n' +
+		        '   - 导航 DOM：js/partials.js 注入的 header 必须包含 <nav id="site-nav">、<button id="nav-toggle" aria-expanded="false">、<ul class="nav-list"> 与链接 a.nav-link；active 类加在 .nav-link 上。\n' +
+			        '   - 验收脚本约束：scripts/verify.js 可以/应读取各 HTML 页面做骨架/容器/脚本顺序校验；但对“导航结构”只允许检查 js/partials.js（导航为 JS 注入），禁止要求各 HTML 静态包含 #site-nav/#nav-toggle/.nav-list/.nav-link。\n' +
+		        '   - 列表页容器固定：services.html 使用 #services-list；cases.html 使用 #cases-list；news.html 使用 #news-list；careers.html 使用 #careers-list；如需展示线索，contact.html 使用 #leads-list。HTML 只提供容器，不手写多条卡片；列表项由 js/main.js 使用 DOM API（createElement）基于 window.__SITE_DATA__ 渲染，禁止混用 <template> 方案，避免与静态结构重复冲突。\n' +
+		        '   - 列表渲染结构：列表项根节点统一用 <article class="card" data-id="...">，并包含 .card-title/.card-content；空数组时渲染 <p class="empty-state" data-empty="true">...</p>；详情页未命中 id 时渲染同样 empty-state。\n' +
+		        '   - 联系页骨架固定：contact.html 必须包含 form#contact-form（字段 name/company/email/phone/message），并包含 #contact-success/#contact-error（默认隐藏）与 #leads-list 容器；不要在后续任务中“假设已存在”。\n' +
+		        '   - 避免重复：列表/详情渲染任务只覆盖 services/cases/news/careers 与详情页；联系表单校验/存储逻辑只在“联系表单”相关任务中出现（不要在列表/详情任务里重复实现）。\n' +
+		        '   - 命名：招聘页文件名固定为 careers.html，禁止出现 jobs.html。\n' +
+		        '   - 数据字段（最小集，必须全程一致）：services/cases/careers 每条为 {id,title,content}；news 每条为 {id,title,date,content}（date 为 ISO 8601：YYYY-MM-DD）；线索 nebula_leads 每条为 {id,createdAt,name,company,email,phone,message}。\n' +
+			        '   - 导航高亮逻辑只允许在 js/main.js 实现；js/partials.js 只负责渲染导航 DOM，不做 active 计算。\n' +
+			        '   - 移动端导航展开：必须在 js/main.js 绑定 #nav-toggle click 切换 aria-expanded（true/false）；css/style.css 仅基于 aria-expanded 控制 .nav-list 展开/收起。\n' +
 		        '   - 列表页文件名固定：cases.html 与 news.html；禁止使用 case-list.html/news-list.html。\n' +
-		        '   - 联系表单交互只在 js/main.js 中实现；contact.html 禁止内嵌 <script> 逻辑（页面只引入脚本）。\n' +
+		        '   - 联系表单交互只在 js/main.js 中实现；contact.html 禁止内嵌 <script> 逻辑（页面只引入脚本）；每个字段必须有 <label for> + 唯一 id；email/phone 需有最小格式校验（邮箱示例 a@b.com；电话示例 +86 13800138000；允许字符 [0-9\\s+()-]）；成功提示 id 固定为 #contact-success；错误提示容器固定为 #contact-error（建议 role="alert"，校验失败时设置 aria-invalid="true"）；线索存储 key 固定为 nebula_leads。\n' +
+			        '   - 多语言预留：默认 <html lang="zh-CN">；header 增加按钮 #lang-toggle；待翻译文案用 data-i18n-key 标记；语言键仅使用 zh-CN/en-US（localStorage nebula_lang 仅存 zh-CN/en-US）；词条最小集必须包含 nav.home/nav.about/nav.services/nav.cases/nav.news/nav.careers/nav.contact 与 common.submit/common.learn_more/common.language；js/i18n.js 必须暴露 window.I18N（getText/applyI18n/initI18n/setLang/getCurrentLang），js/main.js 统一调用 window.I18N.initI18n()/applyI18n()；禁止 window.applyI18n/window.initI18n 等未定义接口。\n' +
 		        '   - 样式：css/style.css（先定义全局变量/排版/网格，再做页面区块样式）\n' +
 		        '   - 数据：js/data.js（统一用 window.__SITE_DATA__ 暴露，禁止 export/import 与 window 挂载混用）\n' +
 		        '   - 共享头尾：js/partials.js（渲染到 #site-header / #site-footer），禁止创建 header.html/footer.html 片段文件\n' +
 		        '   - 交互入口：js/main.js（集中初始化导航/表单/详情渲染；禁止拆成 js/pages/*.js 多入口）\n' +
 	        '   - 验收：scripts/verify.js（node scripts/verify.js；仅用 Node 内置模块，禁止 jsdom/puppeteer 等第三方依赖）+ 本地预览命令（python -m http.server 8000，访问 http://localhost:8000/）\n' +
+	        '   - verify.js 以存在性/结构/字段校验为主（含页面骨架、列表/详情/联系关键容器与数据字段最小集），禁止依赖固定文案/标题文本，避免误报。\n' +
 	        '请严格输出 JSON：{"tasks":[{title,core,details,ac}]}。',
 	    },
 	    atomize: {
@@ -213,6 +232,11 @@ const DEFAULT_PROMPT_CONFIG = {
 	        '1) 输出为原子级任务，不要摘要；拆到“可独立实现并可验收”为止；单条任务建议 10-20 分钟内可完成（目标约 15 分钟）。\n' +
 	        '   - 禁止为追求更小而拆到单个 DOM 节点（如单个 <li>/<span>）、单个 class/单个 CSS 属性等微改。\n' +
 	        '   - 同一文件内围绕同一功能/区块/交互，尽量一次完成其结构/样式/文案/数据绑定；只有当同一文件内存在明显可独立验收的多个功能点时才拆分。\n' +
+	        '   - 对 docs/*.md：禁止拆成“创建文档标题/章节骨架”与“补齐内容”多条；必须合并为 1 条输出可读完整内容（允许一次性写完所有章节与条目）。\n' +
+	        '   - 对 *.html：创建单个页面时必须一次写完整页面（head 元信息 + css/style.css 引入 + #site-header/#page-content/#site-footer + 必要列表/详情容器 + 脚本顺序）；禁止拆成“创建 head”/“补齐 body”两条。\n' +
+		        '   - 对同一文件：除非存在两个完全独立可验收功能点，否则该文件在整个 tasks_atomic 内最多拆成 1 条任务（最多 2 条作为例外），避免流程冗长与“骨架任务”。\n' +
+		        '   - 禁止对同一文件输出多条“做同一件事”的重复任务（尤其 js/i18n.js）：如出现 2+ 条内容高度相似的任务，必须合并为 1 条最完整任务。\n' +
+		        '   - 若规则已在 docs/assumptions.md 中定义：后续任务不要重复粘贴规则正文，只在 details 中引用对应章节；只有新增/变更规则时才修改 docs/assumptions.md。\n' +
 	        '2) 任务对象字段：title/core/details/ac。\n' +
 	        '3) title 必须以“创建/修改/删除 <相对文件路径>”开头，且 <相对文件路径> 必须是动作后的第一个 token（后续说明用“｜”追加）。\n' +
 	        '   - 文件路径必须包含扩展名（.ts/.tsx/.js/.md/.css/.json 等），且必须为最终可用路径。\n' +
@@ -225,15 +249,37 @@ const DEFAULT_PROMPT_CONFIG = {
 	        '6) 遵循定义先行：先定义数据结构/常量/DOM id 与 class/接口契约，再实现渲染与交互逻辑；若涉及 TS/后端/DB，依然遵循 types/schema -> logic -> UI。\n' +
 	        '7) 文档类任务必须输出到 docs/*.md（推荐 docs/ia.md），禁止把信息架构/路由说明写进 HTML 页面。\n' +
 	        '8) 一致性约束：同一 spec 内必须选择唯一实现路线并保持一致（尤其是 header/footer 复用方式、数据组织方式、类名命名）。禁止同时输出两套互斥方案。\n' +
-	        '9) 对“纯 HTML/CSS/JS 且不引入构建工具”的场景：\n' +
-	        '   - 数据文件统一采用 js/data.js，并以 window.__SITE_DATA__ 暴露；后续任务必须一致引用，禁止 export/import 与 window 挂载混用。\n' +
-	        '   - 共享结构优先采用 js/partials.js 注入（渲染到 #site-header/#site-footer），禁止创建 header.html/footer.html 片段文件。\n' +
+		        '9) 对“纯 HTML/CSS/JS 且不引入构建工具”的场景：\n' +
+		        '   - 数据文件统一采用 js/data.js，并以 window.__SITE_DATA__ 暴露；后续任务必须一致引用，禁止 export/import 与 window 挂载混用。\n' +
+		        '   - 路径范围：仅允许 *.html（仓库根）、docs/、css/、js/、scripts/、assets/；禁止触碰 bridge/、dashboard/、deploy/、specs/、task/ 等本项目工具目录。\n' +
+		        '   - 共享结构优先采用 js/partials.js 注入（渲染到 #site-header/#site-footer），禁止创建 header.html/footer.html 片段文件。\n' +
 		        '   - 交互入口统一采用 js/main.js（按页面识别执行初始化）；禁止引入 js/pages/*.js 或 home.js/index.js 等多入口脚本。\n' +
-		        '   - 重要：文档/任务中描述“路由/链接”时必须使用实际文件名（例如 about.html、services.html）；详情页必须用 `case-detail.html?id=...` / `news-detail.html?id=...` 这类 query 参数形式；禁止使用 /about、/products、:id 这类伪路由表达。\n' +
+		        '   - 初始化顺序：DOMContentLoaded 后先确保 js/partials.js 完成 header/footer 注入，再调用 window.I18N.initI18n() → window.I18N.applyI18n()，再执行导航高亮/折叠与页面渲染；联系表单绑定仅在 contact.html 且 form#contact-form 存在时执行。\n' +
+		        '   - 页面骨架：每个页面必须包含 #site-header、<main id="page-content">、#site-footer；只放容器，不手写列表卡片。\n' +
+		        '   - SEO/可访问性最小集：每个 HTML 页面 head 必须包含 <title> 与 <meta name="description">；#nav-toggle 必须为 <button> 且包含 aria-expanded/aria-controls；联系表单字段必须有 <label for>，校验失败时设置 aria-invalid。\n' +
+		        '   - 资源引入：每个 HTML 页面 head 引入 css/style.css；body 末尾按顺序引入 js/data.js → js/i18n.js → js/partials.js → js/main.js；禁止缺失与乱序。\n' +
+	        '   - 样式任务合并：css/style.css 的 :root tokens（配色/字体/字号/间距/圆角/阴影/断点）必须合并为 1 条任务；禁止拆分为多条“只新增变量”的任务。\n' +
+	        '   - 导航 DOM：js/partials.js 注入的 header 必须包含 <nav id="site-nav">、<button id="nav-toggle" aria-expanded="false">、<ul class="nav-list"> 与链接 a.nav-link；active 类加在 .nav-link 上。\n' +
+		        '   - 验收脚本约束：scripts/verify.js 可以/应读取各 HTML 页面做骨架/容器/脚本顺序校验；但对“导航结构”只允许检查 js/partials.js（导航为 JS 注入），禁止要求各 HTML 静态包含 #site-nav/#nav-toggle/.nav-list/.nav-link。\n' +
+	        '   - 列表渲染结构：列表项根节点统一用 <article class="card" data-id="...">，并包含 .card-title/.card-content；空数组时渲染 <p class="empty-state" data-empty="true">...</p>；详情页未命中 id 时渲染同样 empty-state。\n' +
+	        '   - 重要：文档/任务中描述“路由/链接”时必须使用实际文件名（例如 about.html、services.html）；详情页必须用 query 参数形式：案例详情页固定为 `case-detail.html?id=...`（只展示案例，返回链接必须指向 cases.html），新闻详情页固定为 `news-detail.html?id=...`；产品/服务详情禁止新建 service-detail.html 且禁止复用 case-detail.html，统一用 `services.html?id=...` 或同页展开。禁止使用 /about、/products、:id 这类伪路由表达。\n' +
+	        '   - 命名：招聘页文件名固定为 careers.html，禁止出现 jobs.html。\n' +
+		        '   - 列表页容器固定：services.html 使用 #services-list；cases.html 使用 #cases-list；news.html 使用 #news-list；careers.html 使用 #careers-list；如需展示线索，contact.html 使用 #leads-list。HTML 只提供容器，不手写多条卡片；列表项由 js/main.js 使用 DOM API（createElement）渲染，禁止混用 <template> 方案。\n' +
+		        '   - 联系页骨架固定：contact.html 必须包含 form#contact-form（字段 name/company/email/phone/message），并包含 #contact-success/#contact-error（默认隐藏）与 #leads-list 容器；不要在后续任务中“假设已存在”。\n' +
+		        '   - 避免重复：列表/详情渲染任务只覆盖 services/cases/news/careers 与详情页；联系表单校验/存储逻辑只在“联系表单”相关任务中出现（不要在列表/详情任务里重复实现）。\n' +
+		        '   - 数据字段（最小集，必须全程一致）：services/cases/careers 每条为 {id,title,content}；news 每条为 {id,title,date,content}（date 为 ISO 8601：YYYY-MM-DD）；线索 nebula_leads 每条为 {id,createdAt,name,company,email,phone,message}。\n' +
+			        '   - 导航高亮逻辑只能在 js/main.js 实现；js/partials.js 仅输出导航 DOM，不做 active 计算。\n' +
+			        '   - 移动端导航展开：必须在 js/main.js 绑定 #nav-toggle click 切换 aria-expanded（true/false）；css/style.css 仅基于 aria-expanded 控制 .nav-list 展开/收起，禁止只写 CSS 不写 JS。\n' +
 		        '   - 列表页文件名固定：cases.html 与 news.html；禁止使用 case-list.html/news-list.html。\n' +
-		        '   - 联系表单交互只允许在 js/main.js 中实现；contact.html 禁止内嵌 <script> 逻辑。\n' +
-		        '10) ac 必须“机器可验证”，且尽量客观：优先提供 CLI 可脚本化验证（例如 node scripts/verify.js）；必要时可补充页面验证（页面路径+元素+操作+预期）。\n' +
-		        '   - 验收脚本必须仅依赖 Node 内置模块（fs/path/assert 等），禁止 jsdom/puppeteer 等第三方依赖。\n' +
+		        '   - 联系表单交互只允许在 js/main.js 中实现；contact.html 禁止内嵌 <script> 逻辑；每个字段必须有 <label for> + 唯一 id；成功提示 id 固定为 #contact-success；错误提示容器固定为 #contact-error（建议 role="alert"，校验失败时设置 aria-invalid="true"）；线索存储 key 固定为 nebula_leads。\n' +
+			        '   - 多语言预留：默认 <html lang="zh-CN">；header 增加按钮 #lang-toggle；待翻译文案用 data-i18n-key 标记；语言键仅使用 zh-CN/en-US（localStorage nebula_lang 仅存 zh-CN/en-US）；词条最小集必须包含 nav.home/nav.about/nav.services/nav.cases/nav.news/nav.careers/nav.contact 与 common.submit/common.learn_more/common.language；js/i18n.js 必须暴露 window.I18N（getText/applyI18n/initI18n/setLang/getCurrentLang），js/main.js 统一调用 window.I18N.initI18n()/applyI18n()；禁止 window.applyI18n/window.initI18n 等未定义接口。\n' +
+	        '10) ac 必须可验证且尽量客观：优先提供 node -e 读取“当前任务文件”做静态校验（只依赖 Node 内置模块）；仅在 tasks_atomic 中已存在创建/修改 scripts/verify.js 的任务后，才允许引用 node scripts/verify.js。必要时可补充页面验证（页面路径+元素+操作+预期）。\n' +
+		        '   - AC 内单条命令尽量 ≤ 200 字符；跨文件/多页面的复杂校验集中写入 scripts/verify.js，并仅在“创建/修改 scripts/verify.js”对应任务里新增检查点与 AC。\n' +
+		        '   - 若当前任务文件为 scripts/verify.js：必须覆盖 HTML 页面骨架/脚本引入顺序/列表与详情与联系关键容器/数据字段最小集；导航结构仅校验 js/partials.js，不要求 HTML 静态包含导航。\n' +
+		        '   - 禁止在 AC 中引用尚未在 tasks_atomic 中创建/修改过的文件（例如 scripts/verify.js 在其任务之前）；需要跨文件验收时，用 node -e 临时读取多个文件或把验收点放到后续 scripts/verify.js 任务。\n' +
+	        '   - 对关键交互（语言切换/导航高亮/表单校验/菜单展开）：AC 必须包含最小端到端步骤 + 可直接粘贴的控制台断言示例（检查 .nav-link.active、aria-expanded、localStorage key 等）。\n' +
+	        '   - 验收脚本必须仅依赖 Node 内置模块（fs/path/assert 等），禁止 jsdom/puppeteer 等第三方依赖。\n' +
+	        '   - verify.js 检查以存在性/结构/字段校验为主，禁止强依赖固定文案/标题文本（避免误报）。\n' +
 		        '   - 禁止仅用 rg/grep/搜索 作为唯一验收；必须至少包含 1 条“行为验证”（脚本运行结果/构建或测试通过/页面交互可观察结果）。\n' +
 	        '11) 依赖/顺序：若该任务依赖前置容器/数据/样式变量，必须在 details 中写明“前置条件：...”，确保执行顺序一致。\n' +
 	        '12) 信息不足时：先补 1 条“创建 docs/assumptions.md”记录假设/待确认点（写清缺失信息），再继续拆分。\n' +
@@ -3381,8 +3427,8 @@ function generateTasksContent(design, prompt) {
           `- 页面清单：${pageListText}`,
           '- 导航结构：顶栏导航项与对应页面路径（使用上述页面文件名）。',
           '- 每页主要区块大纲（首页/关于/服务/案例/新闻/招聘/联系按需）。',
-          '- 数据字段约定：统一 id/title/summary（可选 body），news 额外 date；后续写入 js/data.js。',
-          '- 约束：纯静态站点；不开发后端/数据库/登录；联系表单仅前端校验 + mailto（不落库）。',
+          '- 数据字段约定（最小集）：services/cases/careers=id/title/content；news=id/title/date/content（date 为 YYYY-MM-DD）；线索 nebula_leads=id/createdAt/name/company/email/phone/message；后续写入 js/data.js。',
+          '- 约束：纯静态站点；不开发后端/数据库/登录；联系表单为前端必填校验 + localStorage（key：nebula_leads）；可选提供 mailto/tel 链接但不作为存储。',
         ].join('\n'),
         ac:
           '运行 `node -e "const fs=require(\'fs\');const c=fs.readFileSync(\'docs/ia.md\',\'utf8\');if(!c.includes(\'页面清单\')) throw new Error(\'missing\');"` 退出码为 0。',
@@ -3422,13 +3468,13 @@ function generateTasksContent(design, prompt) {
           '- 以 `window.__SITE_DATA__ = { ... }` 暴露（禁止 export/import 与 window 挂载混用）。',
           '- 提供 `services` 数组（至少 3 条）。',
           ...(includeCases
-            ? ['- 提供 `cases` 数组（至少 3 条），字段：id/title/summary/body。']
+            ? ['- 提供 `cases` 数组（至少 3 条），字段：id/title/content。']
             : []),
           ...(includeNews
-            ? ['- 提供 `news` 数组（至少 3 条），字段：id/title/summary/date/body。']
+            ? ['- 提供 `news` 数组（至少 3 条），字段：id/title/date/content（date 为 ISO 8601：YYYY-MM-DD）。']
             : []),
           ...(includeCareers
-            ? ['- 提供 `jobs` 数组（至少 3 条），字段：id/title/summary/body。']
+            ? ['- 提供 `careers` 数组（至少 3 条），字段：id/title/content。']
             : []),
         ]
           .filter(Boolean)
@@ -3443,10 +3489,23 @@ function generateTasksContent(design, prompt) {
           '创建 js/partials.js：',
           '- 渲染 header 到 `#site-header`，footer 到 `#site-footer`。',
           '- 导航链接与 docs/ia.md 的页面清单一致（使用固定文件名）。',
-          '- 当前页高亮：根据 `location.pathname` 或 `document.body.dataset.page` 判断。',
+          '- header 必须包含：`<nav id="site-nav">`、`<button id="nav-toggle" aria-expanded="false">`、`<button id="lang-toggle" type="button">`、`.nav-list`、`.nav-link`。',
+          '- 仅输出导航 DOM（包含 `.nav-link`），不做 active 计算；active 逻辑统一放在 `js/main.js`。',
         ].join('\n'),
         ac:
           '运行 `node -e "const fs=require(\'fs\');const c=fs.readFileSync(\'js/partials.js\',\'utf8\');if(!c.includes(\'site-header\')||!c.includes(\'site-footer\')) throw new Error(\'missing\');"` 退出码为 0。',
+      },
+      {
+        title: '创建 js/i18n.js｜多语言预留字典',
+        core: '提供中英最小字典与应用函数，支持后续扩展。',
+        details: [
+          '创建 js/i18n.js：',
+          '- 定义 `window.I18N`（至少覆盖导航与首页关键标题的最小字典 + API）。',
+          '- 提供 `window.I18N.applyI18n(root, lang)`：遍历带 `data-i18n-key` 的元素并替换 `textContent`。',
+          "- 提供 `window.I18N.initI18n({ storageKey: 'nebula_lang', defaultLang: 'zh-CN' })`：从 localStorage 读取语言并应用。",
+        ].join('\n'),
+        ac:
+          '运行 `node -e "global.window={};require(\'./js/i18n.js\');if(!window.I18N||typeof window.I18N.applyI18n!==\'function\'||typeof window.I18N.initI18n!==\'function\') throw new Error(\'missing\');"` 退出码为 0。',
       },
       {
         title: '创建 js/main.js｜页面渲染与交互',
@@ -3454,12 +3513,13 @@ function generateTasksContent(design, prompt) {
         details: [
           '创建 js/main.js：',
           '- 初始化时先调用 `partials.js` 渲染共享头尾。',
-          '- 列表页从 `window.__SITE_DATA__` 渲染 services/cases/news/jobs 列表（按页面存在决定）。',
+          '- 列表页从 `window.__SITE_DATA__` 渲染 services/cases/news/careers 列表（按页面存在决定）。',
           '- 详情页（case-detail.html/news-detail.html）通过 `?id=` 从数据中查找并渲染详情。',
-          '- contact.html 联系表单：前端必填校验；通过 `mailto:` 生成邮件草稿（不落库/不调用后端）。',
+          '- contact.html 联系表单：前端必填校验；通过 localStorage key `nebula_leads` 记录线索并显示成功提示（不落库/不调用后端）。',
+          '- 多语言预留：读取 localStorage key `nebula_lang`（默认 zh-CN），点击 #lang-toggle 切换并调用 window.I18N.applyI18n(document, lang)；关键文案使用 data-i18n-key 标记。',
         ].join('\n'),
         ac:
-          '运行 `node -e "const fs=require(\'fs\');const c=fs.readFileSync(\'js/main.js\',\'utf8\');if(!c.includes(\'mailto:\')) throw new Error(\'missing mailto\');"` 退出码为 0。',
+          '运行 `node -e "const fs=require(\'fs\');const c=fs.readFileSync(\'js/main.js\',\'utf8\');if(!c.includes(\'nebula_leads\')) throw new Error(\'missing nebula_leads\');"` 退出码为 0。',
       },
       {
         title: '创建 scripts/verify.js｜冒烟验收脚本',
@@ -3468,7 +3528,9 @@ function generateTasksContent(design, prompt) {
           '创建 scripts/verify.js（仅用 Node 内置模块 fs/path/assert/url）：',
           `- REQUIRED_FILES 至少包含：${pageListText}、css/style.css、js/data.js、js/partials.js、js/main.js、scripts/verify.js`,
           `- HTML_PAGES 至少包含：${pageListText}`,
-          '- 检查每个 HTML 页面都包含 `#site-header`、`#site-footer`、并引入 css/style.css 与 js/main.js。',
+          '- 检查每个 HTML 页面都包含 `#site-header`、`#site-footer`、`<main id="page-content">`，并引入 css/style.css 与 js/main.js。',
+          '- 检查每个 HTML 页面都设置 `<html lang="zh-CN">`（后续可由 i18n 切换更新）。',
+          '- 检查 js/partials.js 至少包含 site-nav/nav-toggle/lang-toggle/nav-link 关键字。',
           '- 失败时 `process.exit(1)` 并输出原因；全部通过 `process.exit(0)`。',
         ].join('\n'),
         ac: '运行 `node scripts/verify.js` 退出码为 0。',
@@ -3627,6 +3689,7 @@ function filterAcceptanceLines(lines) {
 
 function buildRequirementsMarkdown(prompt, payload) {
   const fallbackSummary = normalizePrompt(prompt);
+  const isWebsitePrompt = /(企业)?官网|网站|网页/i.test(fallbackSummary);
   const rawPrompt = fallbackSummary || '（未提供原始需求）';
   let background = sanitizeModelText(
     payload?.background || payload?.summary || payload?.goal,
@@ -3647,9 +3710,12 @@ function buildRequirementsMarkdown(prompt, payload) {
   const acceptance = filterAcceptanceLines(
     payload?.acceptance || payload?.ears || payload?.criteria,
   );
+  const cleanedAcceptance = isWebsitePrompt
+    ? acceptance.filter((line) => !/(管理员|后台|CMS|登录|鉴权|数据库|权限)/.test(line))
+    : acceptance;
   const acceptanceLines =
-    acceptance.length > 0
-      ? acceptance
+    cleanedAcceptance.length > 0
+      ? cleanedAcceptance
       : [
           '当用户开始使用该功能时，系统应提供清晰的引导与默认配置（可后续调整）。',
           '当用户执行核心操作时，系统应提供可感知的反馈（加载态/提示）。',
@@ -3705,7 +3771,39 @@ function buildDesignMarkdown(prompt, payload) {
 
 function buildTasksMarkdown(prompt, payload) {
   const fallbackSummary = normalizePrompt(prompt);
-  const guide = `## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务总览与回写入口（范围约束 / 验收记录）。\n- AI IDE 开发时优先按 tasks_atomic.md（原子化任务表单）逐条执行；完成情况与关键变更回写到 tasks.md，保持任务与代码同步。\n- 如发现遗漏或范围变化：先更新 tasks.md，再重新生成 tasks_atomic.md 后继续。\n\n## 任务清单`;
+  const isWebsitePrompt = /(企业)?官网|网站|网页/i.test(fallbackSummary);
+  const globalConventions = isWebsitePrompt
+    ? [
+        '## 全局约定（自动生成）',
+        '- 页面文件名唯一清单：index.html、about.html、services.html、cases.html、case-detail.html、news.html、news-detail.html、careers.html、contact.html。',
+        '- 详情页：case-detail.html?id=...（仅案例详情，返回链接元素 id 固定为 #case-back-link，href 指向 cases.html）；news-detail.html?id=...（仅新闻详情，返回链接元素 id 固定为 #news-back-link，href 指向 news.html）；服务详情统一用 services.html?id=... 或同页展开，禁止复用 case-detail.html。',
+        '- 导航高亮：把 / 与 /index.html 视为同一页面；忽略 query/hash；详情页（case-detail.html/news-detail.html）导航高亮对应列表页（cases.html/news.html）；active 类加在 .nav-link。',
+        '- 数据口径：js/data.js 统一 window.__SITE_DATA__；字段以 docs/assumptions.md 为唯一权威。基线：services/cases/careers=id/title/content；news=id/title/date/content（date 为 ISO 8601：YYYY-MM-DD）。如需扩展字段：先更新 docs/assumptions.md，再在 tasks.md/tasks_atomic.md 全文一致引用。',
+        '- CSS 命名：网格布局统一用 .grid/.grid-2/.grid-3（列表容器 #services-list/#cases-list/#news-list/#careers-list 可直接使用 class=\"grid\" 或叠加 grid-2/grid-3）；导航列表用 .nav-list，链接用 .nav-link；禁止出现 list-grid/card-grid 等别名。',
+        '- 渲染结构：列表项根节点统一使用 <article class=\"card\" data-id=\"...\">，标题用 .card-title，正文用 .card-content；空数组时在列表容器内渲染 <p class=\"empty-state\" data-empty=\"true\">...。</p>；详情页未命中 id 时渲染同样 empty-state。',
+	        '- 多语言预留：默认 <html lang=\"zh-CN\">；header 提供 #lang-toggle；待翻译文案用 data-i18n-key 标记；语言键仅使用 zh-CN/en-US（localStorage nebula_lang 仅存 zh-CN/en-US）；词条最小集必须包含 nav.home/nav.about/nav.services/nav.cases/nav.news/nav.careers/nav.contact 与 common.submit/common.learn_more/common.language；js/i18n.js 必须暴露 window.I18N（getText/applyI18n/initI18n/setLang/getCurrentLang），由 js/main.js 统一调用；禁止出现 window.applyI18n/window.initI18n 等未定义接口。',
+        '- 冲突优先级：若 tasks.md、tasks_atomic.md 与 docs/assumptions.md 出现冲突，以 docs/assumptions.md 为准；tasks_atomic.md 为执行清单，tasks.md 为总览。',
+        '- 线索记录：无后端时统一使用 localStorage key `nebula_leads`（数组，字段 id/createdAt/name/company/email/phone/message）；如需展示，容器 id 固定为 #leads-list。',
+        '- 表单可访问性：contact.html 每个字段必须有 <label for> + 唯一 id；校验失败时写入 #contact-error、设置 aria-invalid=\"true\" 并显示错误；成功时显示 #contact-success。',
+        '- 关键容器：#site-header #site-footer #site-nav #nav-toggle #lang-toggle .nav-list .nav-link <main id=\"page-content\">；列表 #services-list #cases-list #news-list #careers-list；详情 #case-detail #case-title #case-content #case-back-link #news-detail #news-title #news-date #news-content #news-back-link；表单 #contact-form；成功提示 #contact-success；错误提示 #contact-error；线索 #leads-list。',
+        '- 资源引入：每个 HTML 页面 head 引入 css/style.css；body 末尾脚本顺序 js/data.js → js/i18n.js → js/partials.js → js/main.js（缺失/乱序视为不通过）。',
+        '- 验收环境：Node >= 18；默认在仓库根目录执行 `node scripts/verify.js` / `node -e ...`。',
+        '- 本地预览：python -m http.server 8000（访问 http://localhost:8000/）；验收脚本：node scripts/verify.js。',
+        '- 验收：scripts/verify.js 以存在性/结构/字段校验为主（含页面骨架、列表/详情/联系关键容器、数据字段最小集）；混合内容检查仅限资源引用（script/link/img 的 src/href），不检查普通 a 外链；避免依赖固定文案。',
+      ].join('\n')
+    : '';
+
+  const guide = [
+    '## AI IDE 使用说明',
+    '- 本文件是“规范驱动开发”的任务总览与回写入口（范围约束 / 验收记录）。',
+    '- AI IDE 开发时优先按 tasks_atomic.md（原子化任务表单）逐条执行；完成情况与关键变更回写到 tasks.md，保持任务与代码同步。',
+    '- 如发现遗漏或范围变化：先更新 tasks.md，再重新生成 tasks_atomic.md 后继续。',
+    globalConventions,
+    '',
+    '## 任务清单',
+  ]
+    .filter(Boolean)
+    .join('\n');
 
   const rawTasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
   const tasks = rawTasks
@@ -3727,7 +3825,25 @@ function buildTasksMarkdown(prompt, payload) {
     },
   ];
 
-  const list = tasks.length ? tasks : fallbackList;
+  let list = tasks.length ? tasks : fallbackList;
+  if (isWebsitePrompt) {
+    const hasAssumptions = list.some((t) => {
+      const joined = [t?.title, t?.core, t?.details, t?.ac].filter(Boolean).join('\n');
+      return /docs\/assumptions\.md/i.test(joined) || /assumptions|待确认点/i.test(joined);
+    });
+    if (!hasAssumptions) {
+      list = [
+        {
+          title: '创建 docs/assumptions.md｜写入关键快照',
+          core: '固化本 spec 的关键约定快照，避免字段/选择器/多语言/表单规则在后续任务中漂移。',
+          details:
+            'docs/assumptions.md（必须包含：页面文件名唯一清单；window.__SITE_DATA__ 字段最小集；关键容器与选择器；多语言预留策略（lang/#lang-toggle/data-i18n-key）；联系表单可访问性与 nebula_leads 线索字段）。',
+          ac: 'docs/assumptions.md 存在，且包含“页面文件名唯一清单”“关键容器与选择器”“数据字段（最小集）”“多语言预留”“联系表单字段/线索存储”相关小节或条目。',
+        },
+        ...list,
+      ];
+    }
+  }
 
   const blocks = list
     .map((t, idx) => {
@@ -4289,6 +4405,16 @@ function truncateForPrompt(text, maxLen) {
   return `${value.slice(0, maxLen)}…`;
 }
 
+function extractTasksGlobalConventionsSection(tasksMarkdown) {
+  const text = normalizeLineEndings(tasksMarkdown || '');
+  if (!text.trim()) return '';
+  const match = text.match(
+    /(^##\s*全局约定[^\n]*\n[\s\S]*?)(?=\n##\s+|\n#\s+|$)/m,
+  );
+  if (!match) return '';
+  return String(match[1] || '').trim();
+}
+
 function formatOriginalTaskForAtomize(task) {
   const title = sanitizeModelText(task?.title || '', '').trim();
   const core = sanitizeModelText(task?.core || '', '').trim();
@@ -4371,9 +4497,9 @@ function mergeAssumptionsTasksInTasksAtomicMarkdown(markdown) {
   const mergedBlockLines = [
     `- [ ] **Task ${firstAssumptionsLabel || '1.1'}**: 修改 docs/assumptions.md｜汇总待确认点`,
     '  - **核心逻辑**: 汇总原子化过程中的待确认点，消除重复 assumptions 任务。',
-    '  - **技术细节**: 在 docs/assumptions.md 补齐默认值与待确认点，避免后续任务出现“基址/路径/字段/交互规则不确定”。建议结构：1) 基址 baseUrl（默认 http://localhost:8000/，用于 canonical/预览）；2) 页面清单（列出全部 HTML 文件）；3) 详情页参数约定（统一 ?id=）；4) 数据字段命名（统一 id/title/summary/cover/date/body）；5) 导航高亮规则（统一基于 location.pathname，含 / 与 /index.html）；6) 待确认点条目（追加/合并如下）：',
+    '  - **技术细节**: 在 docs/assumptions.md 补齐默认值与待确认点，避免后续任务出现“基址/路径/字段/交互规则不确定”。建议结构：1) 基址 baseUrl（默认 http://localhost:8000/，用于 canonical/预览）；2) 页面清单（列出全部 HTML 文件）；3) 详情页参数约定（统一 ?id=）；4) 数据字段命名（以 assumptions 为唯一权威；基线 services/cases/careers=id/title/content；news=id/title/date/content（date 为 ISO 8601：YYYY-MM-DD）；leads(localStorage:nebula_leads)=id/createdAt/name/company/email/phone/message；正文统一字段名 content，禁止同时使用 detail/body/content 多套命名）；5) 导航高亮规则（统一基于 location.pathname，含 / 与 /index.html）；6) 待确认点条目（追加/合并如下）：',
     ...items.map((x) => `    - ${x}`),
-    '  - **验收准则 (AC)**: 运行 `node -e "const fs=require(\\\"fs\\\");const t=fs.readFileSync(\\\"docs/assumptions.md\\\",\\\"utf8\\\");const must=[\\\"基址\\\",\\\"页面清单\\\",\\\"?id=\\\",\\\"cover\\\",\\\"location.pathname\\\",\\\"待确认点\\\"];if(!must.every(k=>t.includes(k)))process.exit(1);console.log(\\\"ok\\\")"` 输出 `ok`。',
+    '  - **验收准则 (AC)**: 运行 `node -e "const fs=require(\\\"fs\\\");const t=fs.readFileSync(\\\"docs/assumptions.md\\\",\\\"utf8\\\");const must=[\\\"基址\\\",\\\"页面清单\\\",\\\"?id=\\\",\\\"title\\\",\\\"content\\\",\\\"date\\\",\\\"nebula_leads\\\",\\\"location.pathname\\\",\\\"待确认点\\\"];if(!must.every(k=>t.includes(k)))process.exit(1);console.log(\\\"ok\\\")"` 输出 `ok`。',
   ];
 
   const output = [];
@@ -4442,15 +4568,46 @@ function ensureAssumptionsTaskDeclaresPageNamingInTasksAtomicMarkdown(markdown) 
 
   if (!htmlPages.length) return text;
 
+  const websiteCanonicalPages = [
+    'index.html',
+    'about.html',
+    'services.html',
+    'cases.html',
+    'case-detail.html',
+    'news.html',
+    'news-detail.html',
+    'careers.html',
+    'contact.html',
+  ];
+  const isWebsite = websiteCanonicalPages.some((p) => text.includes(p));
+  const resolvedPages = (() => {
+    if (!isWebsite) return htmlPages;
+    const derived = new Set(htmlPages.map((p) => p.toLowerCase()));
+    const missing = websiteCanonicalPages.filter((p) => !derived.has(p.toLowerCase()));
+    return missing.length ? websiteCanonicalPages : htmlPages;
+  })();
+
   const markerPages = '页面文件名唯一清单：';
   const markerBrand = '企业名称（title/meta）：';
+  const markerDataSchema = '数据字段（最小集）：';
   const markerContactFields = '联系表单字段：';
+  const markerLeadKey = '线索存储 key：';
+  const markerAssets = '资源引入顺序：';
   const markerSelectors = '关键容器与选择器：';
+  const markerI18n = '多语言预留：';
+  const markerRenderRules = '渲染结构约定：';
+  const markerNavRules = '导航高亮规则：';
 
-  const injectionPages = `    ${markerPages}${htmlPages.join('、')}。禁止使用 case-list.html/news-list.html/products.html/product-detail.html 等未在清单中的文件名。`;
-  const injectionBrand = `    ${markerBrand}星云科技（可调整但必须全站一致）。`;
-  const injectionContactFields = `    ${markerContactFields}name/email/phone/message；协议：mailto:/tel:。`;
-  const injectionSelectors = `    ${markerSelectors}#site-header #site-footer #site-nav #nav-toggle .nav-link <main id=\"page-content\">。`;
+  const injectionPages = `    ${markerPages}${resolvedPages.join('、')}。案例详情页固定为 case-detail.html?id=...（返回 cases.html）；新闻详情页固定为 news-detail.html?id=...；产品/服务详情统一在 services.html?id=... 或同页展开，禁止复用 case-detail.html。禁止使用 case-list.html/news-list.html/products.html/product-detail.html 等未在清单中的文件名。`;
+  const injectionBrand = `    ${markerBrand}Nebula（中文名：星云科技；可调整但必须全站一致）。`;
+	  const injectionDataSchema = `    ${markerDataSchema}services/cases/careers=id/title/content；news=id/title/date/content（date 为 YYYY-MM-DD）；nebula_leads=id/createdAt/name/company/email/phone/message；i18n（js/i18n.js 内置 I18N_DICT，语言键仅 zh-CN/en-US）最小集必须覆盖 nav.home/nav.about/nav.services/nav.cases/nav.news/nav.careers/nav.contact 与 common.submit/common.learn_more/common.language。`;
+  const injectionContactFields = `    ${markerContactFields}name/company/email/phone/message（均为必填，且每个字段需 <label for> + 唯一 id；校验失败设置 aria-invalid="true"，错误提示容器建议 role="alert"）。`;
+  const injectionLeadKey = `    ${markerLeadKey}nebula_leads（localStorage 数组），展示容器：#leads-list。`;
+  const injectionAssets = `    ${markerAssets}运行前提：Node >= 18，命令默认在仓库根目录执行。每个 HTML 页面 head 引入 css/style.css；body 末尾按顺序引入 js/data.js → js/i18n.js → js/partials.js → js/main.js（缺失或乱序视为不通过）。`;
+  const injectionSelectors = `    ${markerSelectors}#site-header #site-footer #site-nav #nav-toggle #lang-toggle .nav-list .nav-link <main id=\"page-content\"> #services-list #cases-list #news-list #careers-list #contact-form #contact-success #contact-error #leads-list #case-detail #case-title #case-content #case-back-link #news-detail #news-title #news-date #news-content #news-back-link .card .card-title .card-content .empty-state [data-id] [data-empty]。`;
+	  const injectionI18n = `    ${markerI18n}默认 <html lang="zh-CN">；header 提供 #lang-toggle；待翻译文案用 data-i18n-key 标记；localStorage key：nebula_lang（zh-CN/en-US）；词条最小集必须覆盖 nav.* 与 common.submit/common.learn_more/common.language；js/i18n.js 必须暴露 window.I18N（getText/applyI18n/initI18n/setLang/getCurrentLang），setLang/getCurrentLang 仅使用 zh-CN/en-US，并由 js/main.js 统一调用（禁止 window.applyI18n/window.initI18n 等未定义接口）。`;
+  const injectionRenderRules = `    ${markerRenderRules}列表渲染：每条卡片根节点为 <article class="card" data-id="...">，并包含 .card-title/.card-content；空数组时在列表容器内渲染 <p class="empty-state" data-empty="true">...</p>；详情页未命中 id 时渲染同样 empty-state。`;
+  const injectionNavRules = `    ${markerNavRules}基于 location.pathname 取文件名；把 / 与 /index.html 视为同一页面；忽略 query/hash；case-detail.html/news-detail.html 高亮对应列表页（cases.html/news.html）。`;
 
   const output = [];
   let inAssumptionsTask = false;
@@ -4469,8 +4626,14 @@ function ensureAssumptionsTaskDeclaresPageNamingInTasksAtomicMarkdown(markdown) 
       output.push(line);
       if (!text.includes(markerPages)) output.push(injectionPages);
       if (!text.includes(markerBrand)) output.push(injectionBrand);
+      if (!text.includes(markerDataSchema)) output.push(injectionDataSchema);
       if (!text.includes(markerContactFields)) output.push(injectionContactFields);
+      if (!text.includes(markerLeadKey)) output.push(injectionLeadKey);
+      if (!text.includes(markerAssets)) output.push(injectionAssets);
       if (!text.includes(markerSelectors)) output.push(injectionSelectors);
+      if (!text.includes(markerI18n)) output.push(injectionI18n);
+      if (!text.includes(markerRenderRules)) output.push(injectionRenderRules);
+      if (!text.includes(markerNavRules)) output.push(injectionNavRules);
       continue;
     }
 
@@ -4517,6 +4680,278 @@ function ensureContactFormSingleEntryInTasksAtomicMarkdown(markdown) {
   return output.join('\n').trimEnd();
 }
 
+function dedupeContactTasksInTasksAtomicMarkdown(markdown) {
+  const text = normalizeLineEndings(markdown || '');
+  if (!text.trim()) return text;
+
+  const lines = text.split('\n');
+  const originalHeaderRe = /^###\s*原始任务\s*(\d+)\s*:\s*(.+)$/;
+  const taskStartRe = /^- \[ \] \*\*Task\s+(\d+(?:\.\d+)?)\*\*[:：]\s*(.+)$/;
+
+  const contactOriginalIndices = new Set();
+  for (const line of lines) {
+    const match = originalHeaderRe.exec(line);
+    if (!match) continue;
+    const title = String(match[2] || '');
+    if (/(联系表单|线索存储|联系咨询)/.test(title)) {
+      contactOriginalIndices.add(String(match[1]));
+    }
+  }
+  if (!contactOriginalIndices.size) return text;
+
+  const isContactRelated = (value) =>
+    /(contact\.html|nebula_leads|#contact-|联系表单|线索|leads-list|aria-invalid)/i.test(
+      String(value || ''),
+    );
+
+  const output = [];
+  let currentOriginalIndex = null;
+
+  let collecting = false;
+  let blockLines = [];
+  let blockTitle = '';
+
+  const flush = () => {
+    if (!collecting) return;
+    const token = extractAtomicTaskTitlePathToken(blockTitle);
+    const normalized = token ? normalizePathForPolicy(token) : '';
+    const blockText = blockLines.join('\n');
+
+    let keep = true;
+    if (
+      currentOriginalIndex &&
+      !contactOriginalIndices.has(String(currentOriginalIndex)) &&
+      (normalized === 'contact.html' || normalized === 'js/main.js') &&
+      isContactRelated(blockText)
+    ) {
+      keep = false;
+    }
+
+    if (keep) output.push(...blockLines);
+    collecting = false;
+    blockLines = [];
+    blockTitle = '';
+  };
+
+  for (const line of lines) {
+    const headerMatch = originalHeaderRe.exec(line);
+    if (headerMatch) {
+      flush();
+      currentOriginalIndex = headerMatch[1];
+      output.push(line);
+      continue;
+    }
+
+    const taskMatch = taskStartRe.exec(line);
+    if (taskMatch) {
+      flush();
+      collecting = true;
+      blockTitle = taskMatch[2] || '';
+      blockLines = [line];
+      continue;
+    }
+
+    if (collecting) {
+      blockLines.push(line);
+      continue;
+    }
+    output.push(line);
+  }
+
+  flush();
+  return output.join('\n').trimEnd();
+}
+
+function dedupeContactFormLogicTasksInTasksAtomicMarkdown(markdown) {
+  const text = normalizeLineEndings(markdown || '');
+  if (!text.trim()) return text;
+
+  const lines = text.split('\n');
+  const originalHeaderRe = /^###\s*原始任务\s*(\d+)\s*:\s*(.+)$/;
+  const taskStartRe = /^- \[ \] \*\*Task\s+(\d+(?:\.\d+)?)\*\*[:：]\s*(.+)$/;
+
+  const contactOriginalIndices = new Set();
+  for (const line of lines) {
+    const match = originalHeaderRe.exec(line);
+    if (!match) continue;
+    const title = String(match[2] || '');
+    if (/(联系表单|线索存储|联系咨询)/.test(title)) {
+      contactOriginalIndices.add(String(match[1]));
+    }
+  }
+  if (!contactOriginalIndices.size) return text;
+
+  const helperRe =
+    /\b(buildLeadPayload|validateLeadPayload|saveLeadToStorage|LEADS_STORAGE_KEY|validateContactForm|renderContactErrors|CONTACT_FIELDS|CONTACT_SELECTORS)\b/i;
+  const submitRe =
+    /\b(submit|preventDefault|addEventListener\(\s*['"]submit['"])\b|#contact-(?:success|error)|aria-invalid/i;
+  const leadsRenderRe = /(leads-list|renderLeads|渲染线索|展示线索)/i;
+
+  const output = [];
+  let currentOriginalIndex = null;
+  let keptHelper = false;
+  let keptSubmit = false;
+
+  let collecting = false;
+  let blockLines = [];
+  let blockTitle = '';
+
+  const flush = () => {
+    if (!collecting) return;
+
+    const token = extractAtomicTaskTitlePathToken(blockTitle);
+    const normalized = token ? normalizePathForPolicy(token) : '';
+    const blockText = blockLines.join('\n');
+
+    let keep = true;
+
+    const isContactSection =
+      currentOriginalIndex && contactOriginalIndices.has(String(currentOriginalIndex));
+    const isMainJs = normalized === 'js/main.js';
+
+    if (isContactSection && isMainJs) {
+      const wantsHelper = helperRe.test(blockText);
+      const wantsSubmit = submitRe.test(blockText);
+      const isLeadsRender = leadsRenderRe.test(blockText);
+
+      const keepForHelper = wantsHelper && !keptHelper;
+      const keepForSubmit = wantsSubmit && !keptSubmit;
+
+      if (wantsHelper && !keptHelper) keptHelper = true;
+      if (wantsSubmit && !keptSubmit) keptSubmit = true;
+
+      if ((wantsHelper || wantsSubmit) && !keepForHelper && !keepForSubmit && !isLeadsRender) {
+        keep = false;
+      }
+    }
+
+    if (keep) output.push(...blockLines);
+    collecting = false;
+    blockLines = [];
+    blockTitle = '';
+  };
+
+  for (const line of lines) {
+    const headerMatch = originalHeaderRe.exec(line);
+    if (headerMatch) {
+      flush();
+      currentOriginalIndex = headerMatch[1];
+      keptHelper = false;
+      keptSubmit = false;
+      output.push(line);
+      continue;
+    }
+
+    const taskMatch = taskStartRe.exec(line);
+    if (taskMatch) {
+      flush();
+      collecting = true;
+      blockTitle = taskMatch[2] || '';
+      blockLines = [line];
+      continue;
+    }
+
+    if (collecting) {
+      blockLines.push(line);
+      continue;
+    }
+
+    output.push(line);
+  }
+
+  flush();
+  return output.join('\n').trimEnd();
+}
+
+function compressStyleTokensTasksInTasksAtomicMarkdown(markdown) {
+  const text = normalizeLineEndings(markdown || '');
+  if (!text.trim()) return text;
+
+  const lines = text.split('\n');
+  const originalHeaderRe = /^###\s*原始任务\s*(\d+)\s*:\s*(.+)$/;
+  const taskStartRe = /^- \[ \] \*\*Task\s+(\d+(?:\.\d+)?)\*\*[:：]\s*(.+)$/;
+
+  const output = [];
+  let inStyleSection = false;
+  let keptRootTokens = false;
+
+  let collecting = false;
+  let blockLines = [];
+  let blockTitle = '';
+
+  const flush = () => {
+    if (!collecting) return;
+
+    const token = extractAtomicTaskTitlePathToken(blockTitle);
+    const normalized = token ? normalizePathForPolicy(token) : '';
+    const blockText = blockLines.join('\n');
+
+    let keep = true;
+    if (inStyleSection && normalized === 'css/style.css') {
+      const looksLikeRootTokens =
+        /:root/.test(blockText) &&
+        /--color-|--font-|--text-|--space-|--radius-|--shadow-|--bp-/.test(blockText) &&
+        /变量/.test(blockText);
+
+      if (looksLikeRootTokens) {
+        if (keptRootTokens) {
+          keep = false;
+        } else {
+          keptRootTokens = true;
+          blockLines = blockLines.map((line) => {
+            if (/^  - \*\*核心逻辑\*\*:/.test(line)) {
+              return '  - **核心逻辑**: 在 css/style.css 一次性补齐 :root 设计 tokens（配色/字体/字号/间距/圆角/阴影/断点）变量，后续样式只引用这些变量。';
+            }
+            if (/^  - \*\*技术细节\*\*:/.test(line)) {
+              return '  - **技术细节**: 创建/更新 :root，至少包含：--color-primary/--color-bg/--color-text/--color-border；--font-sans；--text-md；--space-md；--radius-md；--shadow-md；--bp-md。禁止把 tokens 拆成多条任务。';
+            }
+            if (/^  - \*\*验收准则 \(AC\)\*\*:/.test(line)) {
+              return "  - **验收准则 (AC)**: node -e \"const c=require('fs').readFileSync('css/style.css','utf8');const must=[':root','--color-primary','--font-sans','--text-md','--space-md','--radius-md','--shadow-md','--bp-md'];if(!must.every(s=>c.includes(s)))process.exit(1);console.log('ok')\" 输出 ok";
+            }
+            return line;
+          });
+        }
+      }
+    }
+
+    if (keep) output.push(...blockLines);
+    collecting = false;
+    blockLines = [];
+    blockTitle = '';
+  };
+
+  for (const line of lines) {
+    const headerMatch = originalHeaderRe.exec(line);
+    if (headerMatch) {
+      flush();
+      const title = String(headerMatch[2] || '');
+      inStyleSection = /css\/style\.css/i.test(title) && /(样式|布局|排版|响应式)/.test(title);
+      keptRootTokens = false;
+      output.push(line);
+      continue;
+    }
+
+    const taskMatch = taskStartRe.exec(line);
+    if (taskMatch) {
+      flush();
+      collecting = true;
+      blockTitle = taskMatch[2] || '';
+      blockLines = [line];
+      continue;
+    }
+
+    if (collecting) {
+      blockLines.push(line);
+      continue;
+    }
+
+    output.push(line);
+  }
+
+  flush();
+  return output.join('\n').trimEnd();
+}
+
 function ensureVerifyScriptCoversAllHtmlPagesInTasksAtomicMarkdown(markdown) {
   const text = normalizeLineEndings(markdown || '');
   if (!text.trim()) return text;
@@ -4550,7 +4985,26 @@ function ensureVerifyScriptCoversAllHtmlPagesInTasksAtomicMarkdown(markdown) {
   if (!hasVerifyTask) return text;
   if (htmlPages.length <= 1) return text;
 
-  const pageListText = htmlPages.join('、');
+  const websiteCanonicalPages = [
+    'index.html',
+    'about.html',
+    'services.html',
+    'cases.html',
+    'case-detail.html',
+    'news.html',
+    'news-detail.html',
+    'careers.html',
+    'contact.html',
+  ];
+  const isWebsite = websiteCanonicalPages.some((p) => text.includes(p));
+  const resolvedPages = (() => {
+    if (!isWebsite) return htmlPages;
+    const derived = new Set(htmlPages.map((p) => p.toLowerCase()));
+    const missing = websiteCanonicalPages.filter((p) => !derived.has(p.toLowerCase()));
+    return missing.length ? websiteCanonicalPages : htmlPages;
+  })();
+
+  const pageListText = resolvedPages.join('、');
 
   const output = [];
   let inVerifyTask = false;
@@ -4578,17 +5032,31 @@ function ensureVerifyScriptCoversAllHtmlPagesInTasksAtomicMarkdown(markdown) {
         output.some((x) => x.includes('关键约定（静态字符串检查即可）：'));
       if (!hasKeyDomHint) {
         output.push(
-          "    关键约定（静态字符串检查即可）：每个页面必须包含 id=\"site-header\"、id=\"site-footer\"，并包含 <main ...> 主内容容器（id 以骨架任务约定为准）；js/partials.js 必须包含 id=\"site-nav\"、id=\"nav-toggle\" 与 '.nav-link'。",
+          "    关键约定（静态字符串检查即可）：每个页面必须包含 id=\"site-header\"、id=\"site-footer\"、<main id=\"page-content\">；并在 head 引入 css/style.css，body 末尾按顺序引入 js/data.js → js/i18n.js → js/partials.js → js/main.js；列表页：services.html 必须包含 #services-list，cases.html #cases-list，news.html #news-list，careers.html #careers-list；详情页：case-detail.html 必须包含 #case-detail/#case-title/#case-content/#case-back-link，news-detail.html 必须包含 #news-detail/#news-title/#news-date/#news-content/#news-back-link；联系页：contact.html 必须包含 #contact-form/#contact-success/#contact-error/#leads-list；js/partials.js 必须包含 id=\"site-nav\"、id=\"nav-toggle\"、'#lang-toggle'、'.nav-list' 与 '.nav-link'。",
+        );
+      }
+      const hasCheckCategoryHint =
+        text.includes('校验分类：') || output.some((x) => x.includes('校验分类：'));
+      if (!hasCheckCategoryHint) {
+        output.push(
+          '    校验分类：STATIC=字符串存在性（资源引入/partials 关键字）；STRUCT=HTML 结构容器；DATA=数据字段最小集；输出日志需标注类别，避免歧义。',
+        );
+      }
+      const hasAssetOrderExampleHint =
+        text.includes('资源引入顺序校验示例：') || output.some((x) => x.includes('资源引入顺序校验示例：'));
+      if (!hasAssetOrderExampleHint) {
+        output.push(
+          "    资源引入顺序校验示例：对每页 HTML 使用 indexOf 比较 `js/data.js` < `js/i18n.js` < `js/partials.js` < `js/main.js`，任一乱序则报错。",
         );
       }
       const hasMixedContentHint =
         text.includes('混合内容检查：') || output.some((x) => x.includes('混合内容检查：'));
-      if (!hasMixedContentHint) {
-        output.push(
-          '    混合内容检查：必须在 scripts/verify.js 中静态检查所有 HTML 页面不包含 `http://`（应使用 https://），以避免混合内容。',
-        );
-      }
-      continue;
+       if (!hasMixedContentHint) {
+         output.push(
+          '    混合内容检查：仅对 <script src>/<link href>/<img src> 做字符串检查：禁止出现 `http://`（允许 `http://localhost`）；示例规则：/\\bhttp:\\/\\/(?!localhost)/；不检查普通 <a href>。',
+         );
+       }
+        continue;
     }
 
     output.push(line);
@@ -4697,6 +5165,7 @@ function normalizeTasksAtomicTextConsistency(markdown) {
   if (!text.trim()) return text;
 
   let next = text;
+  next = next.replace(/\bpage-main\b/g, 'page-content');
   next = next.replace(
     /路径或\s*body\s*\[data-page\]/g,
     'location.pathname（含 / 与 /index.html 作为首页）',
@@ -4704,9 +5173,83 @@ function normalizeTasksAtomicTextConsistency(markdown) {
   next = next.replace(/路径或\s*data-page/g, 'location.pathname（含 / 与 /index.html 作为首页）');
   next = next.replace(/\bcase-list\.html\b/gi, 'cases.html');
   next = next.replace(/\bnews-list\.html\b/gi, 'news.html');
-  next = next.replace(/\bheroImage\b/g, 'cover');
+  next = next.replace(/\bjobs\.html\b/gi, 'careers.html');
+  next = next.replace(/\bcss\/styles\.css\b/gi, 'css/style.css');
+  next = next.replace(/css\\\/styles\\\.css/gi, 'css\\/style\\.css');
+  next = next.replace(/#case-list\b/g, '#cases-list');
+  next = next.replace(/\blist-grid\b/g, 'grid');
+  next = next.replace(/\bcard-grid\b/g, 'grid');
+  next = next.replace(/\.nav\s+\.active\b/g, '#site-nav .nav-link.active');
+  next = next.replace(/\.nav\s+a\b/g, '#site-nav .nav-link');
+  next = next.replace(/\.nav(?!-(?:link|list))\b/g, '#site-nav');
+  next = next.replace(/id\/title\/summary\/detail\b/g, 'id/title/content');
+  next = next.replace(/id\/title\/summary\/content\b/g, 'id/title/content');
+  next = next.replace(/services\([^)]*summary[^)]*\)/gi, 'services(id,title,content)');
+  next = next.replace(/cases\([^)]*(?:summary|industry|location|type)[^)]*\)/gi, 'cases(id,title,content)');
+  next = next.replace(/careers\([^)]*(?:summary|location|type)[^)]*\)/gi, 'careers(id,title,content)');
+  next = next.replace(/news\([^)]*summary[^)]*\)/gi, 'news(id,title,date,content)');
+  next = next.replace(
+    /leads\(\s*name\s*,\s*company\s*,\s*email\s*,\s*phone\s*,\s*message\s*,\s*createdAt\s*\)/gi,
+    'leads(id,createdAt,name,company,email,phone,message)',
+  );
+  next = next.replace(
+    /\['id','title','summary','detail'\]/g,
+    "['id','title','content']",
+  );
+  next = next.replace(
+    /\['id','title','summary','content'\]/g,
+    "['id','title','content']",
+  );
+  next = next.replace(
+    /\[\"id\",\"title\",\"summary\",\"detail\"\]/g,
+    '["id","title","content"]',
+  );
+  next = next.replace(
+    /\[\"id\",\"title\",\"summary\",\"content\"\]/g,
+    '["id","title","content"]',
+  );
+  next = next.replace(
+    /禁止使用\s+cases\.html\/news\.html\/products\.html\/product-detail\.html\s+等未在清单中的文件名/gi,
+    '禁止使用 case-list.html/news-list.html/products.html/product-detail.html 等未在清单中的文件名',
+  );
   next = next.replace(/\bcaseId\b/g, 'id');
   next = next.replace(/\bnewsId\b/g, 'id');
+  next = next.replace(/\bpositions-list\b/g, 'careers-list');
+  next = next.replace(/\bform-success\b/g, 'contact-success');
+  next = next.replace(/\blead-list\b/g, 'leads-list');
+  next = next.replace(/\blocalStorage\.leads\b/g, 'localStorage key nebula_leads');
+  next = next.replace(/\bsite_lang\b/g, 'nebula_lang');
+  next = next.replace(/\bwindow\.applyI18n\b/g, 'window.I18N.applyI18n');
+  next = next.replace(/\bwindow\.initI18n\b/g, 'window.I18N.initI18n');
+  next = next.replace(/\bwindow\.I18N\.apply\b/g, 'window.I18N.applyI18n');
+  next = next.replace(/\bI18N\.apply\b/g, 'I18N.applyI18n');
+  next = next.replace(/\bwindow\.I18N\.applyI18n\?\.\s*\(/g, 'window.I18N.applyI18n(');
+  next = next.replace(/\bwindow\.I18N\.initI18n\?\.\s*\(/g, 'window.I18N.initI18n(');
+  next = next.replace(/\bwindow\.SiteList\.renderEmptyState\b/g, 'renderEmptyState');
+  next = next.replace(/\bSiteList\.renderEmptyState\b/g, 'renderEmptyState');
+  next = next.replace(
+    /使用可选链调用待确认的函数名[^。\n]*window\.I18N\.applyI18n\?\.\(\)\s*或\s*window\.I18N\.initI18n\?\.\(\)[^。\n]*。/g,
+    '调用 window.I18N.initI18n() 与 window.I18N.applyI18n()（函数名固定，不使用可选链）。',
+  );
+  next = next.replace(
+    /使用可选链调用待确认的函数名[^。\n]*window\.applyI18n\?\.\(\)\s*或\s*window\.initI18n\?\.\(\)[^。\n]*。/g,
+    '调用 window.I18N.initI18n() 与 window.I18N.applyI18n()（函数名固定，不使用可选链）。',
+  );
+  next = next.replace(/在 main\(\) 中校验导航 DOM 结构/g, '在 main() 中校验 js/partials.js 注入的导航结构');
+  next = next.replace(
+    /对每个页面校验[^。\n]*site-nav[^。\n]*nav-toggle[^。\n]*nav-list[^。\n]*nav-link[^。\n]*。/g,
+    '读取 js/partials.js 文本并校验包含 #site-nav/#nav-toggle/.nav-list/.nav-link/#lang-toggle（导航为 JS 注入，禁止对 HTML 做静态硬校验）。',
+  );
+  next = next.replace(
+    /当任一页面缺少导航结构时输出包含页面名与缺失项的错误并以非 0 退出；结构完整时以 0 退出/g,
+    '当 js/partials.js 缺少导航关键字时输出包含缺失项的错误并以非 0 退出；存在时以 0 退出',
+  );
+  next = next.replace(/(getItem\s*\(\s*['"])leads(['"]\s*\))/g, '$1nebula_leads$2');
+  next = next.replace(/(setItem\s*\(\s*['"])leads(['"])/g, '$1nebula_leads$2');
+  next = next.replace(/\bwindow\.__SITE_DATA__\.jobs\b/g, 'window.__SITE_DATA__.careers');
+  next = next.replace(/\b__SITE_DATA__\.jobs\b/g, '__SITE_DATA__.careers');
+  next = next.replace(/(服务\s*\(services\)[^\n]*?)`name`/g, '$1`title`');
+  next = next.replace(/(招聘\s*\((?:careers|jobs)\)[^\n]*?)`requirements`/g, '$1`content`');
   return next.trimEnd();
 }
 
@@ -4966,26 +5509,36 @@ function validateAtomicTasks(tasks, pathPolicy = null) {
 }
 
 
-function coerceAtomicTasks(tasks) {
+function coerceAtomicTasks(tasks, pathPolicy = null) {
   const normalized = Array.isArray(tasks) ? tasks.map(normalizeTaskObject).filter(Boolean) : [];
   if (!normalized.length) return [];
 
-  const existsInRepo = (relPath) => {
-    const normalizedPath = String(relPath || '').replace(/\\/g, '/').trim();
+  const normalizedPolicy = normalizeAtomizePathPolicy(pathPolicy);
+  const isAllowedPath = (relPath) => {
+    const normalizedPath = normalizePathForPolicy(relPath);
     if (!normalizedPath) return false;
-    const abs = path.join(REPO_DIR, ...normalizedPath.split('/'));
-    return fs.existsSync(abs);
+    if (!normalizedPolicy) return true;
+    if (normalizedPolicy.exact.has(normalizedPath)) return true;
+    return normalizedPolicy.prefixes.some((prefix) => normalizedPath.startsWith(prefix));
   };
 
   const pickFallbackPath = (hintText) => {
     const text = String(hintText || '');
-    if (/(前端|UI|按钮|组件|React|dashboard|App\.tsx|tsx)/i.test(text)) {
-      return existsInRepo('dashboard/src/App.tsx') ? 'dashboard/src/App.tsx' : 'docs/assumptions.md';
+    const preferred = [];
+
+    preferred.push('docs/assumptions.md');
+
+    if (/(verify\.js|验收|校验|冒烟|脚本)/i.test(text)) preferred.unshift('scripts/verify.js');
+    if (/(i18n|语言|多语言|nebula_lang)/i.test(text)) preferred.unshift('js/i18n.js');
+    if (/(partials|header|footer|导航|nav)/i.test(text)) preferred.unshift('js/partials.js');
+    if (/(main\.js|交互|事件|初始化|切换|折叠)/i.test(text)) preferred.unshift('js/main.js');
+    if (/(data\.js|数据|字段|__SITE_DATA__)/i.test(text)) preferred.unshift('js/data.js');
+    if (/(css|样式|布局|响应式)/i.test(text)) preferred.unshift('css/style.css');
+
+    for (const candidate of preferred) {
+      if (isAllowedPath(candidate)) return candidate;
     }
-    if (/(assumptions|待确认点|不确定|缺失|文档|说明|readme)/i.test(text)) {
-      return 'docs/assumptions.md';
-    }
-    return existsInRepo('bridge/src/index.js') ? 'bridge/src/index.js' : 'docs/assumptions.md';
+    return 'docs/assumptions.md';
   };
 
   const pickAction = (rawTitle) => {
@@ -5012,7 +5565,9 @@ function coerceAtomicTasks(tasks) {
 
     const sanitizedTitle = sanitizeAtomicField(rawTitle, '').trim();
     const fromTitle = extractPathToken(sanitizedTitle);
-    const targetPath = fromTitle || pickFallbackPath(hintSource);
+    const targetPath =
+      (fromTitle && isAllowedPath(fromTitle) ? fromTitle : null) ||
+      pickFallbackPath(hintSource);
 
     const title = `${action} ${targetPath}${hint ? `｜${hint}` : ''}`.trim();
 
@@ -5077,8 +5632,20 @@ function buildFallbackAtomicTasks(summary) {
 }
 
 function shouldSplitFurther(tasks) {
-  const pattern = /(并且|以及|同时|随后|然后|步骤|流程)/;
-  return tasks.some((t) => pattern.test(`${t.title} ${t.core} ${t.details}`));
+  const connectivePattern = /(并且|以及|同时|随后|然后|步骤|流程)/;
+  const isTooLong = (value, limit) =>
+    String(value || '').replace(/\s+/g, ' ').trim().length > limit;
+  const countSeparators = (value) => {
+    const text = String(value || '');
+    return (text.match(/[；;]/g) || []).length + (text.match(/[、]/g) || []).length;
+  };
+  return tasks.some((t) => {
+    const merged = `${t.title} ${t.core} ${t.details}`;
+    if (connectivePattern.test(merged)) return true;
+    if (isTooLong(t.core, 220) || isTooLong(t.details, 320)) return true;
+    if (countSeparators(t.core) >= 6 || countSeparators(t.details) >= 10) return true;
+    return false;
+  });
 }
 
 async function generateTasksWithModel(design, prompt, options = {}) {
@@ -5396,7 +5963,7 @@ async function requestAtomicTasks(payload, designSnippet, timeoutMs, reason = ''
     }
   }
   if (!verdict.ok) {
-    const loose = coerceAtomicTasks(candidateTasks);
+    const loose = coerceAtomicTasks(candidateTasks, telemetry?.pathPolicy || null);
     if (loose.length) {
       const err = new Error('LLM tasks output invalid');
       err.partialTasks = loose;
@@ -5686,7 +6253,16 @@ async function runAtomizeJob(specName, job, options = {}) {
 
     if (!originalTasks.length) throw new Error('任务列表为空，无法原子化');
 
-    const designSnippet = truncateText(designMarkdown, 1200);
+    const conventionsSnippet = truncateText(
+      extractTasksGlobalConventionsSection(tasksMarkdown),
+      900,
+    );
+    const designSnippet = [
+      truncateText(designMarkdown, conventionsSnippet ? 900 : 1200),
+      conventionsSnippet,
+    ]
+      .filter(Boolean)
+      .join('\n\n');
 
     const iterationReason =
       typeof options?.iterationReason === 'string' && options.iterationReason.trim()
@@ -5732,7 +6308,7 @@ async function runAtomizeJob(specName, job, options = {}) {
     const batchSize = requestedBatchSize || defaultBatchSize || 3;
     job.batchSize = batchSize;
 
-    const maxRounds = Number(process.env.LLM_TASK_ATOMIZE_ROUNDS || 3);
+    const maxRounds = Number(process.env.LLM_TASK_ATOMIZE_ROUNDS || 4);
     const timeoutMs = Math.min(
       Math.max(8000, Number(process.env.LLM_TASK_ATOMIZE_TIMEOUT_MS || 120000)),
       240000,
@@ -5757,7 +6333,7 @@ async function runAtomizeJob(specName, job, options = {}) {
         recordAttempt: (attempt) =>
           appendFlowRunStageAttempt(specName, 'atomize', attempt, { reason: flowRunReason }),
       };
-      const atomized = canUseModel
+      let atomized = canUseModel
         ? await atomizeTaskSummarySafe(
             summaryForModel,
             designSnippet,
@@ -5768,6 +6344,9 @@ async function runAtomizeJob(specName, job, options = {}) {
             iterationReason,
           )
         : buildFallbackAtomicTasks(originalTitle);
+      if (!Array.isArray(atomized) || atomized.length === 0) {
+        atomized = buildFallbackAtomicTasks(originalTitle);
+      }
       const section = buildAtomicSection(index, originalTitle, atomized);
       fs.appendFileSync(atomicPath, `\n\n${section}\n`, 'utf8');
       doneIndices.add(index);
@@ -5807,8 +6386,11 @@ async function runAtomizeJob(specName, job, options = {}) {
 	          after = ensureVerifyScriptCoversAllHtmlPagesInTasksAtomicMarkdown(after);
 	          after = ensurePartialsTaskDeclaresNavDomConventions(after);
 	          after = normalizeTasksAtomicTextConsistency(after);
+	          after = compressStyleTokensTasksInTasksAtomicMarkdown(after);
 	          after = ensureAssumptionsTaskDeclaresPageNamingInTasksAtomicMarkdown(after);
 	          after = ensureContactFormSingleEntryInTasksAtomicMarkdown(after);
+	          after = dedupeContactFormLogicTasksInTasksAtomicMarkdown(after);
+	          after = dedupeContactTasksInTasksAtomicMarkdown(after);
 	          after = ensureAtomicTaskTitleVerbMatchesFileExistence(after);
 	          after = renumberTasksAtomicMarkdown(after);
 	          if (after && after !== before) {
