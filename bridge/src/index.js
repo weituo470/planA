@@ -1,5 +1,6 @@
 ﻿const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const http = require('http');
 const crypto = require('crypto');
 const express = require('express');
@@ -19,6 +20,7 @@ const EVENT_LOG = path.join(DATA_DIR, 'events.jsonl');
 const LLM_CONFIG_FILE = path.join(DATA_DIR, 'llm-config.json');
 const PROMPT_CONFIG_FILE = path.join(DATA_DIR, 'prompt-config.json');
 const PROMPT_PRESETS_FILE = path.join(DATA_DIR, 'prompt-presets.json');
+const WORKSPACE_CONFIG_FILE = path.join(DATA_DIR, 'workspace-config.json');
 const ROOT_DIR = path.resolve(__dirname, '..', '..', '..');
 const REPO_DIR = path.resolve(__dirname, '..', '..');
 const DOCS_DIR = path.join(REPO_DIR, 'docs');
@@ -26,9 +28,15 @@ const WATCH_DIRS =
   process.env.WORKFLOW_WATCH_DIRS || '.codex,task,workflow';
 const MAX_DIFF_CHARS = 8000;
 const SPEC_ROOT = path.join(ROOT_DIR, 'workflow', 'specs');
+const DEFAULT_TESTCLI_DIR = path.join(os.homedir(), 'testcli');
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(SPEC_ROOT, { recursive: true });
+try {
+  fs.mkdirSync(DEFAULT_TESTCLI_DIR, { recursive: true });
+} catch {
+  // ignore
+}
 
 const app = express();
 app.use(cors());
@@ -3978,6 +3986,101 @@ function parseAtomicDoneIndices(markdown) {
   return done;
 }
 
+function sanitizeAtomicTaskId(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (!/^\d+(?:\.\d+)+$/.test(trimmed)) return null;
+  return trimmed;
+}
+
+function parseTasksAtomicMarkdown(markdown) {
+  const text = normalizeLineEndings(markdown || '');
+  const lines = text.split('\n');
+
+  const results = [];
+  let currentOriginalIndex = null;
+  let currentOriginalTitle = '';
+  let currentTask = null;
+  let currentTaskLines = [];
+  let lastField = null;
+
+  const flushTask = () => {
+    if (!currentTask) return;
+    currentTask.block = currentTaskLines.join('\n').trimEnd();
+    results.push(currentTask);
+    currentTask = null;
+    currentTaskLines = [];
+    lastField = null;
+  };
+
+  for (const line of lines) {
+    const originalMatch = /^###\s*原始任务\s*(\d+)\s*:\s*(.*)\s*$/.exec(line);
+    if (originalMatch) {
+      flushTask();
+      currentOriginalIndex = Number.parseInt(originalMatch[1], 10);
+      currentOriginalTitle = String(originalMatch[2] || '').trim();
+      if (Number.isNaN(currentOriginalIndex)) currentOriginalIndex = null;
+      continue;
+    }
+
+    const taskMatch = /^- \[( |x|X)\]\s*\*\*Task\s+([^*]+?)\*\*:\s*(.*)\s*$/.exec(line);
+    if (taskMatch) {
+      flushTask();
+      const done = String(taskMatch[1] || '').toLowerCase() === 'x';
+      const id = String(taskMatch[2] || '').trim();
+      const title = String(taskMatch[3] || '').trim();
+      currentTask = {
+        id,
+        done,
+        title,
+        core: '',
+        details: '',
+        ac: '',
+        originalIndex: currentOriginalIndex,
+        originalTitle: currentOriginalTitle,
+        block: '',
+      };
+      currentTaskLines = [line];
+      lastField = null;
+      continue;
+    }
+
+    if (currentTask) {
+      currentTaskLines.push(line);
+
+      const fieldMatch = /^\s{2,}-\s*\*\*(核心逻辑|技术细节|验收准则(?:\s*\(AC\))?)\*\*:\s*(.*)\s*$/.exec(
+        line,
+      );
+      if (fieldMatch) {
+        const keyLabel = fieldMatch[1];
+        const value = String(fieldMatch[2] || '').trim();
+        if (keyLabel.includes('核心逻辑')) lastField = 'core';
+        else if (keyLabel.includes('技术细节')) lastField = 'details';
+        else lastField = 'ac';
+        currentTask[lastField] = value;
+        continue;
+      }
+
+      const trimmed = line.trim();
+      if (
+        lastField &&
+        trimmed &&
+        !/^###\s/.test(trimmed) &&
+        !/^- \[( |x|X)\]\s*\*\*Task\s+/i.test(trimmed) &&
+        !/^\s{0,}-\s*\*\*/.test(trimmed)
+      ) {
+        currentTask[lastField] = currentTask[lastField]
+          ? `${currentTask[lastField]}\n${trimmed}`
+          : trimmed;
+      }
+    }
+  }
+
+  flushTask();
+  return results;
+}
+
 function formatAtomicTaskBlock(indexLabel, task) {
   const normalized = normalizeTaskObject(task) || { title: '', core: '', details: '', ac: '' };
   let title =
@@ -5426,6 +5529,228 @@ function handleFileChange(eventType, absolutePath) {
 
 let ptyProcess = null;
 
+const terminalSessions = new Map();
+const TERMINAL_BUFFER_LIMIT = 120;
+
+const DEFAULT_WORKSPACE_CONFIG = { defaultCwd: null };
+
+function readWorkspaceConfig() {
+  if (!fs.existsSync(WORKSPACE_CONFIG_FILE)) {
+    return { ...DEFAULT_WORKSPACE_CONFIG };
+  }
+  try {
+    const raw = fs.readFileSync(WORKSPACE_CONFIG_FILE, 'utf8').replace(/^\uFEFF/, '');
+    const parsed = JSON.parse(raw);
+    return { ...DEFAULT_WORKSPACE_CONFIG, ...(parsed && typeof parsed === 'object' ? parsed : {}) };
+  } catch {
+    return { ...DEFAULT_WORKSPACE_CONFIG };
+  }
+}
+
+function writeWorkspaceConfig(next) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const defaultCwd =
+    typeof next?.defaultCwd === 'string'
+      ? next.defaultCwd
+      : next?.defaultCwd == null
+        ? null
+        : DEFAULT_WORKSPACE_CONFIG.defaultCwd;
+  fs.writeFileSync(
+    WORKSPACE_CONFIG_FILE,
+    JSON.stringify({ ...DEFAULT_WORKSPACE_CONFIG, defaultCwd }, null, 2),
+    'utf8',
+  );
+}
+
+function resolveExistingDirectory(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  try {
+    const resolved = path.resolve(trimmed);
+    const stat = fs.statSync(resolved);
+    if (!stat.isDirectory()) return null;
+    return resolved;
+  } catch {
+    return null;
+  }
+}
+
+function getDefaultWorkspaceCwd() {
+  const cfg = readWorkspaceConfig();
+  const candidates = [
+    resolveExistingDirectory(cfg?.defaultCwd),
+    resolveExistingDirectory(process.env.WORKFLOW_DEFAULT_CWD || ''),
+    resolveExistingDirectory(DEFAULT_TESTCLI_DIR),
+    resolveExistingDirectory(REPO_DIR),
+  ].filter(Boolean);
+  return candidates[0] || REPO_DIR;
+}
+
+function normalizeTerminalTitle(value) {
+  if (typeof value !== 'string') return 'Terminal';
+  const trimmed = value.trim();
+  if (!trimmed) return 'Terminal';
+  return trimmed.slice(0, 80);
+}
+
+function normalizeTerminalCommand(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (trimmed.length > 400) return null;
+  if (trimmed.includes('\0')) return null;
+  return trimmed;
+}
+
+function normalizeTerminalArgs(value) {
+  if (!Array.isArray(value)) return [];
+  const args = [];
+  for (const raw of value) {
+    if (typeof raw !== 'string') continue;
+    const trimmed = raw;
+    if (!trimmed) continue;
+    if (trimmed.length > 2000) continue;
+    if (trimmed.includes('\0')) continue;
+    args.push(trimmed);
+    if (args.length >= 60) break;
+  }
+  return args;
+}
+
+function normalizeTerminalCwd(value) {
+  if (typeof value !== 'string') return getDefaultWorkspaceCwd();
+  const trimmed = value.trim();
+  if (!trimmed) return getDefaultWorkspaceCwd();
+  try {
+    const resolved = path.resolve(trimmed);
+    const stat = fs.statSync(resolved);
+    if (stat.isDirectory()) return resolved;
+  } catch {
+    // ignore
+  }
+  return getDefaultWorkspaceCwd();
+}
+
+function normalizeTerminalSize(value, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  const int = Math.floor(n);
+  if (int <= 0) return fallback;
+  if (int > 600) return 600;
+  return int;
+}
+
+function listTerminalSessions() {
+  return Array.from(terminalSessions.values()).map((t) => ({
+    id: t.id,
+    title: t.title,
+    pid: t.pid,
+    command: t.command,
+    args: t.args,
+    cwd: t.cwd,
+    running: t.running,
+    createdAt: t.createdAt,
+    exitedAt: t.exitedAt,
+    exitCode: t.exitCode,
+  }));
+}
+
+function getTerminalSession(id) {
+  if (typeof id !== 'string' || !id.trim()) return null;
+  return terminalSessions.get(id) || null;
+}
+
+function createTerminalSession(options) {
+  const command = normalizeTerminalCommand(options?.command);
+  if (!command) {
+    const error = new Error('command is required');
+    error.status = 400;
+    throw error;
+  }
+
+  const id = nanoid();
+  const title = normalizeTerminalTitle(options?.title);
+  const args = normalizeTerminalArgs(options?.args);
+  const cwd = normalizeTerminalCwd(options?.cwd);
+  const cols = normalizeTerminalSize(options?.cols, 120);
+  const rows = normalizeTerminalSize(options?.rows, 30);
+
+  const proc = pty.spawn(command, args, {
+    name: 'xterm-256color',
+    cols,
+    rows,
+    cwd,
+    env: process.env,
+  });
+
+  const session = {
+    id,
+    title,
+    command,
+    args,
+    cwd,
+    pid: proc.pid,
+    running: true,
+    createdAt: new Date().toISOString(),
+    exitedAt: null,
+    exitCode: null,
+    seq: 0,
+    buffer: [],
+    proc,
+  };
+
+  terminalSessions.set(id, session);
+
+  proc.onData((data) => {
+    const item = { seq: (session.seq += 1), data };
+    session.buffer.push(item);
+    if (session.buffer.length > TERMINAL_BUFFER_LIMIT) {
+      session.buffer.splice(0, session.buffer.length - TERMINAL_BUFFER_LIMIT);
+    }
+    io.emit('terminal:data', { terminalId: id, seq: item.seq, data });
+  });
+
+  proc.onExit(({ exitCode }) => {
+    session.running = false;
+    session.exitedAt = new Date().toISOString();
+    session.exitCode = typeof exitCode === 'number' ? exitCode : null;
+    io.emit('terminal:exit', {
+      terminalId: id,
+      exitCode: session.exitCode ?? -1,
+    });
+  });
+
+  return session;
+}
+
+function writeTerminalInput(session, input) {
+  if (!session?.proc || !session.running) return;
+  if (typeof input !== 'string' || !input) return;
+  session.proc.write(input);
+}
+
+function resizeTerminal(session, cols, rows) {
+  if (!session?.proc || !session.running) return;
+  const nextCols = normalizeTerminalSize(cols, null);
+  const nextRows = normalizeTerminalSize(rows, null);
+  if (!nextCols || !nextRows) return;
+  try {
+    session.proc.resize(nextCols, nextRows);
+  } catch {
+    // ignore resize errors
+  }
+}
+
+function killTerminal(session) {
+  if (!session?.proc) return;
+  try {
+    session.proc.kill();
+  } catch {
+    // ignore
+  }
+}
+
 function pauseProcessIfNeeded() {
   if (!ptyProcess || isPaused) {
     return;
@@ -5484,7 +5809,7 @@ function resumeProcessIfNeeded() {
   }
 }
 
-function startPty(command, args) {
+function startPty(command, args, options = {}) {
   if (ptyProcess) {
     ptyProcess.kill();
     ptyProcess = null;
@@ -5493,12 +5818,15 @@ function startPty(command, args) {
   const shell = process.env.SHELL || 'powershell.exe';
   const resolvedCommand = command || shell;
   const resolvedArgs = args && args.length ? args : [];
+  const requestedCwd = typeof options?.cwd === 'string' ? options.cwd : '';
+  const fallbackCwd = getDefaultWorkspaceCwd();
+  const spawnCwd = resolveExistingDirectory(requestedCwd) || fallbackCwd;
 
   ptyProcess = pty.spawn(resolvedCommand, resolvedArgs, {
     name: 'xterm-color',
     cols: 120,
     rows: 30,
-    cwd: process.cwd(),
+    cwd: spawnCwd,
     env: process.env,
   });
 
@@ -5523,6 +5851,386 @@ function startPty(command, args) {
 
 app.get('/health', (req, res) => {
   res.json({ ok: true });
+});
+
+app.get('/workspace', (req, res) => {
+  const cfg = readWorkspaceConfig();
+  res.json({
+    defaultCwd: typeof cfg?.defaultCwd === 'string' ? cfg.defaultCwd : null,
+    effectiveCwd: getDefaultWorkspaceCwd(),
+    repoDir: REPO_DIR,
+  });
+});
+
+app.post('/workspace', (req, res) => {
+  const raw = req.body?.defaultCwd;
+  if (raw == null || (typeof raw === 'string' && !raw.trim())) {
+    writeWorkspaceConfig({ defaultCwd: null });
+    return res.json({
+      ok: true,
+      defaultCwd: null,
+      effectiveCwd: getDefaultWorkspaceCwd(),
+    });
+  }
+  if (typeof raw !== 'string') {
+    return res.status(400).json({ error: 'defaultCwd must be a string or null' });
+  }
+  const resolved = resolveExistingDirectory(raw);
+  if (!resolved) {
+    return res.status(400).json({ error: 'Directory not found' });
+  }
+  writeWorkspaceConfig({ defaultCwd: resolved });
+  return res.json({
+    ok: true,
+    defaultCwd: resolved,
+    effectiveCwd: getDefaultWorkspaceCwd(),
+  });
+});
+
+function listWindowsDriveRoots() {
+  const roots = [];
+  for (let code = 65; code <= 90; code += 1) {
+    const letter = String.fromCharCode(code);
+    const root = `${letter}:\\\\`;
+    try {
+      if (fs.existsSync(root)) roots.push(root);
+    } catch {
+      // ignore
+    }
+  }
+  return roots;
+}
+
+function listDirectoryDirs(dirPath) {
+  const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+  const dirs = [];
+  for (const entry of entries) {
+    if (!entry?.isDirectory?.()) continue;
+    const name = String(entry.name || '').trim();
+    if (!name) continue;
+    dirs.push(name);
+  }
+  dirs.sort((a, b) => a.localeCompare(b, 'zh-CN', { numeric: true, sensitivity: 'base' }));
+  return dirs;
+}
+
+function sanitizeFsEntryName(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (trimmed === '.' || trimmed === '..') return null;
+  if (trimmed.length > 120) return null;
+  if (/[<>:"/\\|?*\u0000-\u001F]/.test(trimmed)) return null;
+  return trimmed;
+}
+
+function isRootPath(value) {
+  try {
+    const resolved = path.resolve(value);
+    const root = path.parse(resolved).root;
+    return resolved === root;
+  } catch {
+    return false;
+  }
+}
+
+function resolveExistingPath(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  try {
+    const resolved = path.resolve(trimmed);
+    fs.lstatSync(resolved);
+    return resolved;
+  } catch {
+    return null;
+  }
+}
+
+function listDirectoryEntries(dirPath) {
+  const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+  const list = [];
+  for (const entry of entries) {
+    const name = String(entry?.name || '').trim();
+    if (!name) continue;
+    const fullPath = path.join(dirPath, name);
+    if (entry.isDirectory()) {
+      list.push({ name, path: fullPath, type: 'dir' });
+      continue;
+    }
+    if (entry.isFile()) {
+      list.push({ name, path: fullPath, type: 'file' });
+      continue;
+    }
+  }
+  list.sort((a, b) => {
+    if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
+    return a.name.localeCompare(b.name, 'zh-CN', { numeric: true, sensitivity: 'base' });
+  });
+  return list;
+}
+
+function normalizePathKey(value) {
+  return String(value || '').replace(/\//g, '\\').toLowerCase();
+}
+
+function isDescendantPath(parentPath, childPath) {
+  try {
+    const parent = path.resolve(parentPath);
+    const child = path.resolve(childPath);
+    const parentKey = normalizePathKey(parent).replace(/\\+$/, '') + '\\';
+    const childKey = normalizePathKey(child);
+    return childKey.startsWith(parentKey);
+  } catch {
+    return false;
+  }
+}
+
+app.get('/fs/dirs', (req, res) => {
+  const raw = typeof req.query?.path === 'string' ? req.query.path.trim() : '';
+  if (!raw) {
+    if (process.platform === 'win32') {
+      const roots = listWindowsDriveRoots();
+      return res.json({
+        path: null,
+        parent: null,
+        dirs: roots.map((p) => ({ name: p, path: p })),
+      });
+    }
+    const root = resolveExistingDirectory('/');
+    if (!root) return res.status(500).json({ error: 'Root directory not found' });
+    return res.json({
+      path: root,
+      parent: null,
+      dirs: listDirectoryDirs(root).map((name) => ({ name, path: path.join(root, name) })),
+    });
+  }
+
+  const current = resolveExistingDirectory(raw);
+  if (!current) {
+    return res.status(400).json({ error: 'Directory not found' });
+  }
+
+  const parentPath = path.dirname(current);
+  const hasParent = Boolean(parentPath && parentPath !== current);
+  return res.json({
+    path: current,
+    parent: hasParent ? parentPath : null,
+    dirs: listDirectoryDirs(current).map((name) => ({ name, path: path.join(current, name) })),
+  });
+});
+
+app.get('/fs/list', (req, res) => {
+  const raw = typeof req.query?.path === 'string' ? req.query.path.trim() : '';
+  if (!raw) {
+    if (process.platform === 'win32') {
+      const roots = listWindowsDriveRoots();
+      return res.json({
+        path: null,
+        parent: null,
+        entries: roots.map((p) => ({ name: p, path: p, type: 'dir' })),
+      });
+    }
+    const root = resolveExistingDirectory('/');
+    if (!root) return res.status(500).json({ error: 'Root directory not found' });
+    return res.json({
+      path: root,
+      parent: null,
+      entries: listDirectoryEntries(root),
+    });
+  }
+
+  const current = resolveExistingDirectory(raw);
+  if (!current) {
+    return res.status(400).json({ error: 'Directory not found' });
+  }
+  const parentPath = path.dirname(current);
+  const hasParent = Boolean(parentPath && parentPath !== current);
+  return res.json({
+    path: current,
+    parent: hasParent ? parentPath : null,
+    entries: listDirectoryEntries(current),
+  });
+});
+
+app.post('/fs/mkdir', (req, res) => {
+  const parent = resolveExistingDirectory(req.body?.parent);
+  if (!parent) return res.status(400).json({ error: 'parent is required' });
+  const name = sanitizeFsEntryName(req.body?.name);
+  if (!name) return res.status(400).json({ error: 'Invalid folder name' });
+  const target = path.join(parent, name);
+  try {
+    if (fs.existsSync(target)) {
+      return res.status(409).json({ error: 'Already exists' });
+    }
+    fs.mkdirSync(target, { recursive: false });
+    return res.json({ ok: true, path: target });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || 'Failed to create directory' });
+  }
+});
+
+app.post('/fs/touch', (req, res) => {
+  const parent = resolveExistingDirectory(req.body?.parent);
+  if (!parent) return res.status(400).json({ error: 'parent is required' });
+  const name = sanitizeFsEntryName(req.body?.name);
+  if (!name) return res.status(400).json({ error: 'Invalid file name' });
+  const target = path.join(parent, name);
+  try {
+    if (fs.existsSync(target)) {
+      return res.status(409).json({ error: 'Already exists' });
+    }
+    fs.writeFileSync(target, '', 'utf8');
+    return res.json({ ok: true, path: target });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || 'Failed to create file' });
+  }
+});
+
+app.post('/fs/paste', (req, res) => {
+  const src = resolveExistingPath(req.body?.srcPath);
+  if (!src) return res.status(400).json({ error: 'srcPath not found' });
+  const destDir = resolveExistingDirectory(req.body?.destDir);
+  if (!destDir) return res.status(400).json({ error: 'destDir not found' });
+  const modeRaw = typeof req.body?.mode === 'string' ? req.body.mode.trim() : '';
+  const mode = modeRaw === 'cut' ? 'cut' : 'copy';
+
+  const base = path.basename(src);
+  const dest = path.join(destDir, base);
+  if (fs.existsSync(dest)) {
+    return res.status(409).json({ error: 'Destination already exists' });
+  }
+  if (isDescendantPath(src, destDir)) {
+    return res.status(400).json({ error: 'Refuse to paste into its own subdirectory' });
+  }
+
+  try {
+    const stat = fs.lstatSync(src);
+    if (mode === 'cut') {
+      try {
+        fs.renameSync(src, dest);
+        return res.json({ ok: true, path: dest, mode });
+      } catch (error) {
+        // cross-device move: fallback to copy+delete
+        if (!stat.isDirectory()) {
+          fs.copyFileSync(src, dest);
+          fs.rmSync(src, { force: true });
+          return res.json({ ok: true, path: dest, mode });
+        }
+        fs.cpSync(src, dest, { recursive: true, errorOnExist: true });
+        fs.rmSync(src, { recursive: true, force: true });
+        return res.json({ ok: true, path: dest, mode });
+      }
+    }
+
+    if (!stat.isDirectory()) {
+      fs.copyFileSync(src, dest);
+      return res.json({ ok: true, path: dest, mode });
+    }
+    fs.cpSync(src, dest, { recursive: true, errorOnExist: true });
+    return res.json({ ok: true, path: dest, mode });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || 'Failed to paste' });
+  }
+});
+
+app.post('/fs/rename', (req, res) => {
+  const existing = resolveExistingPath(req.body?.path);
+  if (!existing) return res.status(400).json({ error: 'path not found' });
+  const newName = sanitizeFsEntryName(req.body?.newName);
+  if (!newName) return res.status(400).json({ error: 'Invalid newName' });
+  const parent = path.dirname(existing);
+  const target = path.join(parent, newName);
+  try {
+    if (fs.existsSync(target)) {
+      return res.status(409).json({ error: 'Already exists' });
+    }
+    fs.renameSync(existing, target);
+    return res.json({ ok: true, path: target });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || 'Failed to rename' });
+  }
+});
+
+app.post('/fs/delete', (req, res) => {
+  const existing = resolveExistingPath(req.body?.path);
+  if (!existing) return res.status(400).json({ error: 'path not found' });
+  if (isRootPath(existing)) {
+    return res.status(400).json({ error: 'Refuse to delete root path' });
+  }
+  try {
+    fs.rmSync(existing, { recursive: true, force: true });
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || 'Failed to delete' });
+  }
+});
+
+app.get('/terminals', (req, res) => {
+  res.json({ terminals: listTerminalSessions() });
+});
+
+app.get('/terminals/:id/buffer', (req, res) => {
+  const session = getTerminalSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ error: 'Terminal not found' });
+  }
+  return res.json({
+    terminal: {
+      id: session.id,
+      title: session.title,
+      pid: session.pid,
+      running: session.running,
+      createdAt: session.createdAt,
+      exitedAt: session.exitedAt,
+      exitCode: session.exitCode,
+    },
+    buffer: session.buffer,
+  });
+});
+
+app.post('/terminals', (req, res) => {
+  if (state.status === 'Reviewing') {
+    return res.status(409).json({ error: 'Blocked by approval' });
+  }
+  try {
+    const session = createTerminalSession(req.body || {});
+    return res.json({
+      id: session.id,
+      pid: session.pid,
+      title: session.title,
+    });
+  } catch (error) {
+    return res.status(error?.status || 500).json({ error: error?.message || 'Failed to create terminal' });
+  }
+});
+
+app.post('/terminals/:id/input', (req, res) => {
+  const session = getTerminalSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ error: 'Terminal not found' });
+  }
+  writeTerminalInput(session, req.body?.input);
+  return res.json({ ok: true });
+});
+
+app.post('/terminals/:id/resize', (req, res) => {
+  const session = getTerminalSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ error: 'Terminal not found' });
+  }
+  resizeTerminal(session, req.body?.cols, req.body?.rows);
+  return res.json({ ok: true });
+});
+
+app.delete('/terminals/:id', (req, res) => {
+  const session = getTerminalSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ error: 'Terminal not found' });
+  }
+  killTerminal(session);
+  terminalSessions.delete(session.id);
+  return res.json({ ok: true });
 });
 
 app.get('/llm', (req, res) => {
@@ -6494,6 +7202,256 @@ app.post('/specs/:name/tasks/atomize', async (req, res) => {
   return res.json(getAtomizeStatus(job));
 });
 
+function normalizeCodexSandbox(value) {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  const allowed = new Set(['read-only', 'workspace-write', 'danger-full-access']);
+  if (allowed.has(raw)) return raw;
+  return 'workspace-write';
+}
+
+function normalizeCodexModel(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (trimmed.length > 100) return null;
+  return trimmed;
+}
+
+function buildCodexRunDoc(specName, atomicTask, options = {}) {
+  const runsDir = path.join(resolveSpecDir(specName), '.runlogs', 'codex-runs');
+  fs.mkdirSync(runsDir, { recursive: true });
+
+  const taskId = atomicTask?.id || 'unknown';
+  const safeTaskId = String(taskId).replace(/[^\d.]/g, '').replace(/\./g, '_') || 'unknown';
+  const stamp = new Date().toISOString().replace(/[:.]/g, '').replace('Z', 'Z');
+  const runDocPath = path.join(runsDir, `task-${safeTaskId}-${stamp}.md`);
+  const lastMessagePath = path.join(runsDir, `last-message-${safeTaskId}-${stamp}.md`);
+
+  const rel = (absPath) => normalizePathForPrompt(path.relative(REPO_DIR, absPath));
+  const artifacts = {
+    requirements: resolveSpecFile(specName, 'requirements'),
+    design: resolveSpecFile(specName, 'design'),
+    tasks: resolveSpecFile(specName, 'tasks'),
+    tasks_atomic: resolveSpecFile(specName, 'tasks_atomic'),
+  };
+
+  const lines = [];
+  lines.push(`# Codex 任务执行文档`);
+  lines.push('');
+  lines.push(`- Spec: ${specName}`);
+  lines.push(`- Task: ${taskId}`);
+  lines.push(`- StartedAt: ${new Date().toISOString()}`);
+  if (options.model) lines.push(`- Model: ${options.model}`);
+  if (options.sandbox) lines.push(`- Sandbox: ${options.sandbox}`);
+  lines.push('');
+  lines.push('## Spec 入口');
+  lines.push(`- requirements: \`${normalizePathForPrompt(artifacts.requirements)}\``);
+  lines.push(`- design: \`${normalizePathForPrompt(artifacts.design)}\``);
+  lines.push(`- tasks: \`${normalizePathForPrompt(artifacts.tasks)}\``);
+  lines.push(`- tasks_atomic: \`${normalizePathForPrompt(artifacts.tasks_atomic)}\``);
+  lines.push('');
+  lines.push('## 本次原子任务');
+  if (atomicTask?.block) {
+    lines.push('');
+    lines.push('```markdown');
+    lines.push(String(atomicTask.block).trimEnd());
+    lines.push('```');
+  } else {
+    lines.push('');
+    lines.push(`- title: ${atomicTask?.title || ''}`);
+    lines.push(`- 核心逻辑: ${atomicTask?.core || ''}`);
+    lines.push(`- 技术细节: ${atomicTask?.details || ''}`);
+    lines.push(`- 验收准则: ${atomicTask?.ac || ''}`);
+  }
+  lines.push('');
+  lines.push('## 执行要求');
+  lines.push('- 严格按“本次原子任务”的 title/core/details/ac 实现。');
+  lines.push('- 若需要新增/修改文件，遵循仓库既有风格与约束。');
+  lines.push('- 完成后运行 AC 中描述的验证步骤（若 AC 未给出命令，请补充最小可行验证）。');
+  lines.push('- 可选：将 tasks_atomic.md 中对应条目标记为 [x]，并在 tasks.md 回写关键变更摘要。');
+  lines.push('');
+
+  fs.writeFileSync(runDocPath, lines.join('\n'), 'utf8');
+  return {
+    runDocPath,
+    lastMessagePath,
+    runDocPathRel: rel(runDocPath),
+    lastMessagePathRel: rel(lastMessagePath),
+    artifacts,
+  };
+}
+
+app.post('/specs/:name/tasks_atomic/codex', (req, res) => {
+  const specName = sanitizeSpecName(req.params.name);
+  if (!specName) {
+    return res.status(400).json({ error: 'Invalid spec request' });
+  }
+  if (state.status === 'Reviewing') {
+    return res.status(409).json({ error: 'Blocked by approval' });
+  }
+
+  const taskId = sanitizeAtomicTaskId(req.body?.taskId ?? req.body?.id ?? req.query?.taskId);
+  if (!taskId) {
+    return res.status(400).json({ error: 'taskId is required (e.g. 1.2)' });
+  }
+
+  const atomicPath = resolveSpecFile(specName, 'tasks_atomic');
+  if (!fs.existsSync(atomicPath)) {
+    return res.status(404).json({ error: 'Spec file not found' });
+  }
+
+  const content = fs.readFileSync(atomicPath, 'utf8');
+  const atomicTasks = parseTasksAtomicMarkdown(content);
+  const hit = atomicTasks.find((t) => String(t?.id || '').trim() === taskId);
+  if (!hit) {
+    return res.status(404).json({ error: `Atomic task not found: ${taskId}` });
+  }
+
+  const sandbox = normalizeCodexSandbox(req.body?.sandbox ?? req.query?.sandbox);
+  const model = normalizeCodexModel(req.body?.model ?? req.query?.model);
+  const projectDir = normalizeTerminalCwd(
+    req.body?.cwd ??
+      req.body?.projectDir ??
+      (typeof req.query?.cwd === 'string' ? req.query.cwd : '') ??
+      (typeof req.query?.projectDir === 'string' ? req.query.projectDir : ''),
+  );
+
+  const doc = buildCodexRunDoc(specName, hit, { sandbox, model });
+  const runDocPathForPrompt = normalizePathForPrompt(doc.runDocPath);
+  const prompt = `请按任务文档（绝对路径）${runDocPathForPrompt} 实现该原子任务，完成后自检并用简短要点总结变更与验证结果。`;
+
+  const codexExecutable = (process.env.CODEX_COMMAND || 'codex').trim() || 'codex';
+  const codexArgs = ['-a', 'never', '-s', sandbox];
+  if (model) codexArgs.push('-m', model);
+  codexArgs.push(
+    '-C',
+    projectDir,
+    'exec',
+    '--add-dir',
+    SPEC_ROOT,
+    '--output-last-message',
+    doc.lastMessagePath,
+    prompt,
+  );
+
+  const spawnCommand = process.platform === 'win32' ? 'cmd.exe' : codexExecutable;
+  const spawnArgs = process.platform === 'win32'
+    ? ['/d', '/s', '/c', codexExecutable, ...codexArgs]
+    : codexArgs;
+
+  emitEvent('log:append', {
+    source: 'codex',
+    message: `[codex] start spec=${specName} task=${taskId} sandbox=${sandbox}${model ? ` model=${model}` : ''}`,
+  });
+
+  let pid;
+  try {
+    pid = startPty(spawnCommand, spawnArgs, { cwd: projectDir });
+  } catch (error) {
+    emitEvent('log:append', {
+      source: 'codex',
+      message: `[codex] spawn failed: ${error?.message || String(error)}`,
+    });
+    return res.status(500).json({ error: error?.message || 'Failed to start Codex' });
+  }
+  return res.json({
+    pid,
+    runDocPath: doc.runDocPathRel,
+    lastMessagePath: doc.lastMessagePathRel,
+    task: {
+      id: hit.id,
+      done: Boolean(hit.done),
+      title: hit.title,
+      core: hit.core,
+      details: hit.details,
+      ac: hit.ac,
+      originalIndex: hit.originalIndex,
+      originalTitle: hit.originalTitle,
+    },
+  });
+});
+
+app.post('/specs/:name/tasks_atomic/codex/terminal', (req, res) => {
+  const specName = sanitizeSpecName(req.params.name);
+  if (!specName) {
+    return res.status(400).json({ error: 'Invalid spec request' });
+  }
+  if (state.status === 'Reviewing') {
+    return res.status(409).json({ error: 'Blocked by approval' });
+  }
+
+  const taskId = sanitizeAtomicTaskId(req.body?.taskId ?? req.body?.id ?? req.query?.taskId);
+  if (!taskId) {
+    return res.status(400).json({ error: 'taskId is required (e.g. 1.2)' });
+  }
+
+  const atomicPath = resolveSpecFile(specName, 'tasks_atomic');
+  if (!fs.existsSync(atomicPath)) {
+    return res.status(404).json({ error: 'Spec file not found' });
+  }
+
+  const content = fs.readFileSync(atomicPath, 'utf8');
+  const atomicTasks = parseTasksAtomicMarkdown(content);
+  const hit = atomicTasks.find((t) => String(t?.id || '').trim() === taskId);
+  if (!hit) {
+    return res.status(404).json({ error: `Atomic task not found: ${taskId}` });
+  }
+
+  const sandbox = normalizeCodexSandbox(req.body?.sandbox ?? req.query?.sandbox);
+  const model = normalizeCodexModel(req.body?.model ?? req.query?.model);
+  const projectDir = normalizeTerminalCwd(
+    req.body?.cwd ??
+      req.body?.projectDir ??
+      (typeof req.query?.cwd === 'string' ? req.query.cwd : '') ??
+      (typeof req.query?.projectDir === 'string' ? req.query.projectDir : ''),
+  );
+
+  const doc = buildCodexRunDoc(specName, hit, { sandbox, model });
+  const runDocPathForPrompt = normalizePathForPrompt(doc.runDocPath);
+  const prompt = `请按任务文档（绝对路径）${runDocPathForPrompt} 实现该原子任务。需要进一步信息时，请在终端中直接向我提问。`;
+
+  const codexExecutable = (process.env.CODEX_COMMAND || 'codex').trim() || 'codex';
+  const codexArgs = ['-a', 'never', '-s', sandbox, '--add-dir', SPEC_ROOT];
+  if (model) codexArgs.push('-m', model);
+  codexArgs.push('-C', projectDir, prompt);
+
+  const spawnCommand = process.platform === 'win32' ? 'cmd.exe' : codexExecutable;
+  const spawnArgs = process.platform === 'win32'
+    ? ['/d', '/s', '/c', codexExecutable, ...codexArgs]
+    : codexArgs;
+
+  let session;
+  try {
+    session = createTerminalSession({
+      title: `Codex · ${specName} · Task ${taskId}`,
+      command: spawnCommand,
+      args: spawnArgs,
+      cwd: projectDir,
+      cols: req.body?.cols,
+      rows: req.body?.rows,
+    });
+  } catch (error) {
+    return res.status(error?.status || 500).json({ error: error?.message || 'Failed to start terminal' });
+  }
+
+  return res.json({
+    terminalId: session.id,
+    pid: session.pid,
+    title: session.title,
+    runDocPath: doc.runDocPathRel,
+    task: {
+      id: hit.id,
+      done: Boolean(hit.done),
+      title: hit.title,
+      core: hit.core,
+      details: hit.details,
+      ac: hit.ac,
+      originalIndex: hit.originalIndex,
+      originalTitle: hit.originalTitle,
+    },
+  });
+});
+
 app.post('/specs/:name/:artifact', (req, res) => {
   const specName = sanitizeSpecName(req.params.name);
   const artifact = req.params.artifact;
@@ -6533,7 +7491,7 @@ app.post('/cli/start', (req, res) => {
   if (state.status === 'Reviewing') {
     return res.status(409).json({ error: 'Blocked by approval' });
   }
-  const pid = startPty(command, args);
+  const pid = startPty(command, args, { cwd: req.body?.cwd });
   res.json({ pid });
 });
 
@@ -6553,6 +7511,7 @@ io.on('connection', (socket) => {
     approvals: Object.values(state.approvals),
     testReport: state.testReport,
     logs: state.logs,
+    terminals: listTerminalSessions(),
   });
 
   socket.on('approval:submit', (payload) => {
@@ -6590,6 +7549,25 @@ io.on('connection', (socket) => {
     if (ptyProcess && typeof payload?.input === 'string') {
       ptyProcess.write(payload.input);
     }
+  });
+
+  socket.on('terminal:input', (payload) => {
+    const session = getTerminalSession(payload?.terminalId);
+    if (!session) return;
+    if (typeof payload?.input !== 'string') return;
+    writeTerminalInput(session, payload.input);
+  });
+
+  socket.on('terminal:resize', (payload) => {
+    const session = getTerminalSession(payload?.terminalId);
+    if (!session) return;
+    resizeTerminal(session, payload?.cols, payload?.rows);
+  });
+
+  socket.on('terminal:kill', (payload) => {
+    const session = getTerminalSession(payload?.terminalId);
+    if (!session) return;
+    killTerminal(session);
   });
 });
 

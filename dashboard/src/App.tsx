@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import JSZip from 'jszip';
 
 import { Button } from './components/ui/button';
+import { ExplorerSidebar } from './ExplorerSidebar';
+import { TerminalPanel, type TerminalPanelHandle } from './TerminalPanel';
 import type {
   ClarificationQuestion,
   LlmInfo,
@@ -570,6 +572,121 @@ function artifactLabel(a: SpecArtifact) {
   return '任务';
 }
 
+type AtomicTaskFieldKey = 'core' | 'details' | 'ac';
+
+type AtomicTaskItem = {
+  id: string;
+  done: boolean;
+  title: string;
+  core: string;
+  details: string;
+  ac: string;
+  originalIndex: number | null;
+  originalTitle: string;
+};
+
+type AtomicTaskGroup = {
+  originalIndex: number | null;
+  originalTitle: string;
+  tasks: AtomicTaskItem[];
+};
+
+const ANSI_ESCAPE_RE =
+  // eslint-disable-next-line no-control-regex
+  /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[a-zA-Z\d]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-ntqry=><~]))/g;
+
+function stripAnsi(text: string) {
+  return String(text || '').replace(ANSI_ESCAPE_RE, '');
+}
+
+function parseTasksAtomicMarkdown(markdown: string): AtomicTaskGroup[] {
+  const text = String(markdown || '').replace(/\r\n/g, '\n');
+  const lines = text.split('\n');
+
+  const groups: AtomicTaskGroup[] = [];
+  let currentGroup: AtomicTaskGroup | null = null;
+  let currentTask: AtomicTaskItem | null = null;
+  let lastField: AtomicTaskFieldKey | null = null;
+
+  const ensureGroup = () => {
+    if (currentGroup) return currentGroup;
+    currentGroup = { originalIndex: null, originalTitle: '', tasks: [] };
+    groups.push(currentGroup);
+    return currentGroup;
+  };
+
+  const flushTask = () => {
+    if (!currentTask) return;
+    ensureGroup().tasks.push(currentTask);
+    currentTask = null;
+    lastField = null;
+  };
+
+  for (const line of lines) {
+    const originalMatch = /^###\s*原始任务\s*(\d+)\s*:\s*(.*)\s*$/.exec(line);
+    if (originalMatch) {
+      flushTask();
+      const parsedIndex = Number.parseInt(originalMatch[1], 10);
+      currentGroup = {
+        originalIndex: Number.isNaN(parsedIndex) ? null : parsedIndex,
+        originalTitle: String(originalMatch[2] || '').trim(),
+        tasks: [],
+      };
+      groups.push(currentGroup);
+      continue;
+    }
+
+    const taskMatch = /^- \[( |x|X)\]\s*\*\*Task\s+([^*]+?)\*\*:\s*(.*)\s*$/.exec(line);
+    if (taskMatch) {
+      flushTask();
+      const done = String(taskMatch[1] || '').toLowerCase() === 'x';
+      currentTask = {
+        id: String(taskMatch[2] || '').trim(),
+        done,
+        title: String(taskMatch[3] || '').trim(),
+        core: '',
+        details: '',
+        ac: '',
+        originalIndex: currentGroup?.originalIndex ?? null,
+        originalTitle: currentGroup?.originalTitle ?? '',
+      };
+      lastField = null;
+      continue;
+    }
+
+    if (!currentTask) continue;
+
+    const fieldMatch = /^\s{2,}-\s*\*\*(核心逻辑|技术细节|验收准则(?:\s*\(AC\))?)\*\*:\s*(.*)\s*$/.exec(
+      line,
+    );
+    if (fieldMatch) {
+      const label = fieldMatch[1];
+      const value = String(fieldMatch[2] || '').trim();
+      if (label.includes('核心逻辑')) lastField = 'core';
+      else if (label.includes('技术细节')) lastField = 'details';
+      else lastField = 'ac';
+      currentTask[lastField] = value;
+      continue;
+    }
+
+    const trimmed = line.trim();
+    if (
+      lastField &&
+      trimmed &&
+      !/^###\s/.test(trimmed) &&
+      !/^- \[( |x|X)\]\s*\*\*Task\s+/i.test(trimmed) &&
+      !/^\s{0,}-\s*\*\*/.test(trimmed)
+    ) {
+      currentTask[lastField] = currentTask[lastField]
+        ? `${currentTask[lastField]}\n${trimmed}`
+        : trimmed;
+    }
+  }
+
+  flushTask();
+  return groups.filter((g) => g.tasks.length > 0);
+}
+
 export default function App() {
   const [rawPrompt, setRawPrompt] = useState('');
   const [specs, setSpecs] = useState<SpecSummary[]>([]);
@@ -582,6 +699,8 @@ export default function App() {
   });
   const [taskView, setTaskView] = useState<TaskView>('tasks');
   const [tasksAtomicContent, setTasksAtomicContent] = useState('');
+  const [atomicDisplayMode, setAtomicDisplayMode] = useState<'list' | 'raw'>('list');
+  const [explorerOpen, setExplorerOpen] = useState(true);
   const [atomizeStatus, setAtomizeStatus] = useState<AtomizeStatus | null>(null);
   const [atomizeBatchSizeText, setAtomizeBatchSizeText] = useState('3');
   const [atomizeAutoContinue, setAtomizeAutoContinue] = useState(true);
@@ -1561,6 +1680,28 @@ export default function App() {
     }
   }, [atomizeBatchSizeText, selectedSpecName, showToast]);
 
+  const startCodexForAtomicTask = useCallback(
+    async (taskId: string) => {
+      if (!selectedSpecName) return;
+      const normalizedTaskId = String(taskId || '').trim();
+      if (!normalizedTaskId) return;
+      if (!window.confirm(`启动 Codex 执行 Task ${normalizedTaskId}？`)) return;
+
+      setToast(null);
+      try {
+        const result = await terminalPanelRef.current?.startCodexAtomicTask(
+          selectedSpecName,
+          normalizedTaskId,
+        );
+        if (!result) throw new Error('终端面板未就绪');
+        showToast(`Codex 已启动：${result.title}`, 'info');
+      } catch (e: any) {
+        showToast(humanizeError(e));
+      }
+    },
+    [selectedSpecName, showToast],
+  );
+
   const startIterateAtomize = useCallback(async () => {
     if (!selectedSpecName || !activeReportRunId) return;
     setToast(null);
@@ -1973,6 +2114,12 @@ export default function App() {
     ? `${animatedDisplayHead}${animatedDisplayTail}`
     : displayContent;
 
+  const atomicTaskGroups = useMemo(
+    () => parseTasksAtomicMarkdown(tasksAtomicContent),
+    [tasksAtomicContent],
+  );
+  const terminalPanelRef = useRef<TerminalPanelHandle | null>(null);
+
   const outputScrollRef = useRef<OutputScrollEl | null>(null);
   const outputLastScrollTopRef = useRef(0);
   const [outputAutoFollow, setOutputAutoFollow] = useState(true);
@@ -2180,7 +2327,7 @@ export default function App() {
   }, [shouldTypewriter]);
 
   return (
-    <div className="min-h-screen bg-surface text-slate-100">
+    <div className="flex h-screen flex-col bg-surface text-slate-100">
       <div className="border-b border-slate-800 bg-panel px-6 py-3">
         <div className="mx-auto flex max-w-[1400px] flex-col items-center gap-1 text-center">
           <div className="text-lg font-semibold text-slate-100 md:text-xl">planA规范驱动V0.1</div>
@@ -2194,7 +2341,41 @@ export default function App() {
           </a>
         </div>
       </div>
-      <main className="mx-auto grid max-w-[1400px] grid-cols-12 gap-4 px-6 py-6">
+      <div className="min-h-0 flex flex-1">
+        <div className="w-12 shrink-0 border-r border-slate-800 bg-slate-950/60">
+          <div className="flex flex-col items-center gap-1 py-2">
+            <button
+              className={`flex h-10 w-10 items-center justify-center rounded-md transition-colors ${
+                explorerOpen
+                  ? 'bg-slate-800 text-slate-100'
+                  : 'text-slate-400 hover:bg-slate-900/60 hover:text-slate-100'
+              }`}
+              onClick={() => setExplorerOpen((v) => !v)}
+              title="Explorer"
+              aria-label="Explorer"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                className="h-5 w-5"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M4 5.5h6l2 2H20a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-13a1 1 0 0 1 1-1Z" />
+                <path d="M3 10h18" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        {explorerOpen ? (
+          <ExplorerSidebar open onToggle={() => setExplorerOpen(false)} />
+        ) : null}
+
+        <main className="min-w-0 flex-1 overflow-auto">
+          <div className="mx-auto grid max-w-[1400px] grid-cols-12 gap-4 px-6 py-6">
         <section className="col-span-12 space-y-3 rounded-lg border border-slate-800 bg-panel p-4">
           <div className="text-sm font-semibold text-slate-200">原始需求</div>
           <textarea
@@ -2926,6 +3107,26 @@ export default function App() {
                     >
                       原子任务
                     </Button>
+                    {taskView === 'atomic' && (
+                      <>
+                        <Button
+                          variant={atomicDisplayMode === 'list' ? 'default' : 'outline'}
+                          size="sm"
+                          onClick={() => setAtomicDisplayMode('list')}
+                          disabled={!selectedSpecName}
+                        >
+                          列表
+                        </Button>
+                        <Button
+                          variant={atomicDisplayMode === 'raw' ? 'default' : 'outline'}
+                          size="sm"
+                          onClick={() => setAtomicDisplayMode('raw')}
+                          disabled={!selectedSpecName}
+                        >
+                          原文
+                        </Button>
+                      </>
+                    )}
                     <Button
                       size="sm"
                       onClick={() => void startAtomizeTasks()}
@@ -3506,6 +3707,12 @@ export default function App() {
               </div>
             </div>
 
+            {activeArtifact === 'tasks' && (
+              <div className="mb-2 rounded-md border border-slate-800 bg-slate-950/40 p-2 text-xs text-slate-300">
+                <TerminalPanel ref={terminalPanelRef} />
+              </div>
+            )}
+
             <div className="relative">
               {shouldTypewriter ? (
                 <div
@@ -3527,48 +3734,124 @@ export default function App() {
                   </pre>
                 </div>
               ) : (
-                <textarea
-                  ref={(el) => {
-                    outputScrollRef.current = el;
-                  }}
-                  className={`h-[520px] w-full rounded-md border bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent ${
-                    shouldTypewriter ? 'border-slate-600' : 'border-slate-700'
-                  }`}
-                  value={outputText}
-                  onChange={(e) =>
-                    setArtifactContent((prev) => {
-                      if (isAtomicView) return prev;
-                      const nextValue = e.target.value;
-                      const currentValue = prev[activeArtifact] ?? '';
-                      const next = { ...prev, [activeArtifact]: nextValue };
+                isAtomicView && atomicDisplayMode === 'list' ? (
+                  <div
+                    ref={(el) => {
+                      outputScrollRef.current = el;
+                    }}
+                    className={`h-[520px] w-full overflow-auto rounded-md border bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none ${
+                      shouldTypewriter ? 'border-slate-600' : 'border-slate-700'
+                    }`}
+                  >
+                    {atomicTaskGroups.length ? (
+                      <div className="space-y-5">
+                        {atomicTaskGroups.map((group, groupIdx) => (
+                          <div key={`${group.originalIndex ?? 'na'}-${groupIdx}`}>
+                            <div className="flex flex-wrap items-baseline gap-2">
+                              <div className="text-xs font-semibold text-slate-200">
+                                {group.originalIndex != null ? `原始任务 ${group.originalIndex}` : '原子任务'}
+                              </div>
+                              {group.originalTitle ? (
+                                <div className="text-xs text-slate-400">{group.originalTitle}</div>
+                              ) : null}
+                            </div>
+                            <div className="mt-2 space-y-2">
+                              {group.tasks.map((task) => (
+                                <div
+                                  key={`${task.id}-${task.title}`}
+                                  className="rounded-md border border-slate-800 bg-slate-950/40 p-3"
+                                >
+                                  <div className="flex flex-wrap items-start gap-2">
+                                    <div className="text-xs font-semibold text-slate-100">{`Task ${task.id}`}</div>
+                                    <div
+                                      className={`text-xs ${task.done ? 'text-green-400' : 'text-slate-500'}`}
+                                    >
+                                      {task.done ? '已完成' : '待办'}
+                                    </div>
+                                    <div className="ml-auto flex items-center gap-2">
+                                      <Button
+                                        size="sm"
+                                        variant={task.done ? 'outline' : 'default'}
+                                        onClick={() => void startCodexForAtomicTask(task.id)}
+                                        disabled={!selectedSpecName || Boolean(busyLabel)}
+                                      >
+                                        开始
+                                      </Button>
+                                    </div>
+                                  </div>
+                                  <div className="mt-2 whitespace-pre-wrap text-sm text-slate-100">
+                                    {task.title || '（无标题）'}
+                                  </div>
+                                  <div className="mt-2 space-y-1 text-xs text-slate-300">
+                                    <div className="whitespace-pre-wrap">
+                                      <span className="text-slate-400">核心逻辑：</span>
+                                      {task.core || '—'}
+                                    </div>
+                                    <div className="whitespace-pre-wrap">
+                                      <span className="text-slate-400">技术细节：</span>
+                                      {task.details || '—'}
+                                    </div>
+                                    <div className="whitespace-pre-wrap">
+                                      <span className="text-slate-400">验收准则：</span>
+                                      {task.ac || '—'}
+                                    </div>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-sm text-slate-400">
+                        暂无可解析的原子任务（请先点击“开始原子化”生成 tasks_atomic.md）
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <textarea
+                    ref={(el) => {
+                      outputScrollRef.current = el;
+                    }}
+                    className={`h-[520px] w-full rounded-md border bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent ${
+                      shouldTypewriter ? 'border-slate-600' : 'border-slate-700'
+                    }`}
+                    value={outputText}
+                    onChange={(e) =>
+                      setArtifactContent((prev) => {
+                        if (isAtomicView) return prev;
+                        const nextValue = e.target.value;
+                        const currentValue = prev[activeArtifact] ?? '';
+                        const next = { ...prev, [activeArtifact]: nextValue };
 
-                      if (
-                        selectedSpecName &&
-                        !isApplyingHistoryRef.current &&
-                        nextValue !== currentValue
-                      ) {
-                        const h = historyRef.current[activeArtifact];
-                        h.undo.push(currentValue);
-                        if (h.undo.length > 80) h.undo.shift();
-                        h.redo = [];
-                        setHistoryState((prevState) => ({
-                          ...prevState,
-                          [activeArtifact]: { undo: h.undo.length, redo: 0 },
-                        }));
-                      }
+                        if (
+                          selectedSpecName &&
+                          !isApplyingHistoryRef.current &&
+                          nextValue !== currentValue
+                        ) {
+                          const h = historyRef.current[activeArtifact];
+                          h.undo.push(currentValue);
+                          if (h.undo.length > 80) h.undo.shift();
+                          h.redo = [];
+                          setHistoryState((prevState) => ({
+                            ...prevState,
+                            [activeArtifact]: { undo: h.undo.length, redo: 0 },
+                          }));
+                        }
 
-                      if (selectedSpecName) {
-                        if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
-                        saveTimerRef.current = window.setTimeout(() => {
-                          void saveArtifact(activeArtifact);
-                        }, 900);
-                      }
-                      return next;
-                    })
-                  }
-                  disabled={!selectedSpecName}
-                  readOnly={isAtomicView || Boolean(streamStage)}
-                />
+                        if (selectedSpecName) {
+                          if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+                          saveTimerRef.current = window.setTimeout(() => {
+                            void saveArtifact(activeArtifact);
+                          }, 900);
+                        }
+                        return next;
+                      })
+                    }
+                    disabled={!selectedSpecName}
+                    readOnly={isAtomicView || Boolean(streamStage)}
+                  />
+                )
               )}
               {shouldTypewriter && (
                 <div className="pointer-events-none absolute bottom-2 right-2 flex items-center gap-2 rounded-md border border-slate-800 bg-slate-950/80 px-2 py-1 text-xs text-slate-200">
@@ -3583,7 +3866,9 @@ export default function App() {
             </div>
           </div>
         </section>
-      </main>
+          </div>
+        </main>
+      </div>
 
       {busyLabel && (
         <div className="fixed inset-0 z-50 flex items-center justify-center pointer-events-none">
