@@ -3,7 +3,7 @@ import JSZip from 'jszip';
 
 import { Button } from './components/ui/button';
 import { ExplorerSidebar } from './ExplorerSidebar';
-import { TerminalPanel, type TerminalPanelHandle } from './TerminalPanel';
+import { TerminalPanel, type TerminalPanelHandle, type AssignableCliTerminal } from './TerminalPanel';
 import { TaskOrchestrator } from './components/mvp5';
 import type {
   ClarificationQuestion,
@@ -19,8 +19,35 @@ const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
 const API_TIMEOUT_MS = Number(import.meta.env.VITE_API_TIMEOUT_MS || 90000);
 const TASK_TIMEOUT_MS = Number(import.meta.env.VITE_TASK_TIMEOUT_MS || 180000);
 const DOWNLOAD_PREFIX = 'planA-v0.1';
+const ATOMIZE_ENABLED = false;
 
 type TaskView = 'tasks' | 'atomic';
+
+type CliToolInfo = {
+  id: string;
+  label: string;
+  command: string;
+  args: string[];
+  baseUrl: string;
+  baseUrlPresent: boolean;
+  apiKeyPresent: boolean;
+  baseUrlEnvKey: string;
+  apiKeyEnvKey: string;
+  env: Record<string, string>;
+};
+
+type CliToolDraft = {
+  id: string;
+  label: string;
+  command: string;
+  argsText: string;
+  baseUrl: string;
+  baseUrlEnvKey: string;
+  apiKey: string;
+  apiKeyEnvKey: string;
+  envText: string;
+  clearApiKey: boolean;
+};
 
 type OutputScrollEl = HTMLDivElement | HTMLTextAreaElement;
 
@@ -89,12 +116,12 @@ type SpecReportSummary = {
 
 const PROMPT_STAGE_ORDER = [
   { key: 'projectCategory', label: '项目类型识别' },
+  { key: 'requirementsClarifications', label: '提问确认问题生成' },
   { key: 'requirements', label: '需求生成' },
-  { key: 'requirementsClarifications', label: '需求确认问题生成' },
   { key: 'design', label: '设计生成' },
   { key: 'tasks', label: '任务生成' },
-  { key: 'atomize', label: '任务原子化' },
   { key: 'reportScore', label: '流程报告评分' },
+  { key: 'mvp5Plan', label: 'MVP5 执行方案生成' },
 ] as const;
 
 function sanitizeFilePart(input: string) {
@@ -295,37 +322,6 @@ async function renderTextToPng(text: string, title: string) {
   });
 }
 
-function buildClarificationsMarkdown(questions: ClarificationQuestion[]) {
-  const lines: string[] = [];
-  lines.push('## 需求确认', '');
-  questions.forEach((q, i) => {
-    const selectedIds = q.answer?.selectedOptionIds ?? [];
-    const selectedLabels = q.options
-      .filter((opt) => selectedIds.includes(opt.id))
-      .map((opt) => opt.label)
-      .filter(Boolean);
-    const otherText = (q.answer?.otherText ?? '').trim();
-    lines.push(`### Q${i + 1}. ${q.question}`);
-    lines.push(`- 选择：${selectedLabels.length ? selectedLabels.join('、') : '（未选择）'}`);
-    if (q.allowOther) lines.push(`- 补充：${otherText ? otherText : '（无）'}`);
-    lines.push('');
-  });
-  return lines.join('\n').trimEnd();
-}
-
-function upsertClarificationsSection(markdown: string, questions: ClarificationQuestion[]) {
-  const section = buildClarificationsMarkdown(questions);
-  const text = markdown ?? '';
-  const re = /^## 需求(?:澄清|确认)[\s\S]*?(?=\n## |\n# |$)/m;
-  if (re.test(text)) return text.replace(re, section).trimEnd();
-  const afterOriginal = /(## 原始需求[\s\S]*?)(\n## |\n# |$)/m.exec(text);
-  if (afterOriginal) {
-    const insertAt = afterOriginal.index + afterOriginal[1].length;
-    return `${text.slice(0, insertAt).trimEnd()}\n\n${section}\n\n${text.slice(insertAt).trimStart()}`.trimEnd();
-  }
-  return `${text.trimEnd()}\n\n${section}\n`.trimEnd();
-}
-
 function buildTechStackMarkdown(questions: ClarificationQuestion[]) {
   const lines: string[] = [];
   lines.push('## 技术栈确认', '');
@@ -396,6 +392,40 @@ async function apiJson<T>(path: string, init?: RequestInit, timeoutMsOverride?: 
     throw error;
   }
   return data as T;
+}
+
+function cliArgsToText(args?: string[]) {
+  if (!Array.isArray(args) || !args.length) return '';
+  return args.map((v) => String(v ?? '')).filter(Boolean).join('\n');
+}
+
+function cliTextToArgs(text: string) {
+  return String(text || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function cliEnvToText(env?: Record<string, string>) {
+  if (!env || typeof env !== 'object') return '';
+  return Object.entries(env)
+    .map(([k, v]) => `${k}=${String(v ?? '')}`)
+    .join('\n');
+}
+
+function cliTextToEnv(text: string) {
+  const env: Record<string, string> = {};
+  const lines = String(text || '').split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = String(line || '').trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq <= 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    env[key] = trimmed.slice(eq + 1);
+  }
+  return env;
 }
 
 async function apiNdjsonStream<T>(
@@ -521,9 +551,11 @@ function humanizeError(e: any) {
 
   if (!msg) return '发生未知错误';
   if (status === 409 && /Design not confirmed/i.test(msg)) return '设计尚未生成，请先生成设计。';
-  if (status === 409 && /Requirements not confirmed/i.test(msg)) return '需求尚未确认，请先完成需求确认并生成设计。';
+  if (status === 409 && /Requirements not confirmed/i.test(msg)) {
+    return '需求文档（requirements.md）尚未生成，请先完成提问确认并生成 requirements.md。';
+  }
   if (status === 409 && /Tech stack clarifications incomplete/i.test(msg)) return '技术栈确认未完成，请先完成必填项。';
-  if (status === 409 && /clarifications incomplete/i.test(msg)) return '需求确认未完成，请先完成必填项。';
+  if (status === 409 && /clarifications incomplete/i.test(msg)) return '提问确认未完成，请先完成必填项。';
   if (status === 404 && /Spec file not found/i.test(msg)) return '文档尚未生成。';
   if (/Failed to fetch/i.test(msg)) return '无法连接到服务，请检查 bridge 地址/反代配置。';
   if (/LLM config missing/i.test(msg)) return `模型配置缺失：${msg.replace(/^LLM config missing:\s*/i, '')}`;
@@ -552,10 +584,9 @@ function areClarificationsComplete(questions: ClarificationQuestion[]) {
 function errorStageLabel(stage?: string | null) {
   if (!stage) return '未知阶段';
   if (stage === 'requirements') return '需求生成';
-  if (stage === 'requirementsClarifications') return '需求确认问题生成';
+  if (stage === 'requirementsClarifications') return '提问确认问题生成';
   if (stage === 'design') return '设计生成';
   if (stage === 'tasks') return '任务生成';
-  if (stage === 'atomize') return '任务原子化';
   if (stage === 'reportScore') return '流程报告评分';
   return stage;
 }
@@ -573,7 +604,7 @@ function artifactLabel(a: SpecArtifact) {
   return '任务';
 }
 
-type AtomicTaskFieldKey = 'core' | 'details' | 'ac';
+type AtomicTaskFieldKey = 'core' | 'details' | 'depends' | 'ac';
 
 type AtomicTaskItem = {
   id: string;
@@ -581,6 +612,7 @@ type AtomicTaskItem = {
   title: string;
   core: string;
   details: string;
+  depends: string[];
   ac: string;
   originalIndex: number | null;
   originalTitle: string;
@@ -647,6 +679,7 @@ function parseTasksAtomicMarkdown(markdown: string): AtomicTaskGroup[] {
         title: String(taskMatch[3] || '').trim(),
         core: '',
         details: '',
+        depends: [],
         ac: '',
         originalIndex: currentGroup?.originalIndex ?? null,
         originalTitle: currentGroup?.originalTitle ?? '',
@@ -657,22 +690,47 @@ function parseTasksAtomicMarkdown(markdown: string): AtomicTaskGroup[] {
 
     if (!currentTask) continue;
 
-    const fieldMatch = /^\s{2,}-\s*\*\*(核心逻辑|技术细节|验收准则(?:\s*\(AC\))?)\*\*:\s*(.*)\s*$/.exec(
-      line,
-    );
+    const fieldMatch =
+      /^\s{2,}-\s*\*\*(核心逻辑|技术细节|依赖|验收准则(?:\s*\(AC\))?)\*\*:\s*(.*)\s*$/.exec(line);
     if (fieldMatch) {
       const label = fieldMatch[1];
       const value = String(fieldMatch[2] || '').trim();
-      if (label.includes('核心逻辑')) lastField = 'core';
-      else if (label.includes('技术细节')) lastField = 'details';
-      else lastField = 'ac';
-      currentTask[lastField] = value;
+      if (label.includes('核心逻辑')) {
+        lastField = 'core';
+        currentTask[lastField] = value;
+      } else if (label.includes('技术细节')) {
+        lastField = 'details';
+        currentTask[lastField] = value;
+      } else if (label.includes('依赖')) {
+        if (!value || /^(无|无依赖|none|null|n\/a)$/i.test(value)) {
+          currentTask.depends = [];
+          lastField = value ? null : 'depends';
+        } else {
+          currentTask.depends = [value];
+          lastField = 'depends';
+        }
+      } else {
+        lastField = 'ac';
+        currentTask[lastField] = value;
+      }
       continue;
     }
 
     const trimmed = line.trim();
+    if (lastField === 'depends' && trimmed) {
+      const itemMatch = trimmed.match(/^-+\s*(.+)$/);
+      if (itemMatch) {
+        currentTask.depends.push(String(itemMatch[1] || '').trim());
+        continue;
+      }
+      if (currentTask.depends.length) {
+        currentTask.depends[currentTask.depends.length - 1] = `${currentTask.depends[currentTask.depends.length - 1]}\n${trimmed}`.trim();
+        continue;
+      }
+    }
     if (
       lastField &&
+      lastField !== 'depends' &&
       trimmed &&
       !/^###\s/.test(trimmed) &&
       !/^- \[( |x|X)\]\s*\*\*Task\s+/i.test(trimmed) &&
@@ -714,6 +772,14 @@ export default function App() {
   const [iterateUserNoteText, setIterateUserNoteText] = useState('');
   // MVP5: 智能任务编排状态
   const [orchestratorOpen, setOrchestratorOpen] = useState(false);
+  const [atomicTaskStartDialog, setAtomicTaskStartDialog] = useState<{
+    taskId: string;
+    mode: 'new-codex' | 'new-claude' | 'existing';
+    selectedTerminalId: string;
+    terminals: AssignableCliTerminal[];
+    submitting: boolean;
+    error: string | null;
+  } | null>(null);
   const atomizePrevRef = useRef<{
     specName: string | null;
     running: boolean;
@@ -754,6 +820,25 @@ export default function App() {
   const [showLlmConfig, setShowLlmConfig] = useState(false);
   const [llmConfigUnlocked, setLlmConfigUnlocked] = useState(false);
   const [providerDrafts, setProviderDrafts] = useState<Record<string, { baseUrl: string; apiKey: string }>>({});
+  const [cliTools, setCliTools] = useState<CliToolInfo[]>([]);
+  const [cliToolsLoading, setCliToolsLoading] = useState(false);
+  const [cliToolsError, setCliToolsError] = useState<string | null>(null);
+  const [cliConfigOpen, setCliConfigOpen] = useState(false);
+  const [cliToolEditorOpen, setCliToolEditorOpen] = useState(false);
+  const [cliToolEditingId, setCliToolEditingId] = useState<string | null>(null);
+  const [cliToolSaving, setCliToolSaving] = useState(false);
+  const [cliToolDraft, setCliToolDraft] = useState<CliToolDraft>({
+    id: '',
+    label: '',
+    command: '',
+    argsText: '',
+    baseUrl: '',
+    baseUrlEnvKey: '',
+    apiKey: '',
+    apiKeyEnvKey: '',
+    envText: '',
+    clearApiKey: false,
+  });
   const [busyLabel, setBusyLabel] = useState<string | null>(null);
   const busyStartedAtRef = useRef<number | null>(null);
   const [busySeconds, setBusySeconds] = useState(0);
@@ -1044,6 +1129,175 @@ export default function App() {
     }
   }, []);
 
+  const refreshCliTools = useCallback(async () => {
+    setCliToolsLoading(true);
+    setCliToolsError(null);
+    try {
+      const data = await apiJson<{ tools?: CliToolInfo[] }>('/cli-tools');
+      setCliTools(Array.isArray(data.tools) ? data.tools : []);
+      return data;
+    } catch (e: any) {
+      const message = humanizeError(e);
+      setCliToolsError(message);
+      throw e;
+    } finally {
+      setCliToolsLoading(false);
+    }
+  }, []);
+
+  const openCliToolEditor = useCallback((tool?: CliToolInfo) => {
+    if (tool) {
+      setCliToolEditingId(tool.id);
+      setCliToolDraft({
+        id: tool.id,
+        label: tool.label ?? '',
+        command: tool.command ?? '',
+        argsText: cliArgsToText(tool.args),
+        baseUrl: tool.baseUrl ?? '',
+        baseUrlEnvKey: tool.baseUrlEnvKey ?? '',
+        apiKey: '',
+        apiKeyEnvKey: tool.apiKeyEnvKey ?? '',
+        envText: cliEnvToText(tool.env),
+        clearApiKey: false,
+      });
+    } else {
+      setCliToolEditingId(null);
+      setCliToolDraft({
+        id: '',
+        label: '',
+        command: '',
+        argsText: '',
+        baseUrl: '',
+        baseUrlEnvKey: '',
+        apiKey: '',
+        apiKeyEnvKey: '',
+        envText: '',
+        clearApiKey: false,
+      });
+    }
+    setCliToolEditorOpen(true);
+  }, []);
+
+  const cancelCliToolEditor = useCallback(() => {
+    setCliToolEditorOpen(false);
+    setCliToolEditingId(null);
+    setCliToolSaving(false);
+    setCliToolDraft({
+      id: '',
+      label: '',
+      command: '',
+      argsText: '',
+      baseUrl: '',
+      baseUrlEnvKey: '',
+      apiKey: '',
+      apiKeyEnvKey: '',
+      envText: '',
+      clearApiKey: false,
+    });
+  }, []);
+
+  const saveCliTool = useCallback(async () => {
+    const draft = cliToolDraft;
+    const payload: any = {
+      label: draft.label.trim(),
+      command: draft.command.trim(),
+      args: cliTextToArgs(draft.argsText),
+      baseUrl: draft.baseUrl.trim(),
+      baseUrlEnvKey: draft.baseUrlEnvKey.trim(),
+      apiKeyEnvKey: draft.apiKeyEnvKey.trim(),
+      env: cliTextToEnv(draft.envText),
+      clearApiKey: Boolean(draft.clearApiKey),
+    };
+    if (!cliToolEditingId && draft.id.trim()) payload.id = draft.id.trim();
+    if (draft.apiKey.trim()) payload.apiKey = draft.apiKey;
+
+    if (!payload.label) {
+      showToast('请填写 CLI 工具 label');
+      return;
+    }
+    if (!payload.command) {
+      showToast('请填写 CLI 工具 command');
+      return;
+    }
+
+    setToast(null);
+    setCliToolSaving(true);
+    try {
+      if (cliToolEditingId) {
+        await apiJson<{ ok: boolean; tool?: CliToolInfo }>(
+          `/cli-tools/${encodeURIComponent(cliToolEditingId)}`,
+          { method: 'PUT', body: JSON.stringify(payload) },
+        );
+      } else {
+        await apiJson<{ ok: boolean; tool?: CliToolInfo }>('/cli-tools', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+      }
+      showToast(cliToolEditingId ? 'CLI 工具已更新' : 'CLI 工具已新增', 'info');
+      cancelCliToolEditor();
+      void refreshCliTools().catch((e) => showToast(humanizeError(e)));
+    } catch (e: any) {
+      showToast(humanizeError(e));
+    } finally {
+      setCliToolSaving(false);
+    }
+  }, [cancelCliToolEditor, cliToolDraft, cliToolEditingId, refreshCliTools, showToast]);
+
+  const deleteCliTool = useCallback(async (id: string) => {
+    const toolId = String(id || '').trim();
+    if (!toolId) return;
+    if (!window.confirm(`确认删除 CLI 工具：${toolId} ？`)) return;
+    setToast(null);
+    try {
+      await apiJson<{ ok: boolean }>(`/cli-tools/${encodeURIComponent(toolId)}`, { method: 'DELETE' });
+      showToast('CLI 工具已删除', 'info');
+      void refreshCliTools().catch((e) => showToast(humanizeError(e)));
+    } catch (e: any) {
+      showToast(humanizeError(e));
+    }
+  }, [refreshCliTools, showToast]);
+
+  const resetCliToolsToDefault = useCallback(async () => {
+    if (!window.confirm('确认将 CLI 工具还原为初始值（清空自定义配置）？')) return;
+    setToast(null);
+    try {
+      await apiJson<{ ok: boolean; tools?: CliToolInfo[] }>('/cli-tools/reset', { method: 'POST' });
+      showToast('CLI 工具已还原为初始值', 'info');
+      cancelCliToolEditor();
+      void refreshCliTools().catch((e) => showToast(humanizeError(e)));
+    } catch (e: any) {
+      showToast(humanizeError(e));
+    }
+  }, [cancelCliToolEditor, refreshCliTools, showToast]);
+
+  const openCliConfig = useCallback(() => {
+    const open = () => {
+      setCliConfigOpen(true);
+      void refreshCliTools().catch((e) => showToast(humanizeError(e)));
+    };
+
+    if (llmConfigUnlocked) {
+      open();
+      return;
+    }
+
+    const input = window.prompt('请输入密码以打开 CLI 配置');
+    if (input === '159753') {
+      setLlmConfigUnlocked(true);
+      open();
+      return;
+    }
+    if (input !== null) {
+      showToast('密码错误');
+    }
+  }, [llmConfigUnlocked, refreshCliTools, showToast]);
+
+  const closeCliConfig = useCallback(() => {
+    setCliConfigOpen(false);
+    cancelCliToolEditor();
+  }, [cancelCliToolEditor]);
+
   const refreshPrompts = useCallback(async () => {
     const data = await apiJson<PromptConfigResponse>('/prompts');
     setPromptConfig(data);
@@ -1179,7 +1433,8 @@ export default function App() {
     void refreshSpecs().catch((e) => showToast(humanizeError(e)));
     void refreshLlm().catch((e) => showToast(humanizeError(e)));
     void refreshPrompts().catch((e) => showToast(humanizeError(e)));
-  }, [refreshLlm, refreshPrompts, refreshSpecs, showToast]);
+    void refreshCliTools().catch((e) => showToast(humanizeError(e)));
+  }, [refreshCliTools, refreshLlm, refreshPrompts, refreshSpecs, showToast]);
 
   useEffect(() => {
     if (!busyLabel) {
@@ -1513,21 +1768,11 @@ export default function App() {
         method: 'POST',
         body: JSON.stringify({ questions: clarifications }),
       });
-      setArtifactContent((prev) => ({
-        ...prev,
-        requirements: upsertClarificationsSection(prev.requirements ?? '', clarifications),
-      }));
       await refreshSpecs();
     } catch (e: any) {
       showToast(humanizeError(e));
     }
   }, [clarifications, refreshSpecs, selectedSpecName, showToast]);
-
-  const applyClarificationsToRequirements = useCallback(async () => {
-    const next = upsertClarificationsSection(artifactContent.requirements ?? '', clarifications);
-    setArtifactContent((prev) => ({ ...prev, requirements: next }));
-    await saveArtifact('requirements', next);
-  }, [artifactContent.requirements, clarifications, saveArtifact]);
 
   const saveTechStackClarifications = useCallback(async () => {
     if (!selectedSpecName) return;
@@ -1555,10 +1800,9 @@ export default function App() {
     resetStreamPreview();
     try {
       if (!areClarificationsComplete(clarifications)) {
-        throw new Error('请先完成所有必填的需求确认');
+        throw new Error('请先完成所有必填的提问确认');
       }
       await saveClarifications();
-      await applyClarificationsToRequirements();
       await apiNdjsonStream(
         `/specs/${encodeURIComponent(selectedSpecName)}/confirm?stream=1`,
         {
@@ -1582,7 +1826,6 @@ export default function App() {
       setBusyLabel(null);
     }
   }, [
-    applyClarificationsToRequirements,
     clarifications,
     handleNdjsonEvent,
     loadArtifact,
@@ -1683,27 +1926,98 @@ export default function App() {
     }
   }, [atomizeBatchSizeText, selectedSpecName, showToast]);
 
-  const startCodexForAtomicTask = useCallback(
-    async (taskId: string) => {
+  const openAtomicTaskStartDialog = useCallback(
+    (taskId: string) => {
       if (!selectedSpecName) return;
       const normalizedTaskId = String(taskId || '').trim();
       if (!normalizedTaskId) return;
-      if (!window.confirm(`启动 Codex 执行 Task ${normalizedTaskId}？`)) return;
-
-      setToast(null);
-      try {
-        const result = await terminalPanelRef.current?.startCodexAtomicTask(
-          selectedSpecName,
-          normalizedTaskId,
-        );
-        if (!result) throw new Error('终端面板未就绪');
-        showToast(`Codex 已启动：${result.title}`, 'info');
-      } catch (e: any) {
-        showToast(humanizeError(e));
-      }
+      const terminals = terminalPanelRef.current?.listAssignableCliTerminals?.() ?? [];
+      setAtomicTaskStartDialog({
+        taskId: normalizedTaskId,
+        mode: 'new-codex',
+        selectedTerminalId: terminals[0]?.id ?? '',
+        terminals,
+        submitting: false,
+        error: null,
+      });
     },
-    [selectedSpecName, showToast],
+    [selectedSpecName],
   );
+
+  const refreshAtomicTaskAssignableTerminals = useCallback(() => {
+    const terminals = terminalPanelRef.current?.listAssignableCliTerminals?.() ?? [];
+    setAtomicTaskStartDialog((prev) => {
+      if (!prev) return prev;
+      const stillExists = prev.selectedTerminalId
+        ? terminals.some((t) => t.id === prev.selectedTerminalId)
+        : false;
+      return {
+        ...prev,
+        terminals,
+        selectedTerminalId: stillExists ? prev.selectedTerminalId : terminals[0]?.id ?? '',
+      };
+    });
+  }, []);
+
+  const closeAtomicTaskStartDialog = useCallback(() => {
+    setAtomicTaskStartDialog(null);
+  }, []);
+
+  const startAtomicTaskFromDialog = useCallback(async () => {
+    if (!selectedSpecName || !atomicTaskStartDialog) return;
+    const panel = terminalPanelRef.current;
+    if (!panel) {
+      showToast('终端面板未就绪');
+      return;
+    }
+
+    const taskId = atomicTaskStartDialog.taskId;
+    setAtomicTaskStartDialog((prev) => (prev ? { ...prev, submitting: true, error: null } : prev));
+    setToast(null);
+
+    try {
+      if (atomicTaskStartDialog.mode === 'new-codex') {
+        const result = await panel.startCodexAtomicTask(selectedSpecName, taskId);
+        showToast(`Codex 已启动：${result.title}`, 'info');
+        setAtomicTaskStartDialog(null);
+        return;
+      }
+
+      const promptData = await apiJson<{ prompt?: string; error?: string }>(
+        `/specs/${encodeURIComponent(selectedSpecName)}/tasks_atomic/prompt`,
+        { method: 'POST', body: JSON.stringify({ taskId }) },
+        20000,
+      );
+      if (promptData?.error) throw new Error(String(promptData.error));
+      const prompt = String(promptData?.prompt || '').trim();
+      if (!prompt) throw new Error('获取任务提示失败');
+
+      let terminalId = atomicTaskStartDialog.selectedTerminalId;
+      let title = '';
+      if (atomicTaskStartDialog.mode === 'new-claude') {
+        const created = await panel.createClaudeAutoTerminal();
+        terminalId = created.terminalId;
+        title = created.title;
+      }
+
+      if (!terminalId) throw new Error('请选择一个已开启的 CLI');
+
+      await panel.sendTerminalInput(terminalId, `${prompt}\n`);
+      panel.focusTerminal(terminalId);
+
+      showToast(
+        atomicTaskStartDialog.mode === 'existing'
+          ? `已分配到终端：${terminalId}`
+          : `已启动：${title || 'Claude Code'} · ${terminalId}`,
+        'info',
+      );
+      setAtomicTaskStartDialog(null);
+    } catch (e: any) {
+      const message = humanizeError(e);
+      setAtomicTaskStartDialog((prev) => (prev ? { ...prev, submitting: false, error: message } : prev));
+      showToast(message);
+    }
+  }, [atomicTaskStartDialog, selectedSpecName, showToast]);
 
   const startIterateAtomize = useCallback(async () => {
     if (!selectedSpecName || !activeReportRunId) return;
@@ -1776,8 +2090,8 @@ export default function App() {
 
   const downloadCurrentMd = useCallback(() => {
     if (!selectedSpecName) return;
-    const isAtomicView = activeArtifact === 'tasks' && taskView === 'atomic';
-    const displayArtifact = isAtomicView ? 'tasks_atomic' : activeArtifact;
+    const isAtomicView = ATOMIZE_ENABLED && activeArtifact === 'tasks' && taskView === 'atomic';
+    const displayArtifact = activeArtifact;
     const content = isAtomicView
       ? tasksAtomicContent
       : artifactContent[activeArtifact] ?? '';
@@ -1792,8 +2106,8 @@ export default function App() {
     setBusyProgress(0.05);
     setBusyDetail('渲染 PNG…');
     try {
-      const isAtomicView = activeArtifact === 'tasks' && taskView === 'atomic';
-      const displayArtifact = isAtomicView ? 'tasks_atomic' : activeArtifact;
+      const isAtomicView = ATOMIZE_ENABLED && activeArtifact === 'tasks' && taskView === 'atomic';
+      const displayArtifact = activeArtifact;
       const label = isAtomicView ? '任务原子化' : artifactLabel(activeArtifact);
       const title = `${selectedSpecName} / ${label}`;
       const content = isAtomicView
@@ -1835,41 +2149,37 @@ export default function App() {
         [
           'planA 规范驱动开发 - 文档使用说明',
           '',
-          '本压缩包包含 4 份核心文档（requirements/design/tasks/tasks_atomic），用于在 AI IDE 中执行类似 Kiro 的“规范驱动开发（Spec-Driven Development）”。',
+          '本压缩包包含 3 份核心文档（requirements/design/tasks），用于在 AI IDE 中执行“规范驱动开发（Spec-Driven Development）”。',
           '',
-          '给 AI IDE 的执行指令：优先按 tasks_atomic.md（原子化任务表单）逐条实现与验收；tasks.md 只用于范围/里程碑回写。',
-          '如需调整范围/补充任务：先更新 tasks.md，再重新生成 tasks_atomic.md 后继续。',
+          '给 AI IDE 的执行指令：以 requirements/design/tasks 作为约束与上下文，按 tasks.md 的任务（模块级交付物）逐条实现与验收。',
+          '如需调整范围/补充任务：先更新 tasks.md（TASKS_JSON），再继续执行。',
           '',
           '1) requirements.md（需求）',
           '- 用途：产品/业务需求的唯一事实来源（Source of Truth）。',
-          '- 建议：补全背景、用户故事、验收标准，并在“需求确认”中记录关键选择与补充信息。',
+          '- 建议：补全背景、用户故事、验收标准；“需求确认”章节由提问确认的回答汇总生成，可按需继续补充。',
           '',
           '2) design.md（设计）',
           '- 用途：面向实现的技术方案与架构说明，指导代码组织、关键流程、边界与风险。',
           '- 建议：让 AI IDE 在编码前先阅读 design.md，确保实现方向一致。',
           '',
           '3) tasks.md（任务）',
-          '- 用途：任务总览、范围约束与回写入口（开发执行优先以 tasks_atomic.md 为准）。',
+          '- 用途：任务总览、范围约束与并发编排输入（任务粒度：模块级/交付物级，建议 ≤ 25）。',
           '- 工作方式：',
-          '  a) 保持 tasks.md 覆盖所有待办与范围边界；',
-          '  b) AI IDE 实施时优先按 tasks_atomic.md 执行，并将完成情况/关键变更回写到 tasks.md；',
-          '  c) 如发现遗漏或范围变化，先更新 tasks.md，再重新生成 tasks_atomic.md 后继续。',
-          '',
-          '4) tasks_atomic.md（原子化任务表单）',
-          '- 用途：AI IDE 开发的首选执行清单（原子任务粒度，便于逐条验收与并行推进）。',
-          '- 建议：交付给 AI IDE 时，默认以 tasks_atomic.md 为执行单元逐条实现；完成后勾选（- [x]）并补充“实现说明/变更文件/验证结果”。',
+          '  a) tasks.md 的 TASKS_JSON 是编排输入（含 dependencies/scope/complexity）；',
+          '  b) AI IDE 实施时按任务逐条交付，并将完成情况/关键变更回写到 tasks.md；',
+          '  c) 如发现遗漏或范围变化，先更新 tasks.md（保持 TASKS_JSON 有效 JSON）再继续。',
           '',
           '推荐流程（类似 Kiro）：',
-          '1. 写原始需求 → 生成 requirements',
-          '2. 完成“需求确认” → 生成 design',
-          '3. 从 design 生成 tasks',
-          '4. 生成 tasks_atomic（推荐，交付 AI IDE 前完成）',
-          '5. 将 requirements/design/tasks/tasks_atomic 提供给你的 AI 编程工具/IDE，要求它：',
+          '1. 写原始需求 → 生成提问确认问题',
+          '2. 完成回答 → 生成 requirements.md',
+          '3. 生成 design.md',
+          '4. 从 design.md 生成 tasks.md（模块级任务 + DAG 依赖）',
+          '5. 将 requirements/design/tasks 提供给你的 AI 编程工具/IDE，要求它：',
           '   - 以 requirements/design 作为约束与上下文',
-          '   - 优先以 tasks_atomic.md（原子化任务表单）逐条执行并回写完成记录',
+          '   - 按 tasks.md（TASKS_JSON）的任务逐条执行并回写完成记录',
           '   - tasks.md 用于同步范围与里程碑；如需变更先改 tasks.md 再继续',
           '',
-          '提示：当你要加功能或改需求时，先更新 requirements/design/tasks（必要时重新生成 tasks_atomic），再让 AI IDE 继续执行。',
+          '提示：当你要加功能或改需求时，先更新 requirements/design/tasks，再让 AI IDE 继续执行。',
           '',
         ].join('\n'),
       );
@@ -1893,21 +2203,23 @@ export default function App() {
         const png = await renderTextToPng(content, title);
         folder.file(`${a}.png`, png);
       }
-      try {
-        bump('加载 tasks_atomic.md…');
-        const latest = await apiJson<{ content: string }>(
-          `/specs/${encodeURIComponent(selectedSpecName)}/tasks_atomic`,
-        );
-        const atomicContent = latest.content ?? '';
-        if (atomicContent.trim()) {
-          folder.file('tasks_atomic.md', atomicContent);
-          const atomicTitle = `${selectedSpecName} / 任务原子化`;
-          bump('渲染 tasks_atomic.png…');
-          const png = await renderTextToPng(atomicContent, atomicTitle);
-          folder.file('tasks_atomic.png', png);
+      if (ATOMIZE_ENABLED) {
+        try {
+          bump('加载 tasks_atomic.md…');
+          const latest = await apiJson<{ content: string }>(
+            `/specs/${encodeURIComponent(selectedSpecName)}/tasks_atomic`,
+          );
+          const atomicContent = latest.content ?? '';
+          if (atomicContent.trim()) {
+            folder.file('tasks_atomic.md', atomicContent);
+            const atomicTitle = `${selectedSpecName} / 任务原子化`;
+            bump('渲染 tasks_atomic.png…');
+            const png = await renderTextToPng(atomicContent, atomicTitle);
+            folder.file('tasks_atomic.png', png);
+          }
+        } catch {
+          // Ignore missing atomic tasks
         }
-      } catch {
-        // Ignore missing atomic tasks
       }
 
       try {
@@ -2070,7 +2382,8 @@ export default function App() {
     [modelPing, normalizeModelLabel],
   );
 
-  const updatePromptStageField = useCallback((stageKey: string, field: 'system' | 'user', value: string) => {
+  const updatePromptStageField = useCallback(
+    (stageKey: string, field: 'system' | 'user' | 'scenario', value: string) => {
     setPromptDraft((prev) => {
       if (!prev) return prev;
       const currentStage = prev.stages?.[stageKey];
@@ -2088,9 +2401,22 @@ export default function App() {
     });
   }, []);
 
+  const updatePromptMetaField = useCallback((field: 'projectOverview', value: string) => {
+    setPromptDraft((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        meta: {
+          ...(prev.meta ?? { projectOverview: '' }),
+          [field]: value,
+        },
+      };
+    });
+  }, []);
+
   const activeModelId = llm?.model ?? '';
   const activePing = activeModelId ? modelPing[activeModelId] : null;
-  const isAtomicView = activeArtifact === 'tasks' && taskView === 'atomic';
+  const isAtomicView = ATOMIZE_ENABLED && activeArtifact === 'tasks' && taskView === 'atomic';
   const isNonSoftwareProject = selectedSpec?.status?.projectCategory === 'non_software';
   const displayContent = isAtomicView
     ? tasksAtomicContent
@@ -2390,7 +2716,7 @@ export default function App() {
             className="h-24 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent"
             value={rawPrompt}
             onChange={(e) => setRawPrompt(e.target.value)}
-            placeholder="粘贴/输入需求描述，点击“生成需求”创建一个新的 Spec。"
+            placeholder="粘贴/输入需求描述，点击“生成提问确认”创建 Spec 并生成澄清问题。"
           />
             <div className="flex flex-wrap items-center gap-2">
             <Button
@@ -2398,7 +2724,7 @@ export default function App() {
               disabled={!rawPrompt.trim() || Boolean(busyLabel)}
               className={nextAction === 'createSpec' ? guidedButtonClass : ''}
             >
-              生成需求
+              生成提问确认
             </Button>
             <div className="ml-auto flex flex-wrap items-center gap-2 text-sm text-slate-300">
               <span>模型：</span>
@@ -2502,88 +2828,20 @@ export default function App() {
             <summary className="cursor-pointer select-none text-sm font-semibold text-slate-200">
               使用说明（点击展开）
             </summary>
-            <div className="mt-2 space-y-3">
+              <div className="mt-2 space-y-3">
               <div className="text-xs text-slate-400">
-                流程：原始需求 → 需求确认 → 设计 → 技术栈确认 → 任务 → 分段原子化 → 下载交付
-              </div>
-
-              <div className="overflow-x-auto rounded-md border border-slate-800 bg-slate-950/40 p-3">
-                <svg
-                  viewBox="0 0 1060 120"
-                  className="h-[110px] min-w-[1060px]"
-                  role="img"
-                  aria-label="工作流示意图"
-                >
-                  <defs>
-                    <marker
-                      id="arrowHead"
-                      markerWidth="10"
-                      markerHeight="10"
-                      refX="8"
-                      refY="3"
-                      orient="auto"
-                    >
-                      <path d="M0,0 L0,6 L9,3 z" fill="#64748b" />
-                    </marker>
-                  </defs>
-
-                  {[
-                    { x: 10, text: '原始需求' },
-                    { x: 160, text: '需求 + 确认' },
-                    { x: 310, text: '设计' },
-                    { x: 460, text: '技术栈确认' },
-                    { x: 610, text: '任务' },
-                    { x: 760, text: '分段原子化' },
-                    { x: 910, text: '下载 ZIP' },
-                  ].map((node) => (
-                    <g key={node.x}>
-                      <rect
-                        x={node.x}
-                        y={30}
-                        width={130}
-                        height={44}
-                        rx={10}
-                        fill="#0b1220"
-                        stroke="#334155"
-                        strokeWidth={1.2}
-                      />
-                      <text
-                        x={node.x + 65}
-                        y={56}
-                        textAnchor="middle"
-                        fontSize={14}
-                        fill="#e2e8f0"
-                        dominantBaseline="middle"
-                      >
-                        {node.text}
-                      </text>
-                    </g>
-                  ))}
-
-                  {[10, 160, 310, 460, 610, 760].map((x) => (
-                    <line
-                      key={x}
-                      x1={x + 130}
-                      y1={52}
-                      x2={x + 150}
-                      y2={52}
-                      stroke="#64748b"
-                      strokeWidth={2}
-                      markerEnd="url(#arrowHead)"
-                    />
-                  ))}
-                </svg>
+                流程：原始需求 → 提问确认 → 用户回答 → 生成 requirements.md → 设计 → 技术栈确认 → 任务（TASKS_JSON）→ 任务编排（MVP5）→ 下载交付
               </div>
 
               <ol className="list-decimal space-y-1 pl-5 text-sm text-slate-200">
-                <li>在“原始需求”输入内容，点“生成需求”创建一个新的 Spec。</li>
-                <li>切到“需求”，完成“需求确认”，点“确认需求并生成设计”。</li>
+                <li>在“原始需求”输入内容，点“生成提问确认”创建 Spec。</li>
+                <li>切到“需求”，完成“提问确认”，点“生成 requirements.md（并生成设计）”。</li>
                 <li>切到“设计”，完成“技术栈确认”，点“确认技术栈并生成任务”。</li>
                 <li>
-                  切到“任务”，点“开始原子化”。可设置“分段 N 条/次”，默认开启“自动续段”，失败时可点“重试本段”。
+                  切到“任务”，在 tasks.md 的 TASKS_JSON 里维护模块级任务与 dependencies；点“打开任务编排”分析依赖并生成执行方案。
                 </li>
                 <li>
-                  需要交付给 AI IDE 时，点“一键下载（ZIP）”，并优先按 tasks_atomic.md（原子化任务表单）逐条开发。
+                  需要交付给 AI IDE 时，点“一键下载（ZIP）”，按 tasks.md 的任务逐条开发，并在 tasks.md 回写关键变更与验证结果。
                 </li>
               </ol>
 
@@ -2674,6 +2932,18 @@ export default function App() {
                 <div className="text-xs text-slate-400">提示词配置加载中…</div>
               ) : (
                 <div className="grid grid-cols-1 gap-3">
+                  <div className="rounded-md border border-slate-800 bg-slate-950/40 p-3">
+                    <div className="text-sm font-semibold text-slate-200">项目整体说明（与提示词相关）</div>
+                    <div className="mt-2 text-xs text-slate-400">
+                      该说明会随提示词一起保存到配置文件，用于让维护者快速理解每个 stage 的用途与约束。
+                    </div>
+                    <textarea
+                      className="mt-2 h-28 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent"
+                      value={promptDraft.meta?.projectOverview ?? ''}
+                      onChange={(e) => updatePromptMetaField('projectOverview', e.target.value)}
+                      placeholder="请输入与提示词相关的项目整体说明…"
+                    />
+                  </div>
                   {PROMPT_STAGE_ORDER.map(({ key, label }) => {
                     const stage = promptDraft.stages?.[key];
                     if (!stage) return null;
@@ -2687,6 +2957,15 @@ export default function App() {
                             变量：{vars.length ? vars.map((v) => `{{${v}}}`).join(' ') : '（无）'}
                           </div>
                         </div>
+                        <label className="mt-2 block space-y-1 text-xs text-slate-300">
+                          <div>使用场景</div>
+                          <textarea
+                            className="h-20 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent"
+                            value={stage.scenario ?? ''}
+                            onChange={(e) => updatePromptStageField(key, 'scenario', e.target.value)}
+                            placeholder="说明该 stage 在什么时机被调用、输入输出约束、典型用途…"
+                          />
+                        </label>
                         <div className="mt-2 grid grid-cols-1 gap-3 md:grid-cols-2">
                           <label className="space-y-1 text-xs text-slate-300">
                             <div>System</div>
@@ -2769,6 +3048,9 @@ export default function App() {
                   </div>
                 );
               })}
+              <div className="rounded-md border border-slate-800 bg-slate-900/40 p-3 text-xs text-slate-400">
+                CLI 工具配置已移动到「终端」面板的「＋ 新建终端」旁边。
+              </div>
             </div>
           )}
         </section>
@@ -2819,7 +3101,7 @@ export default function App() {
             {selectedSpecName && activeArtifact === 'requirements' && (
               <div className="mb-4 space-y-3 rounded-md border border-slate-800 bg-slate-900/30 p-3">
                 <div className="flex flex-wrap items-center gap-2">
-                  <div className="text-sm font-semibold text-slate-200">需求确认</div>
+                  <div className="text-sm font-semibold text-slate-200">提问确认</div>
                   <div className="text-xs text-slate-400">
                     {areClarificationsComplete(clarifications) ? '已完成' : '未完成'}
                   </div>
@@ -2923,7 +3205,7 @@ export default function App() {
                     disabled={!selectedSpecName || Boolean(busyLabel) || !clarifications.length}
                     className={nextAction === 'generateDesign' ? guidedButtonClass : ''}
                   >
-                    生成设计
+                    生成 requirements.md（并生成设计）
                   </Button>
                 </div>
               </div>
@@ -3098,98 +3380,14 @@ export default function App() {
             <div className="mb-2 flex flex-wrap items-center gap-2">
               {activeArtifact === 'tasks' && (
                 <>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Button
-                      variant={taskView === 'tasks' ? 'default' : 'outline'}
-                      size="sm"
-                      onClick={() => setTaskView('tasks')}
-                      disabled={!selectedSpecName}
-                    >
-                      任务
-                    </Button>
-                    <Button
-                      variant={taskView === 'atomic' ? 'default' : 'outline'}
-                      size="sm"
-                      onClick={() => setTaskView('atomic')}
-                      disabled={!selectedSpecName}
-                    >
-                      原子任务
-                    </Button>
-                    {taskView === 'atomic' && (
-                      <>
-                        <Button
-                          variant={atomicDisplayMode === 'list' ? 'default' : 'outline'}
-                          size="sm"
-                          onClick={() => setAtomicDisplayMode('list')}
-                          disabled={!selectedSpecName}
-                        >
-                          列表
-                        </Button>
-                        <Button
-                          variant={atomicDisplayMode === 'raw' ? 'default' : 'outline'}
-                          size="sm"
-                          onClick={() => setAtomicDisplayMode('raw')}
-                          disabled={!selectedSpecName}
-                        >
-                          原文
-                        </Button>
-                      </>
-                    )}
-                    <Button
-                      size="sm"
-                      onClick={() => void startAtomizeTasks()}
-                      disabled={
-                        !selectedSpecName ||
-                        Boolean(busyLabel) ||
-                        !artifactContent.tasks.trim() ||
-                        atomizeStatus?.running
-                      }
-                      className={nextAction === 'startAtomize' ? guidedButtonClass : ''}
-                    >
-                      {atomizeStatus?.running
-                        ? '原子化中'
-                        : atomizeStatus?.total &&
-                            atomizeStatus.completed > 0 &&
-                            atomizeStatus.completed < atomizeStatus.total
-                          ? '继续原子化（下一段）'
-                          : '开始原子化'}
-                    </Button>
-                    {atomizeStatus?.error && !atomizeStatus?.running && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => void startAtomizeTasks()}
-                        disabled={
-                          !selectedSpecName ||
-                          Boolean(busyLabel) ||
-                          !artifactContent.tasks.trim() ||
-                          atomizeStatus?.running
-                        }
-                      >
-                        重试本段
-                      </Button>
-                    )}
-                    <label className="flex items-center gap-2 rounded-md border border-slate-800 bg-slate-950/40 px-2 py-1 text-xs text-slate-300">
-                      <span className="text-slate-400">分段</span>
-                      <input
-                        className="h-7 w-12 rounded-md border border-slate-700 bg-slate-950 px-2 text-xs text-slate-100 outline-none focus:ring-2 focus:ring-accent"
-                        value={atomizeBatchSizeText}
-                        onChange={(e) => setAtomizeBatchSizeText(e.target.value.replace(/[^\d]/g, '').slice(0, 2))}
-                        placeholder="3"
-                        inputMode="numeric"
-                      />
-                      <span className="text-slate-400">条/次</span>
-                    </label>
-                    <label className="flex items-center gap-2 rounded-md border border-slate-800 bg-slate-950/40 px-2 py-1 text-xs text-slate-300">
-                      <input
-                        type="checkbox"
-                        className="h-4 w-4"
-                        checked={atomizeAutoContinue}
-                        onChange={(e) => setAtomizeAutoContinue(e.target.checked)}
-                      />
-                      <span className="text-slate-400">自动续段</span>
-                    </label>
-                  </div>
+                  <Button
+                    size="sm"
+                    onClick={() => setOrchestratorOpen((prev) => !prev)}
+                    disabled={!selectedSpecName}
+                    className={orchestratorOpen ? 'bg-purple-700 hover:bg-purple-600' : ''}
+                  >
+                    {orchestratorOpen ? '收起任务编排' : '打开任务编排'}
+                  </Button>
                   <Button
                     size="sm"
                     onClick={() => void downloadAllZip()}
@@ -3215,7 +3413,13 @@ export default function App() {
               </div>
             </div>
 
-            {activeArtifact === 'tasks' && (
+            {activeArtifact === 'tasks' && selectedSpecName && orchestratorOpen ? (
+              <div className="mb-3 rounded-md border border-slate-800 bg-slate-950/40 p-3">
+                <TaskOrchestrator specId={selectedSpecName} tasksContent={artifactContent.tasks} />
+              </div>
+            ) : null}
+
+            {activeArtifact === 'tasks' && ATOMIZE_ENABLED && (
               <div className="mb-3 rounded-md border border-slate-800 bg-slate-950/40 p-3">
                 <div className="flex flex-wrap items-center gap-2">
                   <div className="text-sm font-semibold text-slate-200">原子化日志</div>
@@ -3568,7 +3772,8 @@ export default function App() {
                   </div>
                 </details>
 
-                <div className="mt-3 rounded-md border border-slate-800 bg-slate-950/40 p-2">
+                {ATOMIZE_ENABLED ? (
+                  <div className="mt-3 rounded-md border border-slate-800 bg-slate-950/40 p-2">
                   <div className="flex flex-wrap items-center gap-2">
                     <div className="text-xs font-semibold text-slate-200">迭代生成</div>
                     <div className="ml-auto text-xs text-slate-400">
@@ -3597,6 +3802,7 @@ export default function App() {
                     </Button>
                   </div>
                 </div>
+                ) : null}
 
                 <div className="mt-3 flex flex-wrap items-end gap-2">
                   <label className="flex items-center gap-2 text-xs text-slate-300">
@@ -3717,7 +3923,7 @@ export default function App() {
 
             {activeArtifact === 'tasks' && (
               <div className="mb-2 rounded-md border border-slate-800 bg-slate-950/40 p-2 text-xs text-slate-300">
-                <TerminalPanel ref={terminalPanelRef} />
+                <TerminalPanel ref={terminalPanelRef} onOpenCliConfig={openCliConfig} />
               </div>
             )}
 
@@ -3781,7 +3987,7 @@ export default function App() {
                           <div className="mb-4">
                             <TaskOrchestrator
                               specId={selectedSpecName || ''}
-                              atomicTasks={atomicTaskLines}
+                              tasksContent={artifactContent.tasks ?? ''}
                             />
                           </div>
                         )}
@@ -3814,7 +4020,7 @@ export default function App() {
                                       <Button
                                         size="sm"
                                         variant={task.done ? 'outline' : 'default'}
-                                        onClick={() => void startCodexForAtomicTask(task.id)}
+                                        onClick={() => openAtomicTaskStartDialog(task.id)}
                                         disabled={!selectedSpecName || Boolean(busyLabel)}
                                       >
                                         开始
@@ -3832,6 +4038,10 @@ export default function App() {
                                     <div className="whitespace-pre-wrap">
                                       <span className="text-slate-400">技术细节：</span>
                                       {task.details || '—'}
+                                    </div>
+                                    <div className="whitespace-pre-wrap">
+                                      <span className="text-slate-400">依赖：</span>
+                                      {task.depends.length ? task.depends.join('\n') : '无'}
                                     </div>
                                     <div className="whitespace-pre-wrap">
                                       <span className="text-slate-400">验收准则：</span>
@@ -3852,48 +4062,97 @@ export default function App() {
                     )}
                   </div>
                 ) : (
-                  <textarea
-                    ref={(el) => {
-                      outputScrollRef.current = el;
-                    }}
-                    className={`h-[520px] w-full rounded-md border bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent ${
-                      shouldTypewriter ? 'border-slate-600' : 'border-slate-700'
-                    }`}
-                    value={outputText}
-                    onChange={(e) =>
-                      setArtifactContent((prev) => {
-                        if (isAtomicView) return prev;
-                        const nextValue = e.target.value;
-                        const currentValue = prev[activeArtifact] ?? '';
-                        const next = { ...prev, [activeArtifact]: nextValue };
+                  <>
+                    {activeArtifact === 'tasks' ? (
+                      <div className="mb-4">
+                        <div className="mb-3 flex items-center justify-between rounded-md border border-purple-900/50 bg-purple-950/30 p-3">
+                          <div className="flex items-center gap-2">
+                            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-purple-900/50 text-purple-300">
+                              <svg
+                                className="h-4 w-4"
+                                fill="none"
+                                stroke="currentColor"
+                                viewBox="0 0 24 24"
+                              >
+                                <path
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  strokeWidth={2}
+                                  d="M13 10V3L4 14h7v7l9-11h-7z"
+                                />
+                              </svg>
+                            </div>
+                            <div>
+                              <div className="text-sm font-medium text-purple-200">任务编排</div>
+                              <div className="text-xs text-purple-400">
+                                基于 tasks.md 的 TASKS_JSON 分析依赖并推荐执行顺序（并发≤8）
+                              </div>
+                            </div>
+                          </div>
+                          <Button
+                            size="sm"
+                            onClick={() => setOrchestratorOpen(!orchestratorOpen)}
+                            disabled={!selectedSpecName}
+                            className="bg-purple-700 hover:bg-purple-600"
+                          >
+                            {orchestratorOpen ? '收起任务编排' : '打开任务编排'}
+                          </Button>
+                        </div>
 
-                        if (
-                          selectedSpecName &&
-                          !isApplyingHistoryRef.current &&
-                          nextValue !== currentValue
-                        ) {
-                          const h = historyRef.current[activeArtifact];
-                          h.undo.push(currentValue);
-                          if (h.undo.length > 80) h.undo.shift();
-                          h.redo = [];
-                          setHistoryState((prevState) => ({
-                            ...prevState,
-                            [activeArtifact]: { undo: h.undo.length, redo: 0 },
-                          }));
-                        }
+                        {orchestratorOpen && (
+                          <div className="mb-4">
+                            <TaskOrchestrator
+                              specId={selectedSpecName || ''}
+                              tasksContent={artifactContent.tasks ?? ''}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    ) : null}
 
-                        if (selectedSpecName) {
-                          if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
-                          saveTimerRef.current = window.setTimeout(() => {
-                            void saveArtifact(activeArtifact);
-                          }, 900);
-                        }
-                        return next;
-                      })
-                    }
-                    disabled={!selectedSpecName}
-                    readOnly={isAtomicView || Boolean(streamStage)}
-                  />
+                    <textarea
+                      ref={(el) => {
+                        outputScrollRef.current = el;
+                      }}
+                      className={`h-[520px] w-full rounded-md border bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent ${
+                        shouldTypewriter ? 'border-slate-600' : 'border-slate-700'
+                      }`}
+                      value={outputText}
+                      onChange={(e) =>
+                        setArtifactContent((prev) => {
+                          if (isAtomicView) return prev;
+                          const nextValue = e.target.value;
+                          const currentValue = prev[activeArtifact] ?? '';
+                          const next = { ...prev, [activeArtifact]: nextValue };
+
+                          if (
+                            selectedSpecName &&
+                            !isApplyingHistoryRef.current &&
+                            nextValue !== currentValue
+                          ) {
+                            const h = historyRef.current[activeArtifact];
+                            h.undo.push(currentValue);
+                            if (h.undo.length > 80) h.undo.shift();
+                            h.redo = [];
+                            setHistoryState((prevState) => ({
+                              ...prevState,
+                              [activeArtifact]: { undo: h.undo.length, redo: 0 },
+                            }));
+                          }
+
+                          if (selectedSpecName) {
+                            if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+                            saveTimerRef.current = window.setTimeout(() => {
+                              void saveArtifact(activeArtifact);
+                            }, 900);
+                          }
+                          return next;
+                        })
+                      }
+                      disabled={!selectedSpecName}
+                      readOnly={isAtomicView || Boolean(streamStage)}
+                    />
+                  </>
                 )
               )}
               {shouldTypewriter && (
@@ -3912,6 +4171,499 @@ export default function App() {
           </div>
         </main>
       </div>
+
+      {atomicTaskStartDialog ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4"
+          onMouseDown={(e) => {
+            if (e.target !== e.currentTarget) return;
+            if (atomicTaskStartDialog.submitting) return;
+            closeAtomicTaskStartDialog();
+          }}
+        >
+          <div className="w-[760px] max-w-[96vw] overflow-hidden rounded-lg border border-slate-700 bg-slate-950 shadow-2xl">
+            <div className="flex flex-wrap items-center gap-2 border-b border-slate-800 bg-slate-950 px-4 py-3">
+              <div className="text-sm font-semibold text-slate-200">
+                执行 Task {atomicTaskStartDialog.taskId}
+              </div>
+              <div className="ml-auto flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={refreshAtomicTaskAssignableTerminals}
+                  disabled={atomicTaskStartDialog.submitting}
+                >
+                  刷新已开 CLI
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={closeAtomicTaskStartDialog}
+                  disabled={atomicTaskStartDialog.submitting}
+                >
+                  关闭
+                </Button>
+              </div>
+            </div>
+            <div className="space-y-3 p-4 text-sm text-slate-200">
+              <div className="space-y-2">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    checked={atomicTaskStartDialog.mode === 'new-codex'}
+                    onChange={() =>
+                      setAtomicTaskStartDialog((prev) =>
+                        prev ? { ...prev, mode: 'new-codex', error: null } : prev,
+                      )
+                    }
+                    disabled={atomicTaskStartDialog.submitting}
+                  />
+                  <span>新开 Codex（任务模式）</span>
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    checked={atomicTaskStartDialog.mode === 'new-claude'}
+                    onChange={() =>
+                      setAtomicTaskStartDialog((prev) =>
+                        prev ? { ...prev, mode: 'new-claude', error: null } : prev,
+                      )
+                    }
+                    disabled={atomicTaskStartDialog.submitting}
+                  />
+                  <span>新开 Claude Code（全自动）</span>
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    checked={atomicTaskStartDialog.mode === 'existing'}
+                    onChange={() =>
+                      setAtomicTaskStartDialog((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              mode: 'existing',
+                              selectedTerminalId: prev.selectedTerminalId || prev.terminals[0]?.id || '',
+                              error: null,
+                            }
+                          : prev,
+                      )
+                    }
+                    disabled={atomicTaskStartDialog.submitting}
+                  />
+                  <span>分配到已开启 CLI</span>
+                </label>
+              </div>
+
+              {atomicTaskStartDialog.mode === 'existing' ? (
+                <div className="rounded-md border border-slate-800 bg-slate-900/40 p-3">
+                  {atomicTaskStartDialog.terminals.length ? (
+                    <label className="space-y-1 text-xs text-slate-300">
+                      <div>选择终端</div>
+                      <select
+                        className="h-9 w-full rounded-md border border-slate-700 bg-slate-950 px-2 text-sm text-slate-100"
+                        value={atomicTaskStartDialog.selectedTerminalId}
+                        onChange={(e) =>
+                          setAtomicTaskStartDialog((prev) =>
+                            prev ? { ...prev, selectedTerminalId: e.target.value } : prev,
+                          )
+                        }
+                        disabled={atomicTaskStartDialog.submitting}
+                      >
+                        <option value="" disabled>
+                          请选择
+                        </option>
+                        {atomicTaskStartDialog.terminals.map((t) => (
+                          <option key={t.id} value={t.id}>
+                            {t.title} · {t.kind} · {t.id.slice(0, 8)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : (
+                    <div className="text-xs text-slate-400">暂无已开启的 CLI 终端</div>
+                  )}
+                </div>
+              ) : null}
+
+              {atomicTaskStartDialog.error ? (
+                <div className="rounded-md border border-red-800/40 bg-red-950/30 p-2 text-xs text-red-200">
+                  {atomicTaskStartDialog.error}
+                </div>
+              ) : null}
+
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={closeAtomicTaskStartDialog}
+                  disabled={atomicTaskStartDialog.submitting}
+                >
+                  取消
+                </Button>
+                <Button
+                  size="sm"
+                  onClick={() => void startAtomicTaskFromDialog()}
+                  disabled={
+                    atomicTaskStartDialog.submitting ||
+                    (atomicTaskStartDialog.mode === 'existing' &&
+                      (!atomicTaskStartDialog.selectedTerminalId ||
+                        atomicTaskStartDialog.terminals.length === 0))
+                  }
+                >
+                  {atomicTaskStartDialog.submitting ? '启动中…' : '开始'}
+                </Button>
+              </div>
+
+              <div className="text-[11px] text-slate-500">
+                工作目录使用终端面板的“默认目录”；需要新建目录时，可用“默认目录”旁的“新建文件夹”，或在“选择目录”里新建。
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {cliConfigOpen ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) closeCliConfig();
+          }}
+        >
+          <div className="w-[980px] max-w-[96vw] overflow-hidden rounded-lg border border-slate-700 bg-slate-950 shadow-2xl">
+            <div className="flex flex-wrap items-center gap-2 border-b border-slate-800 bg-slate-950 px-4 py-3">
+              <div className="text-sm font-semibold text-slate-200">CLI 配置</div>
+              <div className="text-xs text-slate-400">
+                配置入口已移动到「终端」面板的「新建终端」旁边
+              </div>
+              <div className="ml-auto flex items-center gap-2">
+                <Button variant="outline" size="sm" onClick={closeCliConfig}>
+                  关闭
+                </Button>
+              </div>
+            </div>
+            <div className="max-h-[82vh] overflow-auto p-4">
+              <div className="mb-3 rounded-md border border-slate-800 bg-slate-900/40 p-3">
+                <div className="text-sm font-semibold text-slate-200">内置参考（只读）</div>
+                <div className="mt-2 grid grid-cols-1 gap-2 md:grid-cols-2">
+                  <div className="rounded-md border border-slate-800 bg-slate-950/40 p-2">
+                    <div className="text-xs font-semibold text-slate-200">Codex CLI（手动）</div>
+                    <div className="mt-1 font-mono text-[11px] text-slate-300">
+                      cmd.exe /d /s /c codex
+                    </div>
+                  </div>
+                  <div className="rounded-md border border-slate-800 bg-slate-950/40 p-2">
+                    <div className="text-xs font-semibold text-slate-200">Claude Code（全自动）</div>
+                    <div className="mt-1 font-mono text-[11px] text-slate-300">
+                      cmd.exe /d /s /c claude --dangerously-skip-permissions
+                    </div>
+                  </div>
+                </div>
+                <div className="mt-2 text-[11px] text-slate-500">
+                  需要参照时，打开“新增 CLI 工具”，点击“填入模板”自动带出 command/args。
+                </div>
+              </div>
+
+              <div className="rounded-md border border-slate-800 bg-slate-900/40 p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="text-sm font-semibold text-slate-200">CLI 工具</div>
+                  <div className="text-xs text-slate-400">
+                    {cliToolsLoading ? '加载中…' : `${cliTools.length} 个`}
+                  </div>
+                  <div className="ml-auto flex flex-wrap items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() =>
+                        void refreshCliTools().catch((e) => showToast(humanizeError(e)))
+                      }
+                      disabled={cliToolsLoading || Boolean(busyLabel)}
+                    >
+                      刷新
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void resetCliToolsToDefault()}
+                      disabled={cliToolsLoading || Boolean(busyLabel)}
+                    >
+                      还原初始值
+                    </Button>
+                    <Button size="sm" onClick={() => openCliToolEditor()} disabled={Boolean(busyLabel)}>
+                      新增
+                    </Button>
+                  </div>
+                </div>
+
+                {cliToolsError ? (
+                  <div className="mt-2 rounded-md border border-red-800/40 bg-red-950/30 p-2 text-xs text-red-200">
+                    {cliToolsError}
+                  </div>
+                ) : null}
+
+                <div className="mt-2 space-y-2">
+                  {cliTools.length ? (
+                    cliTools.map((tool) => (
+                      <div
+                        key={tool.id}
+                        className="flex flex-wrap items-center gap-2 rounded-md border border-slate-800 bg-slate-950/40 p-2"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-sm text-slate-100">
+                            {tool.label}{' '}
+                            <span className="text-xs text-slate-400">({tool.id})</span>
+                          </div>
+                          <div className="mt-0.5 truncate text-xs text-slate-400">
+                            {tool.command}
+                            {tool.args?.length ? ` ${tool.args.join(' ')}` : ''}
+                            {tool.baseUrlPresent ? ` · baseUrl: ${tool.baseUrl}` : ''}
+                            {` · key: ${tool.apiKeyPresent ? '已配置' : '未配置'}`}
+                          </div>
+                        </div>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => openCliToolEditor(tool)}
+                          disabled={Boolean(busyLabel)}
+                        >
+                          编辑
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => void deleteCliTool(tool.id)}
+                          disabled={Boolean(busyLabel)}
+                        >
+                          删除
+                        </Button>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-sm text-slate-400">暂无 CLI 工具配置</div>
+                  )}
+                </div>
+
+                {cliToolEditorOpen ? (
+                  <div className="mt-3 rounded-md border border-slate-800 bg-slate-950/40 p-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="text-sm font-semibold text-slate-200">
+                        {cliToolEditingId ? `编辑：${cliToolEditingId}` : '新增 CLI 工具'}
+                      </div>
+                      <div className="ml-auto flex flex-wrap items-center gap-2">
+                        <Button
+                          size="sm"
+                          onClick={() => void saveCliTool()}
+                          disabled={cliToolSaving || Boolean(busyLabel)}
+                        >
+                          保存
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => cancelCliToolEditor()}
+                          disabled={cliToolSaving}
+                        >
+                          取消
+                        </Button>
+                      </div>
+                    </div>
+
+                    <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-300">
+                      <div className="text-slate-400">填入模板：</div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          setCliToolDraft((prev) => ({
+                            ...prev,
+                            ...(cliToolEditingId ? {} : { id: '' }),
+                            label: 'Codex CLI（手动）',
+                            command: 'cmd.exe',
+                            argsText: '/d\n/s\n/c\ncodex',
+                            baseUrl: '',
+                            baseUrlEnvKey: '',
+                            apiKey: '',
+                            apiKeyEnvKey: '',
+                            envText: '',
+                            clearApiKey: false,
+                          }))
+                        }
+                        disabled={cliToolSaving || Boolean(busyLabel)}
+                      >
+                        Codex CLI
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          setCliToolDraft((prev) => ({
+                            ...prev,
+                            ...(cliToolEditingId ? {} : { id: '' }),
+                            label: 'Claude Code（全自动）',
+                            command: 'cmd.exe',
+                            argsText: '/d\n/s\n/c\nclaude\n--dangerously-skip-permissions',
+                            baseUrl: '',
+                            baseUrlEnvKey: '',
+                            apiKey: '',
+                            apiKeyEnvKey: '',
+                            envText: '',
+                            clearApiKey: false,
+                          }))
+                        }
+                        disabled={cliToolSaving || Boolean(busyLabel)}
+                      >
+                        Claude Code
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          setCliToolDraft((prev) => ({
+                            ...prev,
+                            ...(cliToolEditingId ? {} : { id: '' }),
+                            label: '',
+                            command: '',
+                            argsText: '',
+                            baseUrl: '',
+                            baseUrlEnvKey: '',
+                            apiKey: '',
+                            apiKeyEnvKey: '',
+                            envText: '',
+                            clearApiKey: false,
+                          }))
+                        }
+                        disabled={cliToolSaving || Boolean(busyLabel)}
+                      >
+                        清空
+                      </Button>
+                    </div>
+
+                    <div className="mt-2 grid grid-cols-1 gap-2 md:grid-cols-2">
+                      <label className="space-y-1 text-xs text-slate-300">
+                        <div>ID（可选，编辑时不可改）</div>
+                        <input
+                          className="h-9 w-full rounded-md border border-slate-700 bg-slate-950 px-2 text-sm text-slate-100"
+                          value={cliToolDraft.id}
+                          onChange={(e) => setCliToolDraft((prev) => ({ ...prev, id: e.target.value }))}
+                          placeholder="gemini / opencode"
+                          disabled={Boolean(cliToolEditingId)}
+                        />
+                      </label>
+                      <label className="space-y-1 text-xs text-slate-300">
+                        <div>Label</div>
+                        <input
+                          className="h-9 w-full rounded-md border border-slate-700 bg-slate-950 px-2 text-sm text-slate-100"
+                          value={cliToolDraft.label}
+                          onChange={(e) => setCliToolDraft((prev) => ({ ...prev, label: e.target.value }))}
+                          placeholder="Gemini CLI"
+                        />
+                      </label>
+                      <label className="space-y-1 text-xs text-slate-300">
+                        <div>Command</div>
+                        <input
+                          className="h-9 w-full rounded-md border border-slate-700 bg-slate-950 px-2 text-sm text-slate-100"
+                          value={cliToolDraft.command}
+                          onChange={(e) =>
+                            setCliToolDraft((prev) => ({ ...prev, command: e.target.value }))
+                          }
+                          placeholder="gemini"
+                        />
+                      </label>
+                      <label className="space-y-1 text-xs text-slate-300">
+                        <div>Args（每行一个）</div>
+                        <textarea
+                          className="h-20 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-2 text-sm text-slate-100"
+                          value={cliToolDraft.argsText}
+                          onChange={(e) =>
+                            setCliToolDraft((prev) => ({ ...prev, argsText: e.target.value }))
+                          }
+                          placeholder="--help"
+                        />
+                      </label>
+                      <label className="space-y-1 text-xs text-slate-300">
+                        <div>Base URL</div>
+                        <input
+                          className="h-9 w-full rounded-md border border-slate-700 bg-slate-950 px-2 text-sm text-slate-100"
+                          value={cliToolDraft.baseUrl}
+                          onChange={(e) =>
+                            setCliToolDraft((prev) => ({ ...prev, baseUrl: e.target.value }))
+                          }
+                          placeholder="https://..."
+                        />
+                      </label>
+                      <label className="space-y-1 text-xs text-slate-300">
+                        <div>Base URL Env Key（可选）</div>
+                        <input
+                          className="h-9 w-full rounded-md border border-slate-700 bg-slate-950 px-2 text-sm text-slate-100"
+                          value={cliToolDraft.baseUrlEnvKey}
+                          onChange={(e) =>
+                            setCliToolDraft((prev) => ({ ...prev, baseUrlEnvKey: e.target.value }))
+                          }
+                          placeholder="GEMINI_BASE_URL"
+                        />
+                      </label>
+                      <label className="space-y-1 text-xs text-slate-300">
+                        <div>API Key（留空不修改/不展示）</div>
+                        <input
+                          type="password"
+                          className="h-9 w-full rounded-md border border-slate-700 bg-slate-950 px-2 text-sm text-slate-100"
+                          value={cliToolDraft.apiKey}
+                          onChange={(e) =>
+                            setCliToolDraft((prev) => ({ ...prev, apiKey: e.target.value }))
+                          }
+                          placeholder={
+                            cliToolEditingId &&
+                            cliTools.find((t) => t.id === cliToolEditingId)?.apiKeyPresent
+                              ? '已配置（留空不修改）'
+                              : ''
+                          }
+                        />
+                      </label>
+                      <label className="space-y-1 text-xs text-slate-300">
+                        <div>API Key Env Key（可选）</div>
+                        <input
+                          className="h-9 w-full rounded-md border border-slate-700 bg-slate-950 px-2 text-sm text-slate-100"
+                          value={cliToolDraft.apiKeyEnvKey}
+                          onChange={(e) =>
+                            setCliToolDraft((prev) => ({ ...prev, apiKeyEnvKey: e.target.value }))
+                          }
+                          placeholder="GEMINI_API_KEY"
+                        />
+                      </label>
+                      {cliToolEditingId &&
+                      cliTools.find((t) => t.id === cliToolEditingId)?.apiKeyPresent ? (
+                        <label className="flex items-center gap-2 text-xs text-slate-300">
+                          <input
+                            type="checkbox"
+                            checked={cliToolDraft.clearApiKey}
+                            onChange={(e) =>
+                              setCliToolDraft((prev) => ({ ...prev, clearApiKey: e.target.checked }))
+                            }
+                          />
+                          清除已保存的 API Key
+                        </label>
+                      ) : (
+                        <div />
+                      )}
+                      <label className="space-y-1 text-xs text-slate-300 md:col-span-2">
+                        <div>Env（每行 KEY=VALUE，可选）</div>
+                        <textarea
+                          className="h-28 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-2 text-sm text-slate-100"
+                          value={cliToolDraft.envText}
+                          onChange={(e) =>
+                            setCliToolDraft((prev) => ({ ...prev, envText: e.target.value }))
+                          }
+                          placeholder={'FOO=bar\nDEBUG=1'}
+                        />
+                      </label>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {busyLabel && (
         <div className="fixed inset-0 z-50 flex items-center justify-center pointer-events-none">

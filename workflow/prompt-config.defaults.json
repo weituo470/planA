@@ -1,0 +1,58 @@
+{
+  "version": 5,
+  "updatedAt": "2026-01-06T00:00:00.000Z",
+  "meta": {
+    "projectOverview": "本文件集中管理本项目所有可编辑的 LLM 提示词模板（system/user）。\n每个 stages.<key> 对应一个自动化步骤：提问确认/需求/设计/任务/评审/编排。\n统一约定：默认只输出 JSON（不要 Markdown/解释），以便被程序可靠解析。\n任务编排遵循 docs/任务编排.md：任务必须是模块级/交付物级（≤25），并显式给出 dependencies；调度器并发上限 ≤8，复用 CLI worker 池，禁止“一任务一终端”。"
+  },
+  "stages": {
+    "projectCategory": {
+      "label": "项目类型识别",
+      "scenario": "在创建/更新 Spec 时调用。用于判断输入需求属于“软件项目”还是“非软件项目”，并输出 projectCategory 供 UI 与后续流程分支使用。",
+      "variables": ["prompt"],
+      "system": "你是项目类型识别助手。只输出 JSON，不要解释，不要包含分析或思考过程。",
+      "user": "原始需求：{{prompt}}\n\n请判断该需求属于“软件项目”还是“非软件项目”。\n- 软件项目：需要开发/修改应用、网站、脚本、后端服务、数据库、API、自动化工具等，以代码交付为主。\n- 非软件项目：主要产出是文案/策划/报告/制度/流程/课程/活动方案等，不以写代码交付为目标。\n\n请严格只输出 JSON：{\"projectCategory\":\"software|non_software\",\"confidence\":0-1,\"reason\":\"一句话理由\"}。\n要求：projectCategory 只能是 software 或 non_software；confidence 为 0-1 数字；reason 用简体中文 1 句。"
+    },
+    "requirementsClarifications": {
+      "label": "需求确认问题生成",
+      "scenario": "在用户提交“原始需求”后调用。用于产出可点击选项的澄清问题列表，帮助用户确认口径与边界（questions 数组）。",
+      "variables": ["prompt"],
+      "system": "你是需求澄清助手。只输出 JSON，不要解释，不要包含分析或思考过程。",
+      "user": "原始需求：{{prompt}}\n\n请生成 5-8 个“需求确认问题”，用于对齐开发口径：\n- 必须结合原始需求的领域/关键词（至少 2 题需要直接引用关键词）\n- 每题都要给出 3-6 个可点击选项，并允许“其他（用户输入）”\n- 避免泛泛而谈（例如“还有什么需求？”、“预算多少？”）\n\n仅输出 JSON，结构如下：\n{\"questions\":[{\"id\":\"q1\",\"question\":\"...\",\"mode\":\"single\",\"required\":true,\"allowOther\":true,\"options\":[{\"id\":\"a\",\"label\":\"...\"}]}]}"
+    },
+    "requirements": {
+      "label": "需求生成",
+      "scenario": "在用户完成“提问确认”并提交回答后调用。用于生成 requirements.md 的结构化内容（background/user_stories/acceptance），并综合用户回答的澄清结论，且 acceptance 必须是可验证语句。",
+      "variables": ["prompt", "clarificationsSummary"],
+      "system": "你是产品需求助手。只输出 JSON，不要解释，不要包含分析或思考过程。",
+      "user": "需求描述：{{prompt}}\n\n需求澄清结论（来自用户回答，可能为空）：\n{{clarificationsSummary}}\n\n请只输出 JSON，必须包含字段：background（字符串）, user_stories（字符串数组）, acceptance（字符串数组）。\n要求：所有内容必须为简体中文；acceptance 每条为“当...时，系统应...”风格的可验证语句。\n不要输出除 JSON 以外的任何内容。"
+    },
+    "design": {
+      "label": "设计生成",
+      "scenario": "在需求确认后调用。用于基于 requirements + prompt 生成 design.md 草案（overview/flows/considerations），为任务拆解提供依据。",
+      "variables": ["requirements", "prompt"],
+      "system": "你是软件设计助手。只输出 JSON，不要解释，不要包含分析或思考过程。",
+      "user": "需求内容如下：\n{{requirements}}\n\n补充描述：{{prompt}}\n\n请只输出 JSON，字段：overview（字符串）, flows（字符串数组）, considerations（字符串数组）。不要输出除 JSON 以外的任何内容。"
+    },
+    "tasks": {
+      "label": "任务生成",
+      "scenario": "在设计确认后调用。用于将设计草案拆成 tasks.md 的任务列表（模块/交付物级别，禁止原子化），并显式声明 dependencies 以便后续 DAG 并发编排与冲突预警。",
+      "variables": ["design", "prompt", "minTasks", "maxTasks"],
+      "system": "你是项目任务拆解助手。按 docs/任务编排.md 输出模块级任务清单与依赖拓扑。只输出 JSON，不要解释，不要包含分析或思考过程。",
+      "user": "设计内容如下：\n{{design}}\n\n补充描述：{{prompt}}\n\n请按 docs/任务编排.md 生成任务清单，严格只输出 JSON：\n{\"tasks\":[{\"id\":\"TASK_ID\",\"title\":\"动宾结构\",\"description\":\"任务目标契约（输入/输出/验收点）\",\"dependencies\":[\"PREV_TASK_ID\"],\"scope\":[\"/path\"],\"estimated_complexity\":\"Low|Medium|High\"}]}\n\n要求：\n- 任务粒度：模块级/交付物级；严禁原子级/指令级拆解；总数 ≤ {{maxTasks}} 且必须 ≤ 25；建议 ≥ {{minTasks}}。\n- dependencies 必须仅引用本次输出中的 id；无依赖填 []。\n- scope：建议主要修改的文件范围（仓库相对路径或目录前缀），尽量减少重叠以降低冲突。\n- estimated_complexity 只能是 Low/Medium/High。\n- 只输出 JSON。"
+    },
+    "reportScore": {
+      "label": "流程报告评分",
+      "scenario": "在生成 flow report 后调用。用于从 requirements/design/tasks 快照中评审“任务拆解质量（任务级 DAG）”并打分，同时输出可直接作为下一轮生成约束的 suggestions。",
+      "variables": ["specName", "prompt", "requirements", "design", "tasks"],
+      "system": "你是项目经理 + 资深工程评审。你将对 planA 的“任务拆解质量（任务级 DAG）”打分。只输出 JSON，不要解释。",
+      "user": "Spec：{{specName}}\n原始需求：{{prompt}}\n\n以下是该需求的核心文档快照：\n\n【requirements.md】\n{{requirements}}\n\n【design.md】\n{{design}}\n\n【tasks.md】\n{{tasks}}\n\n请按“任务粒度合理性 + DAG 依赖质量 + scope 冲突可控性 + 可验收性”评审并评分（0-100）。\n请严格只输出 JSON，字段必须包含：\n- score：0-100 的整数\n- summary：一句话总评\n- strengths：3-8 条字符串数组\n- weaknesses：3-8 条字符串数组\n- suggestions：3-10 条字符串数组（每条以“必须/禁止/确保”开头，可直接作为下一轮约束）"
+    },
+    "mvp5Plan": {
+      "label": "MVP5 执行方案生成",
+      "scenario": "在 MVP5 智能任务编排中调用。输入为 DAG（任务/依赖/风险/交互）摘要，输出为可落地的执行方案：并发 <= 8、禁止一任务一终端、按 worker 池复用，并给出默认 CLI 与必要 overrides。",
+      "variables": ["specId", "maxCliConcurrency", "cliAvailability", "tasks", "dependencies", "summary"],
+      "system": "你是资深“任务编排 / 执行计划”专家。目标：给出可落地的 CLI 执行方案（并发受限、避免一任务一终端）。只输出 JSON，不要解释，不要包含分析或思考过程。",
+      "user": "SpecId：{{specId}}\n并发硬上限：{{maxCliConcurrency}}（必须 <= 8）\n可用 CLI：{{cliAvailability}}\n\n任务清单（id｜title｜risk｜interaction）：\n{{tasks}}\n\n已识别依赖（from -> to｜type｜strength）：\n{{dependencies}}\n\n摘要：{{summary}}\n\n请严格只输出 JSON，必须包含字段：\n- maxCliConcurrency：整数 1-8，且必须 <= 并发硬上限（建议值）\n- defaultCli：\"codex\" 或 \"claude\"（默认分配）\n- cliOverrides：对象，key 为 taskId，value 为 \"codex\" 或 \"claude\"（只写与 defaultCli 不同的任务）\n- rationale：一句话说明方案（简体中文）\n要求：\n- 禁止输出“每个任务一个 CLI/终端”的方案；必须假设用固定数量 worker 池复用（上限 = maxCliConcurrency）\n- 若任务包含人工交互/高风险操作，建议降低并发并在 rationale 中点明"
+    }
+  }
+}

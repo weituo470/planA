@@ -29,9 +29,21 @@ const PORT = process.env.WORKFLOW_BRIDGE_PORT || 4100;
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const EVENT_LOG = path.join(DATA_DIR, 'events.jsonl');
 const LLM_CONFIG_FILE = path.join(DATA_DIR, 'llm-config.json');
-const PROMPT_CONFIG_FILE = path.join(DATA_DIR, 'prompt-config.json');
+// Prompts are editable via Dashboard and stored in a single, repo-local file for easy management.
+const PROMPT_CONFIG_FILE = path.resolve(__dirname, '..', '..', 'workflow', 'prompt-config.json');
+// Reset-to-defaults reads from this repo-tracked baseline file.
+const PROMPT_CONFIG_DEFAULTS_FILE = path.resolve(
+  __dirname,
+  '..',
+  '..',
+  'workflow',
+  'prompt-config.defaults.json',
+);
+// Backward-compat: previous versions stored prompts under bridge/data (ignored by git).
+const PROMPT_CONFIG_LEGACY_FILE = path.join(DATA_DIR, 'prompt-config.json');
 const PROMPT_PRESETS_FILE = path.join(DATA_DIR, 'prompt-presets.json');
 const WORKSPACE_CONFIG_FILE = path.join(DATA_DIR, 'workspace-config.json');
+const CLI_TOOLS_CONFIG_FILE = path.join(DATA_DIR, 'cli-tools.json');
 const ROOT_DIR = path.resolve(__dirname, '..', '..', '..');
 const REPO_DIR = path.resolve(__dirname, '..', '..');
 const DOCS_DIR = path.join(REPO_DIR, 'docs');
@@ -74,12 +86,11 @@ const reportScoreJobs = new Map();
 
 const fileSnapshots = new Map();
 let isPaused = false;
-const SPEC_ARTIFACTS = ['requirements', 'design', 'tasks', 'tasks_atomic'];
+const SPEC_ARTIFACTS = ['requirements', 'design', 'tasks'];
 const SPEC_TEMPLATES = {
   requirements: `# 需求（requirements）\n\n## 背景\n\n## 用户故事\n\n## 验收标准（EARS）\n- 当[条件/事件]时，系统应[期望行为]。\n`,
   design: `# 设计（design）\n\n## 架构概览\n\n## 关键流程/时序\n\n## 实现考虑\n`,
-  tasks: `# 任务（tasks）\n\n## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务总览与回写入口（范围约束 / 验收记录）。\n- AI IDE 开发时优先按 tasks_atomic.md 逐条执行；完成情况与关键变更回写到 tasks.md，保持任务与代码同步。\n- 如发现遗漏或范围变化：先更新 tasks.md，再重新生成 tasks_atomic.md 后继续。\n\n## 任务清单\n\n- [ ] 1. \n- [ ] 2. \n- [ ] 3. \n`,
-  tasks_atomic: `# 任务原子化（tasks_atomic）\n\n## 使用说明\n- 本文件由 tasks.md 原子化拆解生成，作为 AI IDE 开发的首选执行清单（逐条勾选、逐条验收）。\n- 原子化过程会按条追加写入，若中断可再次“开始原子化”继续。\n\n## 原子任务清单\n\n- [ ] 1. \n- [ ] 2. \n- [ ] 3. \n`,
+  tasks: `# 任务（tasks）\n\n## 说明\n- 任务粒度：模块级/交付物级（建议 ≤ 25），不要原子化。\n- 编排系统会解析下方 TASKS_JSON 区块生成 DAG，并据此限制并发（≤ 8）调度 CLI worker 池。\n- 参考：docs/任务编排.md\n\n## TASKS_JSON\n{\n  \"tasks\": []\n}\n## END_TASKS_JSON\n\n## 回写记录\n- （可选）记录实现进度、关键变更与验证结果。\n`,
 };
 const DEFAULT_SPEC_STATUS = {
   requirementsConfirmed: false,
@@ -132,19 +143,28 @@ const LLM_MODEL_ALIASES = {
 
 const PROMPT_STAGE_KEYS = [
   'projectCategory',
-  'requirements',
   'requirementsClarifications',
+  'requirements',
   'design',
   'tasks',
-  'atomize',
   'reportScore',
+  'mvp5Plan',
 ];
 
 const DEFAULT_PROMPT_CONFIG = {
-  version: 3,
+  version: 5,
+  meta: {
+    projectOverview:
+      '本文件集中管理本项目所有可编辑的 LLM 提示词模板（system/user）。\n' +
+      '每个 stages.<key> 对应一个自动化步骤：生成/澄清/评分/编排；Bridge 调用模型时会读取这里的模板，并用 {{变量}} 注入上下文。\n' +
+      '统一约定：默认只输出 JSON（不要 Markdown/解释），以便被程序可靠解析。\n' +
+      'MVP5 智能任务编排会优先使用 Claude 4.5 Opus（claude-opus-4-5-20251101）生成“并发受限、worker 池复用”的执行方案；失败会自动降级为规则方案。',
+  },
   stages: {
     projectCategory: {
       label: '项目类型识别',
+      scenario:
+        '在创建/更新 Spec 时调用。用于判断输入需求属于“软件项目”还是“非软件项目”，并输出 projectCategory 供 UI 与后续流程分支使用。',
       variables: ['prompt'],
       system:
         '你是项目类型识别助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
@@ -158,17 +178,22 @@ const DEFAULT_PROMPT_CONFIG = {
     },
     requirements: {
       label: '需求生成',
-      variables: ['prompt'],
+      scenario:
+        '在用户完成“提问确认”并提交回答后调用。用于生成 requirements.md 的结构化内容（background/user_stories/acceptance），并综合用户回答的澄清结论，且 acceptance 必须是可验证语句。',
+      variables: ['prompt', 'clarificationsSummary'],
       system:
         '你是产品需求助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
       user:
         `需求描述：{{prompt}}\n\n` +
+        `需求澄清结论（来自用户回答，可能为空）：\n{{clarificationsSummary}}\n\n` +
         '请只输出 JSON，必须包含字段：background（字符串）, user_stories（字符串数组）, acceptance（字符串数组）。\n' +
         '要求：所有内容必须为简体中文；acceptance 每条为“当...时，系统应...”风格的可验证语句。\n' +
         '不要输出除 JSON 以外的任何内容。',
     },
     requirementsClarifications: {
       label: '需求确认问题生成',
+      scenario:
+        '在用户提交“原始需求”后调用。用于产出可点击选项的澄清问题列表，帮助用户确认口径与边界（questions 数组）。',
       variables: ['prompt'],
       system:
         '你是需求澄清助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
@@ -183,6 +208,8 @@ const DEFAULT_PROMPT_CONFIG = {
     },
     design: {
       label: '设计生成',
+      scenario:
+        '在需求确认后调用。用于基于 requirements + prompt 生成 design.md 草案（overview/flows/considerations），为任务拆解提供依据。',
       variables: ['requirements', 'prompt'],
       system:
         '你是软件设计助手。只输出 JSON，不要解释，不要包含分析或思考过程。',
@@ -192,6 +219,8 @@ const DEFAULT_PROMPT_CONFIG = {
     },
 	    tasks: {
 	      label: '任务生成',
+	      scenario:
+	        '在设计确认后调用。用于将设计草案拆成 tasks.md 的任务列表（模块/流程级别，不要求原子化），并要求每条任务可执行、可验收、无占位符路径。',
 	      variables: ['design', 'prompt', 'minTasks', 'maxTasks'],
 	      system:
 	        '你是项目任务拆解助手。你的输出将作为后续“任务原子化”的输入，并会交付给 AI IDE 执行。只输出 JSON，不要解释。',
@@ -211,6 +240,8 @@ const DEFAULT_PROMPT_CONFIG = {
 	    },
 	    atomize: {
 	      label: '任务原子化',
+	      scenario:
+	        '在任务页点击“开始原子化”时调用。用于把 tasks.md 拆成 tasks_atomic.md（单任务单文件、5-10 分钟可完成、包含明确路径/命令/验收），并显式声明依赖以避免冲突。',
 	      variables: ['context', 'main', 'reasonBlock'],
 	      system:
 	        'Role: 硬核工程架构师 (Hardcore Engineering Lead)。你擅长把任务拆解为“原子级执行指令”。只输出 JSON。',
@@ -236,6 +267,8 @@ const DEFAULT_PROMPT_CONFIG = {
 	    },
     reportScore: {
       label: '流程报告评分',
+      scenario:
+        '在生成 flow report 后调用。用于从 requirements/design/tasks/tasks_atomic 快照中评审原子任务质量并打分，同时输出可直接作为下一轮生成约束的 suggestions。',
       variables: [
         'specName',
         'prompt',
@@ -269,6 +302,31 @@ const DEFAULT_PROMPT_CONFIG = {
         '- weaknesses：3-8 条字符串数组\n' +
         '- suggestions：3-10 条字符串数组（每条以“必须/禁止/确保”开头，可直接作为下一轮约束）\n',
     },
+    mvp5Plan: {
+      label: 'MVP5 执行方案生成',
+      scenario:
+        '在 MVP5 智能任务编排中调用。输入为 DAG（任务/依赖/风险/交互）摘要，输出为可落地的执行方案：并发 <= 8、禁止一任务一终端、按 worker 池复用，并给出默认 CLI 与必要 overrides。',
+      variables: ['specId', 'maxCliConcurrency', 'cliAvailability', 'tasks', 'dependencies', 'summary'],
+      system:
+        '你是资深“任务编排 / 执行计划”专家。目标：给出可落地的 CLI 执行方案（并发受限、避免一任务一终端）。只输出 JSON，不要解释，不要包含分析或思考过程。',
+      user:
+        `SpecId：{{specId}}\n` +
+        `并发硬上限：{{maxCliConcurrency}}（必须 <= 8）\n` +
+        `可用 CLI：{{cliAvailability}}\n\n` +
+        '任务清单（id｜title｜risk｜interaction）：\n' +
+        '{{tasks}}\n\n' +
+        '已识别依赖（from -> to｜type｜strength）：\n' +
+        '{{dependencies}}\n\n' +
+        '摘要：{{summary}}\n\n' +
+        '请严格只输出 JSON，必须包含字段：\n' +
+        '- maxCliConcurrency：整数 1-8，且必须 <= 并发硬上限（建议值）\n' +
+        '- defaultCli：\"codex\" 或 \"claude\"（默认分配）\n' +
+        '- cliOverrides：对象，key 为 taskId，value 为 \"codex\" 或 \"claude\"（只写与 defaultCli 不同的任务）\n' +
+        '- rationale：一句话说明方案（简体中文）\n' +
+        '要求：\n' +
+        '- 禁止输出“每个任务一个 CLI/终端”的方案；必须假设用固定数量 worker 池复用（上限 = maxCliConcurrency）\n' +
+        '- 若任务包含人工交互/高风险操作，建议降低并发并在 rationale 中点明\n',
+    },
   },
 };
 
@@ -290,6 +348,14 @@ function normalizePromptConfig(input) {
   const defaults = cloneJson(DEFAULT_PROMPT_CONFIG);
   const raw = input && typeof input === 'object' ? input : {};
   const rawStages = raw?.stages && typeof raw.stages === 'object' ? raw.stages : {};
+  const rawMeta = raw?.meta && typeof raw.meta === 'object' ? raw.meta : {};
+
+  const meta = {
+    projectOverview:
+      typeof rawMeta.projectOverview === 'string'
+        ? rawMeta.projectOverview.slice(0, 20000)
+        : defaults?.meta?.projectOverview || '',
+  };
 
   const stages = {};
   for (const key of PROMPT_STAGE_KEYS) {
@@ -303,6 +369,10 @@ function normalizePromptConfig(input) {
         typeof candidate.label === 'string' && candidate.label.trim()
           ? candidate.label.trim()
           : fallback.label,
+      scenario:
+        typeof candidate.scenario === 'string'
+          ? candidate.scenario.slice(0, 20000)
+          : (fallback.scenario || ''),
       variables: Array.isArray(candidate.variables)
         ? candidate.variables.map((v) => String(v)).filter(Boolean)
         : fallback.variables,
@@ -317,6 +387,7 @@ function normalizePromptConfig(input) {
   return {
     version: defaults.version,
     updatedAt,
+    meta,
     stages,
   };
 }
@@ -326,6 +397,44 @@ function migratePromptConfig(normalized) {
   const current = normalized && typeof normalized === 'object' ? normalized : normalizePromptConfig({});
   const next = cloneJson(current);
   let changed = false;
+
+  if (!next.meta || typeof next.meta !== 'object') {
+    next.meta = cloneJson(defaults.meta || { projectOverview: '' });
+    changed = true;
+  } else if (typeof next.meta.projectOverview !== 'string') {
+    next.meta.projectOverview = String(defaults?.meta?.projectOverview || '');
+    changed = true;
+  }
+
+  for (const key of PROMPT_STAGE_KEYS) {
+    if (!next?.stages?.[key] || typeof next.stages[key] !== 'object') continue;
+    if (typeof next.stages[key].scenario !== 'string' || !next.stages[key].scenario.trim()) {
+      next.stages[key].scenario = String(defaults?.stages?.[key]?.scenario || '');
+      changed = true;
+    }
+  }
+
+  // Ensure requirements stage can consume clarification answers.
+  const reqStage = next?.stages?.requirements && typeof next.stages.requirements === 'object'
+    ? next.stages.requirements
+    : null;
+  if (reqStage) {
+    const vars = Array.isArray(reqStage.variables) ? reqStage.variables.map((v) => String(v)) : [];
+    if (!vars.includes('clarificationsSummary')) {
+      reqStage.variables = Array.from(new Set([...vars, 'clarificationsSummary'])).filter(Boolean);
+      changed = true;
+    }
+    const user = typeof reqStage.user === 'string' ? reqStage.user : '';
+    if (user && !user.includes('{{clarificationsSummary}}')) {
+      const injection = `\n\n需求澄清结论（来自用户回答，可能为空）：\n{{clarificationsSummary}}\n\n`;
+      if (user.includes('请只输出 JSON')) {
+        reqStage.user = user.replace('请只输出 JSON', `${injection}请只输出 JSON`);
+      } else {
+        reqStage.user = `${user}${injection}`;
+      }
+      changed = true;
+    }
+  }
 
   const atomizeUser = next?.stages?.atomize?.user;
   if (typeof atomizeUser === 'string' && atomizeUser.includes('路径不确定用 TBD')) {
@@ -346,15 +455,61 @@ function migratePromptConfig(normalized) {
   return { changed, config: next };
 }
 
+function loadPromptDefaultsRaw() {
+  if (fs.existsSync(PROMPT_CONFIG_DEFAULTS_FILE)) {
+    try {
+      return JSON.parse(fs.readFileSync(PROMPT_CONFIG_DEFAULTS_FILE, 'utf8'));
+    } catch {
+      // fall through to embedded defaults
+    }
+  }
+  return cloneJson(DEFAULT_PROMPT_CONFIG);
+}
+
+function loadPromptDefaults() {
+  return normalizePromptConfig(loadPromptDefaultsRaw());
+}
+
 function loadPromptConfig() {
-  if (!fs.existsSync(PROMPT_CONFIG_FILE)) return normalizePromptConfig({});
+  if (!fs.existsSync(PROMPT_CONFIG_FILE)) {
+    // Migrate from legacy location if present.
+    if (fs.existsSync(PROMPT_CONFIG_LEGACY_FILE)) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(PROMPT_CONFIG_LEGACY_FILE, 'utf8'));
+        return persistPromptConfig(raw);
+      } catch {
+        // fall through to defaults
+      }
+    }
+    try {
+      return persistPromptConfig(loadPromptDefaultsRaw());
+    } catch {
+      return loadPromptDefaults();
+    }
+  }
   try {
     const raw = JSON.parse(fs.readFileSync(PROMPT_CONFIG_FILE, 'utf8'));
     const normalized = normalizePromptConfig(raw);
     const migrated = migratePromptConfig(normalized);
-    if (migrated.changed) {
+
+    // If older configs were missing documentation fields, persist the normalized version once.
+    let shouldPersist = Boolean(migrated.changed);
+    const rawMeta = raw?.meta && typeof raw.meta === 'object' ? raw.meta : null;
+    if (!rawMeta || typeof rawMeta.projectOverview !== 'string') {
+      shouldPersist = true;
+    }
+    const rawStages = raw?.stages && typeof raw.stages === 'object' ? raw.stages : null;
+    for (const key of PROMPT_STAGE_KEYS) {
+      const stage = rawStages && rawStages[key] && typeof rawStages[key] === 'object' ? rawStages[key] : null;
+      if (!stage || typeof stage.scenario !== 'string') {
+        shouldPersist = true;
+        break;
+      }
+    }
+
+    if (shouldPersist) {
       try {
-        persistPromptConfig(migrated.config);
+        return persistPromptConfig(migrated.config);
       } catch {
         // ignore migration write failures
       }
@@ -362,14 +517,18 @@ function loadPromptConfig() {
     }
     return normalized;
   } catch {
-    return normalizePromptConfig({});
+    try {
+      return persistPromptConfig(loadPromptDefaultsRaw());
+    } catch {
+      return loadPromptDefaults();
+    }
   }
 }
 
 function persistPromptConfig(nextConfig) {
   const normalized = normalizePromptConfig(nextConfig);
   const persisted = { ...normalized, updatedAt: new Date().toISOString() };
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.mkdirSync(path.dirname(PROMPT_CONFIG_FILE), { recursive: true });
   fs.writeFileSync(PROMPT_CONFIG_FILE, JSON.stringify(persisted, null, 2), 'utf8');
   return persisted;
 }
@@ -391,6 +550,207 @@ function persistPromptPresets(presets) {
     JSON.stringify(presets || [], null, 2),
     'utf8',
   );
+}
+
+const DEFAULT_CLI_TOOLS_CONFIG = {
+  version: 1,
+  tools: [
+    {
+      id: 'codex-cli',
+      label: 'Codex CLI',
+      command: 'cmd.exe',
+      args: ['/d', '/s', '/c', 'codex'],
+      baseUrl: '',
+      apiKey: '',
+      baseUrlEnvKey: '',
+      apiKeyEnvKey: '',
+      env: {},
+    },
+    {
+      id: 'claude-code-auto',
+      label: 'Claude Code（全自动）',
+      command: 'cmd.exe',
+      args: ['/d', '/s', '/c', 'claude', '--dangerously-skip-permissions'],
+      baseUrl: '',
+      apiKey: '',
+      baseUrlEnvKey: '',
+      apiKeyEnvKey: '',
+      env: {},
+    },
+  ],
+};
+
+function sanitizeEnvVarName(value) {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw) return '';
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(raw)) return '';
+  return raw.slice(0, 64);
+}
+
+function normalizeCliToolId(value) {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw) return '';
+  const normalized = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+/, '')
+    .replace(/-+$/, '');
+  return normalized.slice(0, 48);
+}
+
+function normalizeCliToolArgs(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((v) => (typeof v === 'string' ? v.trim() : ''))
+    .filter(Boolean)
+    .slice(0, 40)
+    .map((v) => v.slice(0, 240));
+}
+
+function normalizeCliToolEnv(value) {
+  const obj = value && typeof value === 'object' ? value : null;
+  if (!obj) return {};
+  const env = {};
+  for (const [key, val] of Object.entries(obj)) {
+    const envKey = sanitizeEnvVarName(key);
+    if (!envKey) continue;
+    const envVal = typeof val === 'string' ? val : val == null ? '' : String(val);
+    env[envKey] = envVal.slice(0, 2000);
+  }
+  return env;
+}
+
+function normalizeCliToolBaseUrl(value) {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw) return '';
+  try {
+    const u = new URL(raw);
+    if (!/^https?:$/.test(u.protocol)) return '';
+  } catch {
+    return '';
+  }
+  return raw.slice(0, 400);
+}
+
+function normalizeCliToolApiKey(value) {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw) return '';
+  return raw.slice(0, 4000);
+}
+
+function normalizeCliToolInput(input, existing = null) {
+  const obj = input && typeof input === 'object' ? input : {};
+  const prev = existing && typeof existing === 'object' ? existing : null;
+
+  const label = typeof obj.label === 'string' ? obj.label.trim().slice(0, 60) : prev?.label || '';
+  const command =
+    typeof obj.command === 'string' ? obj.command.trim().slice(0, 260) : prev?.command || '';
+  const args = Object.prototype.hasOwnProperty.call(obj, 'args')
+    ? normalizeCliToolArgs(obj.args)
+    : prev?.args || [];
+
+  const baseUrl = Object.prototype.hasOwnProperty.call(obj, 'baseUrl')
+    ? normalizeCliToolBaseUrl(obj.baseUrl)
+    : prev?.baseUrl || '';
+
+  const baseUrlEnvKey = Object.prototype.hasOwnProperty.call(obj, 'baseUrlEnvKey')
+    ? sanitizeEnvVarName(obj.baseUrlEnvKey)
+    : prev?.baseUrlEnvKey || '';
+
+  const apiKeyEnvKey = Object.prototype.hasOwnProperty.call(obj, 'apiKeyEnvKey')
+    ? sanitizeEnvVarName(obj.apiKeyEnvKey)
+    : prev?.apiKeyEnvKey || '';
+
+  let apiKey = prev?.apiKey || '';
+  if (Object.prototype.hasOwnProperty.call(obj, 'clearApiKey') && obj.clearApiKey === true) {
+    apiKey = '';
+  } else if (typeof obj.apiKey === 'string' && obj.apiKey.trim()) {
+    apiKey = normalizeCliToolApiKey(obj.apiKey);
+  }
+
+  const env = Object.prototype.hasOwnProperty.call(obj, 'env')
+    ? normalizeCliToolEnv(obj.env)
+    : prev?.env || {};
+
+  return {
+    id: prev?.id || '',
+    label,
+    command,
+    args,
+    baseUrl,
+    apiKey,
+    baseUrlEnvKey,
+    apiKeyEnvKey,
+    env,
+  };
+}
+
+function loadCliToolsConfig() {
+  const defaults = cloneJson(DEFAULT_CLI_TOOLS_CONFIG);
+  if (!fs.existsSync(CLI_TOOLS_CONFIG_FILE)) return defaults;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(CLI_TOOLS_CONFIG_FILE, 'utf8'));
+    const rawTools = Array.isArray(parsed?.tools) ? parsed.tools : [];
+    const normalized = rawTools
+      .map((t) => (t && typeof t === 'object' ? t : null))
+      .filter(Boolean)
+      .map((t) => {
+        const id = normalizeCliToolId(t.id);
+        if (!id) return null;
+        return normalizeCliToolInput(t, { id });
+      })
+      .filter(Boolean);
+
+    // Merge persisted config on top of built-in defaults so Codex/Claude templates
+    // remain available for reference.
+    const byId = new Map();
+    (defaults.tools || []).forEach((tool) => {
+      if (tool?.id) byId.set(String(tool.id), tool);
+    });
+    normalized.forEach((tool) => {
+      if (tool?.id) byId.set(String(tool.id), tool);
+    });
+    const mergedTools = Array.from(byId.values());
+
+    return { ...defaults, ...parsed, tools: mergedTools };
+  } catch {
+    return defaults;
+  }
+}
+
+function persistCliToolsConfig(nextConfig) {
+  const cfg = nextConfig && typeof nextConfig === 'object' ? nextConfig : {};
+  const rawTools = Array.isArray(cfg.tools) ? cfg.tools : [];
+  const tools = rawTools
+    .map((t) => (t && typeof t === 'object' ? t : null))
+    .filter(Boolean)
+    .map((t) => {
+      const id = normalizeCliToolId(t.id);
+      if (!id) return null;
+      return normalizeCliToolInput(t, { id });
+    })
+    .filter(Boolean);
+  const next = { ...DEFAULT_CLI_TOOLS_CONFIG, ...cfg, tools, updatedAt: new Date().toISOString() };
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(CLI_TOOLS_CONFIG_FILE, JSON.stringify(next, null, 2), 'utf8');
+  return next;
+}
+
+function toPublicCliTool(tool) {
+  const obj = tool && typeof tool === 'object' ? tool : {};
+  return {
+    id: String(obj.id || ''),
+    label: String(obj.label || ''),
+    command: String(obj.command || ''),
+    args: Array.isArray(obj.args) ? obj.args : [],
+    baseUrl: obj.baseUrl ? String(obj.baseUrl) : '',
+    baseUrlPresent: Boolean(obj.baseUrl),
+    apiKeyPresent: Boolean(obj.apiKey),
+    baseUrlEnvKey: obj.baseUrlEnvKey ? String(obj.baseUrlEnvKey) : '',
+    apiKeyEnvKey: obj.apiKeyEnvKey ? String(obj.apiKeyEnvKey) : '',
+    env: obj.env && typeof obj.env === 'object' ? obj.env : {},
+  };
 }
 
 function normalizePresetName(name) {
@@ -1334,7 +1694,6 @@ function buildFlowReportMarkdown(specName, status, run, artifacts) {
   const requirements = artifacts?.requirements || '';
   const design = artifacts?.design || '';
   const tasks = artifacts?.tasks || '';
-  const tasksAtomic = artifacts?.tasks_atomic || '';
 
   const projectCategory = normalizeProjectCategoryValue(status?.projectCategory) || 'unknown';
   const projectCategoryMeta =
@@ -1485,12 +1844,6 @@ function buildFlowReportMarkdown(specName, status, run, artifacts) {
     tasks,
     '```',
     '',
-    '### tasks_atomic.md',
-    '',
-    '```markdown',
-    tasksAtomic,
-    '```',
-    '',
     '## 6) 报告评分（任务拆解质量，0-100）',
     '',
     '### 模型评分',
@@ -1535,7 +1888,6 @@ function extractArtifactsFromFlowReportMarkdown(markdown) {
     requirements: 'requirements.md',
     design: 'design.md',
     tasks: 'tasks.md',
-    tasks_atomic: 'tasks_atomic.md',
   };
   const keyByHeader = Object.fromEntries(Object.entries(headerByKey).map(([k, v]) => [v, k]));
 
@@ -2407,6 +2759,54 @@ function buildClarificationsSummary(clarifications) {
   return `需求澄清结论：\n${lines.join('\n')}`.trim();
 }
 
+function buildRequirementsClarificationsMarkdown(questions) {
+  const normalized = normalizeRequirementsClarifications({ questions });
+  if (!normalized.questions.length) return '';
+  const lines = [];
+  lines.push('## 需求确认', '');
+  normalized.questions.forEach((q, idx) => {
+    const selectedIds = Array.isArray(q.answer?.selectedOptionIds) ? q.answer.selectedOptionIds : [];
+    const selectedLabels = (q.options || [])
+      .filter((opt) => selectedIds.includes(opt.id))
+      .map((opt) => opt.label)
+      .filter(Boolean);
+    const otherText = sanitizeReviewText(q.answer?.otherText, 2000);
+    lines.push(`### Q${idx + 1}. ${q.question}`);
+    lines.push(`- 选择：${selectedLabels.length ? selectedLabels.join('、') : '（未选择）'}`);
+    if (q.allowOther) lines.push(`- 补充：${otherText ? otherText : '（无）'}`);
+    lines.push('');
+  });
+  return lines.join('\n').trimEnd();
+}
+
+function upsertRequirementsClarificationsSection(markdown, questions) {
+  const section = buildRequirementsClarificationsMarkdown(questions);
+  if (!section) return (markdown ?? '').trimEnd();
+  const text = markdown ?? '';
+  const re = /^## 需求(?:澄清|确认)[\s\S]*?(?=\n## |\n# |$)/m;
+  let base = text;
+  if (re.test(base)) {
+    base = base.replace(re, '').trimEnd();
+  }
+
+  const backgroundHeading = /^##\s*背景\s*$/m.exec(base);
+  if (backgroundHeading) {
+    const insertAt = backgroundHeading.index;
+    return `${base.slice(0, insertAt).trimEnd()}\n\n${section}\n\n${base
+      .slice(insertAt)
+      .trimStart()}`.trimEnd();
+  }
+
+  const afterOriginal = /(## 原始需求[\s\S]*?)(\n## |\n# |$)/m.exec(base);
+  if (afterOriginal) {
+    const insertAt = afterOriginal.index + afterOriginal[1].length;
+    return `${base.slice(0, insertAt).trimEnd()}\n\n${section}\n\n${base
+      .slice(insertAt)
+      .trimStart()}`.trimEnd();
+  }
+  return `${base.trimEnd()}\n\n${section}\n`.trimEnd();
+}
+
 function buildTechStackSummary(clarifications) {
   const normalized = normalizeRequirementsClarifications(clarifications || {});
   if (!normalized.questions.length) return '';
@@ -3170,6 +3570,105 @@ async function generateClarificationsWithModel(prompt, options = {}) {
   }
 }
 
+function buildDefaultRequirementsClarificationQuestions(prompt) {
+  const now = new Date().toISOString();
+  const summary = summarizeForTemplate(normalizePrompt(prompt), 24);
+  const suffix = summary ? `（围绕：${summary}）` : '';
+  return [
+    {
+      id: 'goal',
+      question: `你希望本次交付的目标是什么${suffix}？`,
+      mode: 'single',
+      required: true,
+      allowOther: true,
+      options: [
+        { id: 'mvp', label: '交付可用 MVP（先跑通核心流程）' },
+        { id: 'prod', label: '可上线/可部署版本（稳定性优先）' },
+        { id: 'poc', label: '概念验证（PoC）' },
+        { id: 'refine', label: '在现有功能上迭代优化' },
+      ],
+      answer: { selectedOptionIds: [], otherText: '' },
+      createdAt: now,
+    },
+    {
+      id: 'users',
+      question: '主要用户/角色有哪些？',
+      mode: 'multi',
+      required: true,
+      allowOther: true,
+      options: [
+        { id: 'admin', label: '管理员/运营' },
+        { id: 'employee', label: '员工/内部用户' },
+        { id: 'customer', label: '外部用户/客户' },
+        { id: 'guest', label: '游客/匿名访问' },
+      ],
+      answer: { selectedOptionIds: [], otherText: '' },
+      createdAt: now,
+    },
+    {
+      id: 'features',
+      question: '最关键的 3-5 个功能点是什么？',
+      mode: 'multi',
+      required: true,
+      allowOther: true,
+      options: [
+        { id: 'auth', label: '登录/鉴权' },
+        { id: 'crud', label: '数据管理（增删改查）' },
+        { id: 'workflow', label: '流程/审批/状态流转' },
+        { id: 'export', label: '导出/报表' },
+        { id: 'notify', label: '通知（站内/邮件/短信等）' },
+      ],
+      answer: { selectedOptionIds: [], otherText: '' },
+      createdAt: now,
+    },
+    {
+      id: 'data',
+      question: '是否需要持久化数据？',
+      mode: 'single',
+      required: true,
+      allowOther: true,
+      options: [
+        { id: 'db', label: '需要数据库持久化' },
+        { id: 'file', label: '只需文件/本地存储' },
+        { id: 'none', label: '不需要持久化（纯展示/计算）' },
+        { id: 'unknown', label: '暂不确定' },
+      ],
+      answer: { selectedOptionIds: [], otherText: '' },
+      createdAt: now,
+    },
+    {
+      id: 'integration',
+      question: '是否需要对接外部系统/第三方接口？',
+      mode: 'single',
+      required: true,
+      allowOther: true,
+      options: [
+        { id: 'none', label: '不需要' },
+        { id: 'third', label: '需要第三方 API' },
+        { id: 'internal', label: '需要对接现有内部系统' },
+        { id: 'import', label: '需要导入/同步数据（CSV/Excel/API）' },
+      ],
+      answer: { selectedOptionIds: [], otherText: '' },
+      createdAt: now,
+    },
+    {
+      id: 'boundaries',
+      question: '本期明确不做/可延后的内容有哪些？',
+      mode: 'multi',
+      required: true,
+      allowOther: true,
+      options: [
+        { id: 'payment', label: '支付/计费' },
+        { id: 'rbac', label: '复杂权限体系（RBAC/多租户）' },
+        { id: 'mobile', label: '移动端/小程序适配' },
+        { id: 'bi', label: '复杂报表/大屏可视化' },
+      ],
+      answer: { selectedOptionIds: [], otherText: '' },
+      createdAt: now,
+    },
+  ];
+}
+
 function ensureRequirementsClarificationsSeeded(specName, status, prompt) {
   const normalized = { ...DEFAULT_SPEC_STATUS, ...status };
   const current = normalizeRequirementsClarifications(
@@ -3177,7 +3676,24 @@ function ensureRequirementsClarificationsSeeded(specName, status, prompt) {
   );
   if (normalized.requirementsConfirmed) return { changed: false, status: normalized };
   if (current.questions.length > 0) return { changed: false, status: normalized };
-  return { changed: false, status: normalized };
+  const seed = buildDefaultRequirementsClarificationQuestions(prompt);
+  const normalizedSeed = normalizeRequirementsClarifications({ questions: seed });
+  if (!normalizedSeed.questions.length) return { changed: false, status: normalized };
+
+  const now = new Date().toISOString();
+  const next = {
+    ...normalized,
+    requirementsClarifications: {
+      ...current,
+      questions: normalizedSeed.questions,
+      updatedAt: now,
+      confirmedAt: normalized.requirementsClarifications?.confirmedAt ?? null,
+      generatedBy: 'default',
+      generationError: null,
+    },
+  };
+  writeSpecStatus(specName, next);
+  return { changed: true, status: next };
 }
 
 function slugifyPrompt(prompt) {
@@ -3236,10 +3752,12 @@ function generateTasksContent(design, prompt) {
       extractOriginalRequirement(design) ||
       normalizePrompt(design),
   );
+  // 已切换为“任务级 DAG（TASKS_JSON）”编排；fallback 直接返回模板，避免生成过度拆解内容。
+  return SPEC_TEMPLATES.tasks;
   if (!summary) {
     return SPEC_TEMPLATES.tasks;
   }
-  return `# 任务（tasks）\n\n## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务总览与回写入口（范围约束 / 验收记录）。\n- AI IDE 开发时优先按 tasks_atomic.md（原子化任务表单）逐条执行；完成情况与关键变更回写到 tasks.md，保持任务与代码同步。\n- 如发现遗漏或范围变化：先更新 tasks.md，再重新生成 tasks_atomic.md 后继续。\n\n## 任务清单\n- [ ] 1. 梳理“${summary}”的模块清单与页面/服务边界。\n- [ ] 2. 明确最小可运行结构（入口、路由/页面、核心依赖）。\n- [ ] 3. 拆分关键流程并标注对应代码落点。\n- [ ] 4. 明确数据结构/接口草案（字段、命名、约束）。\n- [ ] 5. 记录需要的环境变量/配置项。\n- [ ] 6. 列出需要补齐的边界与异常场景。\n`;
+  return `# 任务（tasks）\n\n## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务总览与回写入口（范围约束 / 验收记录）。\n- AI IDE 开发时优先按 tasks_atomic.md（原子化任务表单）逐条执行；完成情况与关键变更回写到 tasks.md，保持任务与代码同步。\n- 如发现遗漏或范围变化：先更新 tasks.md，再重新生成 tasks_atomic.md 后继续。\n\n## 任务清单\n\n- [ ] **Task 1**: 梳理“${summary}”的模块清单与页面/服务边界\n  - **核心逻辑**: 明确交付范围（做什么/不做什么）与模块拆分边界。\n  - **技术细节**: 列出关键页面/组件/服务/数据流，并标注各自职责与输入输出。\n  - **依赖**: 无\n  - **验收准则 (AC)**: tasks.md 中写清模块清单与边界，且能指出 3 个关键落点。\n\n- [ ] **Task 2**: 明确最小可运行结构（入口、路由/页面、核心依赖）\n  - **核心逻辑**: 让项目在本地可启动并可访问核心页面/接口。\n  - **技术细节**: 明确启动命令、端口、路由与核心依赖；记录需要的环境变量。\n  - **依赖**:\n    - 模块清单与边界（来自 Task 1）\n  - **验收准则 (AC)**: 能提供可执行的启动与访问步骤（命令 + 访问地址/路径）。\n\n- [ ] **Task 3**: 拆分关键流程并标注对应代码落点\n  - **核心逻辑**: 将核心用户流程拆到可实现的步骤，并映射到代码落点。\n  - **技术细节**: 标注需要新增/修改的文件路径、关键函数/组件/接口名。\n  - **依赖**:\n    - 最小可运行结构（来自 Task 2）\n  - **验收准则 (AC)**: 至少输出 1 条端到端流程与对应落点清单。\n\n- [ ] **Task 4**: 明确数据结构/接口草案（字段、命名、约束）\n  - **核心逻辑**: 先定义数据结构/接口，再进入具体实现。\n  - **技术细节**: 给出字段列表、类型、校验规则与默认值，并说明与 UI/存储的关系。\n  - **依赖**:\n    - 关键流程与落点（来自 Task 3）\n  - **验收准则 (AC)**: 数据结构/接口草案可直接转为代码实现。\n\n- [ ] **Task 5**: 记录环境变量/配置项与运行约束\n  - **核心逻辑**: 将运行所需配置显式化，避免隐式假设。\n  - **技术细节**: 列出 Base URL / API Key / 端口 / 目录等配置项与默认值。\n  - **依赖**:\n    - 数据结构/接口草案（来自 Task 4）\n  - **验收准则 (AC)**: 至少列出 3 项配置及其作用与默认值。\n\n- [ ] **Task 6**: 补齐边界与异常场景清单\n  - **核心逻辑**: 覆盖失败/无权限/缺配置/网络异常等关键边界。\n  - **技术细节**: 针对每个边界给出处理策略与可观察的提示信息。\n  - **依赖**:\n    - 关键流程与接口草案（来自 Task 3/Task 4）\n  - **验收准则 (AC)**: 至少列出 6 个边界场景与对应处理策略。\n`;
 }
 
 function tryParseJson(text) {
@@ -3479,12 +3997,14 @@ function buildTasksMarkdown(prompt, payload) {
       core: '补全任务拆解与执行记录的基本说明。',
       details: '说明 tasks.md 的用途与使用方式。',
       ac: 'docs/ai_ide_guide.md 存在，且可阅读理解。',
+      depends: [],
     },
     {
       title: `创建 docs/project_skeleton.md｜验证：启动并能访问页面`,
       core: `梳理与“${fallbackSummary}”相关的最小可运行骨架。`,
       details: '包含基本路由/页面/启动脚本。',
       ac: '本地能启动并访问关键页面（以项目实际端口/路由为准）。',
+      depends: [],
     },
   ];
 
@@ -3503,16 +4023,52 @@ function buildTasksMarkdown(prompt, payload) {
       const safeAc =
         ac || '在 docs/assumptions.md 写清可复现的验收步骤（命令/接口/页面路径/可观察结果）。';
 
+      const depends = Array.isArray(t?.depends) ? t.depends : [];
+      const depItems = Array.from(new Set(depends))
+        .map((n) => (Number.isFinite(Number(n)) ? Math.floor(Number(n)) : -1))
+        .filter((n) => n >= 0 && n < list.length && n !== idx)
+        .slice(0, 12)
+        .map((depIdx) => {
+          const depTask = list[depIdx] || {};
+          const depTitle = sanitizeModelText(depTask.title || '', '').trim();
+          const label = depTitle || `Task ${depIdx + 1}`;
+          return `    - ${label}（来自 Task ${depIdx + 1}）`;
+        });
+      const depsBlock = depItems.length
+        ? ['  - **依赖**:', ...depItems].join('\n')
+        : '  - **依赖**: 无';
+
       return [
         `- [ ] **Task ${idx + 1}**: ${safeTitle}`,
         `  - **核心逻辑**: ${safeCore}`,
         `  - **技术细节**: ${safeDetails}`,
+        depsBlock,
         `  - **验收准则 (AC)**: ${safeAc}`,
       ].join('\n');
     })
     .join('\n\n');
 
   return `# 任务（tasks）\n\n${guide}\n\n${blocks}\n`;
+}
+
+function buildTasksDagMarkdown(payload) {
+  const rawTasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
+  const normalized = ensureUniqueDagTaskIds(
+    rawTasks.map((t, idx) => normalizeDagTaskObject(t, idx)).filter(Boolean),
+  );
+  const json = JSON.stringify({ tasks: normalized }, null, 2);
+  return (
+    `# 任务（tasks）\n\n` +
+    `## 说明\n` +
+    `- 任务粒度：模块级/交付物级（建议 ≤ 25），不要原子化。\n` +
+    `- 编排系统会解析下方 TASKS_JSON 区块生成 DAG，并据此限制并发（≤ 8）调度 CLI worker 池。\n` +
+    `- 参考：docs/任务编排.md\n\n` +
+    `## TASKS_JSON\n` +
+    `${json}\n` +
+    `## END_TASKS_JSON\n\n` +
+    `## 回写记录\n` +
+    `- （可选）记录实现进度、关键变更与验证结果。\n`
+  );
 }
 
 async function generateRequirementsWithModel(prompt, options = {}) {
@@ -3524,7 +4080,9 @@ async function generateRequirementsWithModel(prompt, options = {}) {
   const onTelemetry = typeof options?.onTelemetry === 'function' ? options.onTelemetry : null;
 
   const stageKey = 'requirements';
-  const variables = { prompt };
+  const clarificationsSummary =
+    typeof options?.clarificationsSummary === 'string' ? options.clarificationsSummary : '';
+  const variables = { prompt, clarificationsSummary };
   const promptTemplates = { system: stage.system, user: stage.user };
   const promptRendered = {
     system: applyPromptTemplate(stage.system, variables),
@@ -3690,7 +4248,219 @@ function normalizeTaskObject(task) {
   const core = String(obj.core || obj.logic || obj.coreLogic || '').trim();
   const details = String(obj.details || obj.tech || obj.technical || obj.techDetails || '').trim();
   const ac = String(obj.ac || obj.acceptance || obj.criteria || '').trim();
-  return { title, core, details, ac };
+  const dependsRaw = obj.depends ?? obj.dependsOn ?? obj.dependencies ?? null;
+  const depends = (() => {
+    const out = [];
+    const push = (v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return;
+      const idx = Math.floor(n);
+      if (idx < 0) return;
+      out.push(idx);
+    };
+    if (Array.isArray(dependsRaw)) {
+      dependsRaw.forEach(push);
+    } else if (typeof dependsRaw === 'string' && dependsRaw.trim()) {
+      dependsRaw
+        .split(/[,\s]+/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .forEach(push);
+    }
+    return Array.from(new Set(out)).slice(0, 60);
+  })();
+  return { title, core, details, ac, depends };
+}
+
+function normalizeEstimatedComplexity(value) {
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (raw === 'low') return 'Low';
+  if (raw === 'medium' || raw === 'mid') return 'Medium';
+  if (raw === 'high') return 'High';
+  return 'Medium';
+}
+
+function normalizeStringList(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    return value.map((v) => String(v ?? '').trim()).filter(Boolean);
+  }
+  const text = String(value).trim();
+  if (!text) return [];
+  return text
+    .split(/[\r\n,]+/)
+    .map((v) => String(v ?? '').trim())
+    .filter(Boolean);
+}
+
+function normalizeDagTaskId(value, index) {
+  const raw = String(value ?? '').trim();
+  if (raw && /^[A-Za-z0-9_-]+$/.test(raw)) return raw;
+  return `T${index + 1}`;
+}
+
+function normalizeDagTaskObject(task, index) {
+  const obj = task && typeof task === 'object' ? task : null;
+  if (!obj) return null;
+
+  const id = normalizeDagTaskId(
+    obj.id ?? obj.taskId ?? obj.task_id ?? obj.key ?? obj.name,
+    index,
+  );
+  const title = String(obj.title ?? obj.name ?? '').trim();
+  const description = String(obj.description ?? obj.desc ?? obj.contract ?? '').trim();
+  const dependencies = normalizeStringList(
+    obj.dependencies ?? obj.dependsOn ?? obj.depends_on ?? obj.requires,
+  );
+  const scope = normalizeStringList(obj.scope ?? obj.paths ?? obj.path);
+  const estimated_complexity = normalizeEstimatedComplexity(
+    obj.estimated_complexity ?? obj.estimatedComplexity ?? obj.complexity,
+  );
+
+  if (!title) return null;
+
+  return {
+    id,
+    title,
+    description,
+    dependencies,
+    scope,
+    estimated_complexity,
+  };
+}
+
+function ensureUniqueDagTaskIds(tasks) {
+  const list = Array.isArray(tasks) ? tasks : [];
+  const seen = new Set();
+  return list.map((t, idx) => {
+    const base = String(t?.id || `T${idx + 1}`).trim() || `T${idx + 1}`;
+    let id = base;
+    let suffix = 2;
+    while (seen.has(id)) {
+      id = `${base}_${suffix++}`;
+    }
+    seen.add(id);
+    return id === t.id ? t : { ...t, id };
+  });
+}
+
+function extractTasksJsonBlockFromMarkdown(markdown) {
+  if (typeof markdown !== 'string' || !markdown.trim()) return null;
+  const lines = markdown.split(/\r?\n/);
+  const findMarker = (marker) =>
+    lines.findIndex((line) => String(line || '').trim().toUpperCase() === marker);
+
+  const start = findMarker('## TASKS_JSON');
+  if (start < 0) return null;
+
+  let end = lines.length;
+  const endIdx = findMarker('## END_TASKS_JSON');
+  if (endIdx > start) end = endIdx;
+
+  const blockLines = lines.slice(start + 1, end);
+  if (!blockLines.length) return null;
+
+  const trimmedTop = String(blockLines[0] || '').trim();
+  const trimmedBottom = String(blockLines[blockLines.length - 1] || '').trim();
+
+  let begin = 0;
+  let finish = blockLines.length;
+  if (trimmedTop.startsWith('```')) begin += 1;
+  if (trimmedBottom.startsWith('```')) finish -= 1;
+
+  const jsonText = blockLines.slice(begin, finish).join('\n').trim();
+  return jsonText ? jsonText : null;
+}
+
+function parseDagTasksFromTasksContent(tasksContent) {
+  const raw = typeof tasksContent === 'string' ? tasksContent.trim() : '';
+  if (!raw) return null;
+
+  const direct = tryParseJson(raw);
+  if (direct && typeof direct === 'object' && Array.isArray(direct.tasks)) {
+    const normalized = ensureUniqueDagTaskIds(
+      direct.tasks.map((t, idx) => normalizeDagTaskObject(t, idx)).filter(Boolean),
+    );
+    return normalized.length ? normalized : null;
+  }
+
+  const jsonBlock = extractTasksJsonBlockFromMarkdown(raw);
+  if (!jsonBlock) return null;
+
+  const payload = tryParseJson(jsonBlock);
+  if (!payload || typeof payload !== 'object' || !Array.isArray(payload.tasks)) return null;
+
+  const normalized = ensureUniqueDagTaskIds(
+    payload.tasks.map((t, idx) => normalizeDagTaskObject(t, idx)).filter(Boolean),
+  );
+  return normalized.length ? normalized : null;
+}
+
+function normalizeScopePathForConflict(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  return raw
+    .replace(/\\/g, '/')
+    .replace(/\/+/g, '/')
+    .replace(/\/+$/, '')
+    .toLowerCase();
+}
+
+function scopesMayConflict(a, b) {
+  const left = normalizeScopePathForConflict(a);
+  const right = normalizeScopePathForConflict(b);
+  if (!left || !right) return false;
+  if (left === right) return true;
+  if (left.startsWith(`${right}/`)) return true;
+  if (right.startsWith(`${left}/`)) return true;
+  return false;
+}
+
+function detectDagScopeConflicts(tasks) {
+  const list = Array.isArray(tasks) ? tasks : [];
+  const warnings = [];
+  const edges = [];
+  const warnedPairs = new Set();
+
+  for (let i = 0; i < list.length; i += 1) {
+    const a = list[i];
+    const aScope = Array.isArray(a?.scope) ? a.scope : [];
+    if (!aScope.length) continue;
+
+    for (let j = i + 1; j < list.length; j += 1) {
+      const b = list[j];
+      const bScope = Array.isArray(b?.scope) ? b.scope : [];
+      if (!bScope.length) continue;
+
+      let match = null;
+      for (const sa of aScope) {
+        for (const sb of bScope) {
+          if (scopesMayConflict(sa, sb)) {
+            match = String(sa || sb || '').trim();
+            break;
+          }
+        }
+        if (match) break;
+      }
+
+      if (!match) continue;
+
+      const pairKey = `${a.id}::${b.id}`;
+      if (!warnedPairs.has(pairKey)) {
+        warnedPairs.add(pairKey);
+        warnings.push(`scope 可能冲突：${a.id} 与 ${b.id}（例如：${match}）`);
+      }
+      edges.push({
+        from: a.id,
+        to: b.id,
+        type: 'conflict',
+        strength: 'weak',
+        description: `scope 可能冲突：${a.id} 与 ${b.id}（例如：${match}）`,
+      });
+    }
+  }
+
+  return { warnings, edges };
 }
 
 function truncateText(text, maxLen = 1600) {
@@ -3887,7 +4657,12 @@ function parseTasksForAtomize(markdown) {
   const pushCurrent = () => {
     if (!current) return;
     const title = String(current.title || '').trim();
-    if (title) tasks.push({ ...current, title });
+    if (title) {
+      const depends = Array.isArray(current.depends)
+        ? current.depends.map((v) => String(v || '').trim()).filter(Boolean).slice(0, 30)
+        : [];
+      tasks.push({ ...current, title, depends });
+    }
     current = null;
     lastField = null;
   };
@@ -3920,7 +4695,13 @@ function parseTasksForAtomize(markdown) {
       trimmed.match(/^- \[[ xX]\]\s*(.+)$/);
     if (taskHeader) {
       pushCurrent();
-      current = { title: String(taskHeader[1] || '').trim(), core: '', details: '', ac: '' };
+      current = {
+        title: String(taskHeader[1] || '').trim(),
+        core: '',
+        details: '',
+        ac: '',
+        depends: [],
+      };
       lastField = null;
       continue;
     }
@@ -3936,14 +4717,36 @@ function parseTasksForAtomize(markdown) {
       appendField('details', detailsMatch[1]);
       continue;
     }
+    const dependsMatch = trimmed.match(/^-+\s*\*\*依赖\*\*:\s*(.*)$/);
+    if (dependsMatch) {
+      const value = String(dependsMatch[1] || '').trim();
+      if (!value || /^(无|无依赖|none|null|n\/a)$/i.test(value)) {
+        current.depends = [];
+        lastField = value ? null : 'depends';
+      } else {
+        current.depends.push(value);
+        lastField = 'depends';
+      }
+      continue;
+    }
     const acMatch = trimmed.match(/^-+\s*\*\*验收准则\s*\(AC\)\*\*:\s*(.+)$/);
     if (acMatch) {
       appendField('ac', acMatch[1]);
       continue;
     }
 
+    if (lastField === 'depends' && /^\s{2,}/.test(line)) {
+      const itemMatch = trimmed.match(/^-+\s*(.+)$/);
+      if (itemMatch) {
+        current.depends.push(String(itemMatch[1] || '').trim());
+      } else if (trimmed && current.depends.length) {
+        current.depends[current.depends.length - 1] = `${current.depends[current.depends.length - 1]}\n${trimmed}`.trim();
+      }
+      continue;
+    }
+
     // Continuation lines for multi-line blocks.
-    if (lastField && /^\s{2,}/.test(line)) {
+    if (lastField && lastField !== 'depends' && /^\s{2,}/.test(line)) {
       appendField(lastField, trimmed);
     }
   }
@@ -3956,6 +4759,7 @@ function parseTasksForAtomize(markdown) {
     core: '',
     details: '',
     ac: '',
+    depends: [],
   }));
 }
 
@@ -3971,11 +4775,20 @@ function formatOriginalTaskForAtomize(task) {
   const core = sanitizeModelText(task?.core || '', '').trim();
   const details = sanitizeModelText(task?.details || '', '').trim();
   const ac = sanitizeModelText(task?.ac || '', '').trim();
+  const depends = Array.isArray(task?.depends) ? task.depends : [];
+  const depItems = depends
+    .map((item) => sanitizeModelText(item, '').trim())
+    .filter(Boolean)
+    .slice(0, 8);
 
   const lines = [];
   if (title) lines.push(`标题：${truncateForPrompt(title, 240)}`);
   if (core) lines.push(`核心逻辑：${truncateForPrompt(core, 320)}`);
   if (details) lines.push(`技术细节：${truncateForPrompt(details, 420)}`);
+  if (depItems.length) {
+    lines.push('依赖：');
+    depItems.forEach((item) => lines.push(`- ${truncateForPrompt(item, 240)}`));
+  }
   if (ac) lines.push(`验收准则：${truncateForPrompt(ac, 320)}`);
 
   return lines.join('\n').trim() || title;
@@ -4052,6 +4865,7 @@ function parseTasksAtomicMarkdown(markdown) {
         title,
         core: '',
         details: '',
+        depends: [],
         ac: '',
         originalIndex: currentOriginalIndex,
         originalTitle: currentOriginalTitle,
@@ -4065,20 +4879,45 @@ function parseTasksAtomicMarkdown(markdown) {
     if (currentTask) {
       currentTaskLines.push(line);
 
-      const fieldMatch = /^\s{2,}-\s*\*\*(核心逻辑|技术细节|验收准则(?:\s*\(AC\))?)\*\*:\s*(.*)\s*$/.exec(
+      const fieldMatch = /^\s{2,}-\s*\*\*(核心逻辑|技术细节|依赖|验收准则(?:\s*\(AC\))?)\*\*:\s*(.*)\s*$/.exec(
         line,
       );
       if (fieldMatch) {
         const keyLabel = fieldMatch[1];
         const value = String(fieldMatch[2] || '').trim();
-        if (keyLabel.includes('核心逻辑')) lastField = 'core';
-        else if (keyLabel.includes('技术细节')) lastField = 'details';
-        else lastField = 'ac';
-        currentTask[lastField] = value;
+        if (keyLabel.includes('核心逻辑')) {
+          lastField = 'core';
+          currentTask[lastField] = value;
+        } else if (keyLabel.includes('技术细节')) {
+          lastField = 'details';
+          currentTask[lastField] = value;
+        } else if (keyLabel === '依赖') {
+          if (!value || /^(无|无依赖|none|null|n\/a)$/i.test(value)) {
+            currentTask.depends = [];
+            lastField = value ? null : 'depends';
+          } else {
+            currentTask.depends = [value];
+            lastField = 'depends';
+          }
+        } else {
+          lastField = 'ac';
+          currentTask[lastField] = value;
+        }
         continue;
       }
 
       const trimmed = line.trim();
+      if (lastField === 'depends' && trimmed) {
+        const itemMatch = trimmed.match(/^-+\s*(.+)$/);
+        if (itemMatch) {
+          currentTask.depends.push(String(itemMatch[1] || '').trim());
+          continue;
+        }
+        if (currentTask.depends.length) {
+          currentTask.depends[currentTask.depends.length - 1] = `${currentTask.depends[currentTask.depends.length - 1]}\n${trimmed}`.trim();
+          continue;
+        }
+      }
       if (
         lastField &&
         trimmed &&
@@ -4086,9 +4925,11 @@ function parseTasksAtomicMarkdown(markdown) {
         !/^- \[( |x|X)\]\s*\*\*Task\s+/i.test(trimmed) &&
         !/^\s{0,}-\s*\*\*/.test(trimmed)
       ) {
-        currentTask[lastField] = currentTask[lastField]
-          ? `${currentTask[lastField]}\n${trimmed}`
-          : trimmed;
+        if (lastField !== 'depends') {
+          currentTask[lastField] = currentTask[lastField]
+            ? `${currentTask[lastField]}\n${trimmed}`
+            : trimmed;
+        }
       }
     }
   }
@@ -4097,8 +4938,11 @@ function parseTasksAtomicMarkdown(markdown) {
   return results;
 }
 
-function formatAtomicTaskBlock(indexLabel, task) {
+function formatAtomicTaskBlock(indexLabel, task, context = {}) {
   const normalized = normalizeTaskObject(task) || { title: '', core: '', details: '', ac: '' };
+  const groupTasks = Array.isArray(context?.groupTasks) ? context.groupTasks : [];
+  const originalPrefix = String(indexLabel || '').split('.')[0] || '';
+  const currentIdx = Number.isFinite(Number(context?.currentIdx)) ? Math.floor(Number(context.currentIdx)) : -1;
   let title =
     sanitizeAtomicField(normalized.title, '修改 docs/assumptions.md｜补充原子化缺失信息').trim() ||
     '修改 docs/assumptions.md｜补充原子化缺失信息';
@@ -4119,10 +4963,27 @@ function formatAtomicTaskBlock(indexLabel, task) {
       normalized.ac,
       'docs/assumptions.md 存在，且包含“待确认点”小节与至少 3 条条目。',
     ).trim() || 'docs/assumptions.md 存在，且包含“待确认点”小节与至少 3 条条目。';
+
+  const depItems = Array.from(new Set(normalized.depends || []))
+    .map((n) => (Number.isFinite(Number(n)) ? Math.floor(Number(n)) : -1))
+    .filter((n) => n >= 0 && n < groupTasks.length && n !== currentIdx)
+    .slice(0, 12)
+    .map((depIdx) => {
+      const depTask = groupTasks[depIdx] || {};
+      const depTitle = sanitizeAtomicField(depTask.title || '', `Task ${depIdx + 1}`);
+      const label = sanitizeAtomicField(depTitle, `Task ${depIdx + 1}`);
+      const ref = originalPrefix ? `${originalPrefix}.${depIdx + 1}` : `${depIdx + 1}`;
+      return `    - ${label}（来自 Task ${ref}）`;
+    });
+  const depsBlock = depItems.length
+    ? ['  - **依赖**:', ...depItems].join('\n')
+    : '  - **依赖**: 无';
+
   return [
     `- [ ] **Task ${indexLabel}**: ${title}`,
     `  - **核心逻辑**: ${core}`,
     `  - **技术细节**: ${details}`,
+    depsBlock,
     `  - **验收准则 (AC)**: ${ac}`,
   ].join('\n');
 }
@@ -4130,7 +4991,12 @@ function formatAtomicTaskBlock(indexLabel, task) {
 function buildAtomicSection(originalIndex, summary, tasks) {
   const title = sanitizeAtomicField(summary, '（未命名）');
   const blocks = tasks
-    .map((task, idx) => formatAtomicTaskBlock(`${originalIndex}.${idx + 1}`, task))
+    .map((task, idx) =>
+      formatAtomicTaskBlock(`${originalIndex}.${idx + 1}`, task, {
+        groupTasks: tasks,
+        currentIdx: idx,
+      }),
+    )
     .join('\n\n');
   return `### 原始任务 ${originalIndex}: ${title || '（未命名）'}\n\n${blocks}`;
 }
@@ -4405,7 +5271,7 @@ async function generateTasksWithModel(design, prompt, options = {}) {
   assertValidLlmConfig(getActiveLlmConfig());
 
   const minTasks = Number(process.env.LLM_TASK_MIN || 8);
-  const maxTasks = Number(process.env.LLM_TASK_MAX || 16);
+  const maxTasks = Math.min(Number(process.env.LLM_TASK_MAX || 16), 25);
   const timeoutMs = Math.min(Number(process.env.LLM_TASK_TIMEOUT_MS || 60000), 120000);
 
   const promptConfig = loadPromptConfig();
@@ -4462,18 +5328,32 @@ async function generateTasksWithModel(design, prompt, options = {}) {
 
     const payload = tryParseJson(content);
     const rawTasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
-    const normalized = rawTasks.map(normalizeTaskObject).filter(Boolean);
-    const hasEnough = normalized.length >= Math.min(minTasks, maxTasks);
-    const isChinese = normalized.every((t) =>
-      looksLikeChinese(`${t.title} ${t.core} ${t.details} ${t.ac}`),
+    const normalized = ensureUniqueDagTaskIds(
+      rawTasks.map((t, idx) => normalizeDagTaskObject(t, idx)).filter(Boolean),
     );
+    const hasEnough = normalized.length >= Math.min(minTasks, maxTasks);
+    const isChinese = normalized.every((t) => looksLikeChinese(`${t.title} ${t.description}`));
     if (!hasEnough || !isChinese) {
       recordTelemetry(null);
       return generateTasksContent(design, prompt);
     }
-    const trimmed = normalized.slice(0, maxTasks);
+
+    const trimmed = normalized.slice(0, Math.min(maxTasks, 25));
+    const idSet = new Set(trimmed.map((t) => t.id));
+    const finalTasks = trimmed.map((t) => {
+      const deps = Array.isArray(t.dependencies) ? t.dependencies : [];
+      const dependencies = Array.from(
+        new Set(
+          deps
+            .map((d) => String(d ?? '').trim())
+            .filter((d) => d && d !== t.id && idSet.has(d)),
+        ),
+      ).slice(0, 24);
+      const scope = Array.from(new Set(Array.isArray(t.scope) ? t.scope : [])).slice(0, 32);
+      return { ...t, dependencies, scope };
+    });
     recordTelemetry(null);
-    return buildTasksMarkdown(prompt || design, { tasks: trimmed });
+    return buildTasksDagMarkdown({ tasks: finalTasks });
   } catch (error) {
     recordTelemetry(error);
     throw error;
@@ -5363,22 +6243,23 @@ async function createSpecTemplates(name, artifacts = ['requirements'], prompt = 
   for (const artifact of artifacts) {
     if (SPEC_ARTIFACTS.includes(artifact)) {
       if (artifact === 'requirements') {
-        onStage?.('requirements', 'start');
-        const content = await generateRequirementsWithModel(prompt, {
-          onToken: onLlmToken ? (delta) => onLlmToken('requirements', delta) : null,
-          onTelemetry,
-        });
-        onStage?.('requirements', 'end');
-        writeSpecFile(name, artifact, content);
-        const status = readSpecStatus(name);
-        ensureRequirementsReviewSeeded(name, status, content);
         onStage?.('requirementsClarifications', 'start');
-        const clarifications = await generateClarificationsWithModel(prompt, {
-          onToken: onLlmToken
-            ? (delta) => onLlmToken('requirementsClarifications', delta)
-            : null,
-          onTelemetry,
-        });
+        let clarifications = null;
+        try {
+          clarifications = await generateClarificationsWithModel(prompt, {
+            onToken: onLlmToken
+              ? (delta) => onLlmToken('requirementsClarifications', delta)
+              : null,
+            onTelemetry,
+          });
+        } catch (error) {
+          const fallbackQuestions = buildDefaultRequirementsClarificationQuestions(prompt);
+          clarifications = {
+            questions: fallbackQuestions,
+            generatedBy: 'default',
+            generationError: error?.message || 'Clarifications generation failed',
+          };
+        }
         onStage?.('requirementsClarifications', 'end');
         const normalizedClarifications = normalizeRequirementsClarifications(clarifications);
         const nextStatus = readSpecStatus(name);
@@ -5387,8 +6268,14 @@ async function createSpecTemplates(name, artifacts = ['requirements'], prompt = 
           questions: normalizedClarifications.questions.length
             ? normalizedClarifications.questions
             : [],
-          generatedBy: 'llm',
-          generationError: null,
+          generatedBy:
+            typeof clarifications?.generatedBy === 'string' && clarifications.generatedBy
+              ? clarifications.generatedBy
+              : 'llm',
+          generationError:
+            typeof clarifications?.generationError === 'string' && clarifications.generationError
+              ? clarifications.generationError
+              : null,
           updatedAt: new Date().toISOString(),
           confirmedAt: nextStatus.requirementsClarifications?.confirmedAt ?? null,
         };
@@ -5634,6 +6521,19 @@ function normalizeTerminalArgs(value) {
   return args;
 }
 
+function normalizeTerminalEnv(value) {
+  const obj = value && typeof value === 'object' ? value : null;
+  if (!obj) return null;
+  const env = {};
+  for (const [key, val] of Object.entries(obj)) {
+    const envKey = sanitizeEnvVarName(key);
+    if (!envKey) continue;
+    const envVal = typeof val === 'string' ? val : val == null ? '' : String(val);
+    env[envKey] = envVal.slice(0, 2000);
+  }
+  return env;
+}
+
 function normalizeTerminalCwd(value) {
   if (typeof value !== 'string') return getDefaultWorkspaceCwd();
   const trimmed = value.trim();
@@ -5678,7 +6578,17 @@ function getTerminalSession(id) {
 }
 
 function createTerminalSession(options) {
-  const command = normalizeTerminalCommand(options?.command);
+  const toolId = normalizeCliToolId(options?.toolId);
+  const tool = toolId
+    ? loadCliToolsConfig().tools.find((t) => String(t.id || '') === toolId) || null
+    : null;
+  if (toolId && !tool) {
+    const error = new Error(`cli tool not found: ${toolId}`);
+    error.status = 404;
+    throw error;
+  }
+
+  const command = normalizeTerminalCommand(tool?.command ?? options?.command);
   if (!command) {
     const error = new Error('command is required');
     error.status = 400;
@@ -5686,18 +6596,33 @@ function createTerminalSession(options) {
   }
 
   const id = nanoid();
-  const title = normalizeTerminalTitle(options?.title);
-  const args = normalizeTerminalArgs(options?.args);
+  const title = normalizeTerminalTitle(options?.title ?? tool?.label);
+  const args = tool ? normalizeTerminalArgs(tool.args) : normalizeTerminalArgs(options?.args);
   const cwd = normalizeTerminalCwd(options?.cwd);
   const cols = normalizeTerminalSize(options?.cols, 120);
   const rows = normalizeTerminalSize(options?.rows, 30);
+
+  const mergedEnv = { ...process.env };
+  if (tool?.env && typeof tool.env === 'object') {
+    Object.assign(mergedEnv, tool.env);
+  }
+  if (tool?.baseUrl && tool?.baseUrlEnvKey) {
+    mergedEnv[tool.baseUrlEnvKey] = String(tool.baseUrl);
+  }
+  if (tool?.apiKey && tool?.apiKeyEnvKey) {
+    mergedEnv[tool.apiKeyEnvKey] = String(tool.apiKey);
+  }
+  const extraEnv = normalizeTerminalEnv(options?.env);
+  if (extraEnv) {
+    Object.assign(mergedEnv, extraEnv);
+  }
 
   const proc = pty.spawn(command, args, {
     name: 'xterm-256color',
     cols,
     rows,
     cwd,
-    env: process.env,
+    env: mergedEnv,
   });
 
   const session = {
@@ -6249,6 +7174,89 @@ app.delete('/terminals/:id', (req, res) => {
   return res.json({ ok: true });
 });
 
+app.get('/cli-tools', (req, res) => {
+  const cfg = loadCliToolsConfig();
+  return res.json({ tools: cfg.tools.map(toPublicCliTool) });
+});
+
+app.post('/cli-tools', (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const label = typeof body.label === 'string' ? body.label.trim() : '';
+    const command = typeof body.command === 'string' ? body.command.trim() : '';
+    if (!label) return res.status(400).json({ error: 'label is required' });
+    if (!command) return res.status(400).json({ error: 'command is required' });
+
+    const cfg = loadCliToolsConfig();
+    const used = new Set(cfg.tools.map((t) => String(t.id || '')));
+
+    const requestedId = normalizeCliToolId(body.id);
+    const baseId = requestedId || normalizeCliToolId(label) || normalizeCliToolId(command);
+    if (!baseId) return res.status(400).json({ error: 'id is required' });
+
+    let id = baseId;
+    if (used.has(id)) {
+      let n = 2;
+      while (used.has(`${baseId}-${n}`)) n += 1;
+      id = `${baseId}-${n}`;
+    }
+
+    const nextTool = normalizeCliToolInput(body, { id });
+    if (!nextTool.label) return res.status(400).json({ error: 'Invalid label' });
+    if (!nextTool.command) return res.status(400).json({ error: 'Invalid command' });
+
+    cfg.tools.push(nextTool);
+    const persisted = persistCliToolsConfig(cfg);
+    const created = persisted.tools.find((t) => t.id === id);
+    return res.json({ ok: true, tool: toPublicCliTool(created || nextTool) });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || 'Failed to create cli tool' });
+  }
+});
+
+app.put('/cli-tools/:id', (req, res) => {
+  try {
+    const toolId = normalizeCliToolId(req.params.id);
+    if (!toolId) return res.status(400).json({ error: 'Invalid tool id' });
+
+    const cfg = loadCliToolsConfig();
+    const idx = cfg.tools.findIndex((t) => String(t.id || '') === toolId);
+    if (idx < 0) return res.status(404).json({ error: 'Tool not found' });
+
+    const updated = normalizeCliToolInput(req.body, cfg.tools[idx]);
+    if (!updated.label) return res.status(400).json({ error: 'Invalid label' });
+    if (!updated.command) return res.status(400).json({ error: 'Invalid command' });
+
+    cfg.tools[idx] = updated;
+    const persisted = persistCliToolsConfig(cfg);
+    const next = persisted.tools.find((t) => t.id === toolId) || updated;
+    return res.json({ ok: true, tool: toPublicCliTool(next) });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || 'Failed to update cli tool' });
+  }
+});
+
+app.post('/cli-tools/reset', (req, res) => {
+  try {
+    const persisted = persistCliToolsConfig(DEFAULT_CLI_TOOLS_CONFIG);
+    return res.json({ ok: true, tools: persisted.tools.map(toPublicCliTool) });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || 'Failed to reset cli tools' });
+  }
+});
+
+app.delete('/cli-tools/:id', (req, res) => {
+  const toolId = normalizeCliToolId(req.params.id);
+  if (!toolId) return res.status(400).json({ error: 'Invalid tool id' });
+  const cfg = loadCliToolsConfig();
+  const nextTools = cfg.tools.filter((t) => String(t.id || '') !== toolId);
+  if (nextTools.length === cfg.tools.length) {
+    return res.status(404).json({ error: 'Tool not found' });
+  }
+  persistCliToolsConfig({ ...cfg, tools: nextTools });
+  return res.json({ ok: true });
+});
+
 app.get('/llm', (req, res) => {
   const { baseUrl, model, providerId, responseFormat } = getActiveLlmConfig();
   res.json({
@@ -6408,7 +7416,7 @@ app.post('/llm/model', (req, res) => {
 
 app.get('/prompts', (req, res) => {
   const current = loadPromptConfig();
-  const defaults = normalizePromptConfig(DEFAULT_PROMPT_CONFIG);
+  const defaults = loadPromptDefaults();
   const presets = loadPromptPresets().filter((item) => item && typeof item === 'object');
   return res.json({ current, defaults, presets });
 });
@@ -6418,7 +7426,7 @@ app.post('/prompts', (req, res) => {
     const incoming = req.body?.config ?? req.body ?? {};
     const saved = persistPromptConfig(incoming);
     emitEvent('log:append', { source: 'prompt', message: '[prompt] config updated' });
-    const defaults = normalizePromptConfig(DEFAULT_PROMPT_CONFIG);
+    const defaults = loadPromptDefaults();
     const presets = loadPromptPresets().filter((item) => item && typeof item === 'object');
     return res.json({ current: saved, defaults, presets });
   } catch (error) {
@@ -6428,9 +7436,9 @@ app.post('/prompts', (req, res) => {
 
 app.post('/prompts/reset', (req, res) => {
   try {
-    const saved = persistPromptConfig(DEFAULT_PROMPT_CONFIG);
+    const saved = persistPromptConfig(loadPromptDefaultsRaw());
     emitEvent('log:append', { source: 'prompt', message: '[prompt] config reset' });
-    const defaults = normalizePromptConfig(DEFAULT_PROMPT_CONFIG);
+    const defaults = loadPromptDefaults();
     const presets = loadPromptPresets().filter((item) => item && typeof item === 'object');
     return res.json({ current: saved, defaults, presets });
   } catch (error) {
@@ -6454,7 +7462,7 @@ app.post('/prompts/presets', (req, res) => {
       message: `[prompt] preset saved: ${name}`,
     });
     const current = loadPromptConfig();
-    const defaults = normalizePromptConfig(DEFAULT_PROMPT_CONFIG);
+    const defaults = loadPromptDefaults();
     return res.json({ current, defaults, presets: next });
   } catch (error) {
     return res.status(400).json({ error: error?.message || 'Preset save failed' });
@@ -6473,7 +7481,7 @@ app.post('/prompts/presets/apply', (req, res) => {
       source: 'prompt',
       message: `[prompt] preset applied: ${name}`,
     });
-    const defaults = normalizePromptConfig(DEFAULT_PROMPT_CONFIG);
+    const defaults = loadPromptDefaults();
     return res.json({ current: saved, defaults, presets });
   } catch (error) {
     return res.status(400).json({ error: error?.message || 'Preset apply failed' });
@@ -6748,14 +7756,10 @@ app.get('/specs/:name/:artifact', (req, res) => {
   if (artifact === 'requirements' && !content.includes('## 原始需求')) {
     const status = readSpecStatus(specName);
     if (status.prompt) {
-      const injected = buildRequirementsMarkdown(status.prompt, {
-        summary: status.prompt,
-        background: '',
-        user_stories: [],
-        acceptance: [],
-      });
+      const rawPrompt = normalizePrompt(status.prompt) || '（未提供原始需求）';
+      const injected = `# 需求（requirements）\n\n## 原始需求\n${rawPrompt}\n`;
       const tail = content.replace(/^# 需求（requirements）\s*/m, '').trim();
-      content = `${injected}\n${tail ? `\n${tail}` : ''}`.trim();
+      content = `${injected}\n\n${tail}`.trimEnd();
       writeSpecFile(specName, 'requirements', content);
     }
   }
@@ -6883,14 +7887,60 @@ app.post('/specs/:name/confirm', async (req, res) => {
       updatedAt: now,
       confirmedAt: now,
     };
-    status.requirementsConfirmed = true;
     const requirementsPath = resolveSpecFile(specName, 'requirements');
-    const requirementsContent = fs.existsSync(requirementsPath)
+    let requirementsContent = fs.existsSync(requirementsPath)
       ? fs.readFileSync(requirementsPath, 'utf8')
       : '';
+
+    const shouldGenerateRequirements = force || !status.requirementsConfirmed;
+    if (shouldGenerateRequirements) {
+      ensureActiveFlowRun(specName, status, { reason: 'confirm:requirements' });
+      const clarificationsSummary = buildClarificationsSummary(status.requirementsClarifications);
+      stream?.write({ type: 'stage', stage: 'requirements', state: 'start' });
+      try {
+        const generated = await generateRequirementsWithModel(status.prompt, {
+          clarificationsSummary,
+          onTelemetry: (attempt) =>
+            appendFlowRunStageAttempt(specName, 'requirements', attempt, {
+              reason: 'confirm:requirements',
+            }),
+        });
+        requirementsContent = upsertRequirementsClarificationsSection(
+          generated,
+          status.requirementsClarifications?.questions,
+        );
+        status.lastError = null;
+      } catch (error) {
+        recordSpecError(status, 'requirements', error, null);
+        const fallback = buildRequirementsMarkdown(status.prompt, {
+          summary: status.prompt,
+          background: '',
+          user_stories: [],
+          acceptance: [],
+        });
+        requirementsContent = upsertRequirementsClarificationsSection(
+          fallback,
+          status.requirementsClarifications?.questions,
+        );
+      }
+      stream?.write({ type: 'delta', stage: 'requirements', delta: requirementsContent });
+      stream?.write({ type: 'stage', stage: 'requirements', state: 'end' });
+      writeSpecFile(specName, 'requirements', requirementsContent);
+      status = ensureRequirementsReviewSeeded(specName, status, requirementsContent).status;
+    } else {
+      requirementsContent = upsertRequirementsClarificationsSection(
+        requirementsContent,
+        status.requirementsClarifications?.questions,
+      );
+      if (requirementsContent.trim()) {
+        writeSpecFile(specName, 'requirements', requirementsContent);
+      }
+    }
+
+    status.requirementsConfirmed = true;
     const designPath = resolveSpecFile(specName, 'design');
     const shouldGenerate =
-      !fs.existsSync(designPath) || fs.readFileSync(designPath, 'utf8').trim() === '';
+      force || !fs.existsSync(designPath) || fs.readFileSync(designPath, 'utf8').trim() === '';
     if (shouldGenerate) {
       try {
         ensureActiveFlowRun(specName, status, { reason: 'confirm:requirements' });
@@ -7277,6 +8327,12 @@ function buildCodexRunDoc(specName, atomicTask, options = {}) {
     lines.push(`- title: ${atomicTask?.title || ''}`);
     lines.push(`- 核心逻辑: ${atomicTask?.core || ''}`);
     lines.push(`- 技术细节: ${atomicTask?.details || ''}`);
+    const depends = Array.isArray(atomicTask?.depends)
+      ? atomicTask.depends.map((v) => String(v || '').trim()).filter(Boolean).join('；')
+      : atomicTask?.depends
+        ? String(atomicTask.depends)
+        : '';
+    lines.push(`- 依赖: ${depends}`);
     lines.push(`- 验收准则: ${atomicTask?.ac || ''}`);
   }
   lines.push('');
@@ -7296,6 +8352,70 @@ function buildCodexRunDoc(specName, atomicTask, options = {}) {
     artifacts,
   };
 }
+
+app.post('/specs/:name/tasks_atomic/prompt', (req, res) => {
+  const specName = sanitizeSpecName(req.params.name);
+  if (!specName) {
+    return res.status(400).json({ error: 'Invalid spec request' });
+  }
+  if (state.status === 'Reviewing') {
+    return res.status(409).json({ error: 'Blocked by approval' });
+  }
+
+  const taskId = sanitizeAtomicTaskId(req.body?.taskId ?? req.body?.id ?? req.query?.taskId);
+  if (!taskId) {
+    return res.status(400).json({ error: 'taskId is required (e.g. 1.2)' });
+  }
+
+  const atomicPath = resolveSpecFile(specName, 'tasks_atomic');
+  if (!fs.existsSync(atomicPath)) {
+    return res.status(404).json({ error: 'Spec file not found' });
+  }
+
+  const content = fs.readFileSync(atomicPath, 'utf8');
+  const atomicTasks = parseTasksAtomicMarkdown(content);
+  const hit = atomicTasks.find((t) => String(t?.id || '').trim() === taskId);
+  if (!hit) {
+    return res.status(404).json({ error: `Atomic task not found: ${taskId}` });
+  }
+
+  const sandbox = normalizeCodexSandbox(req.body?.sandbox ?? req.query?.sandbox);
+  const model = normalizeCodexModel(req.body?.model ?? req.query?.model);
+  const projectDir = normalizeTerminalCwd(
+    req.body?.cwd ??
+      req.body?.projectDir ??
+      (typeof req.query?.cwd === 'string' ? req.query.cwd : '') ??
+      (typeof req.query?.projectDir === 'string' ? req.query.projectDir : ''),
+  );
+
+  const doc = buildCodexRunDoc(specName, hit, { sandbox, model });
+  const runDocPathForPrompt = normalizePathForPrompt(doc.runDocPath);
+  const projectDirForPrompt = normalizePathForPrompt(projectDir);
+  const prompt = [
+    `请按任务文档（绝对路径）${runDocPathForPrompt} 实现该原子任务，完成后自检并用简短要点总结变更与验证结果。`,
+    projectDirForPrompt ? `建议工作目录：${projectDirForPrompt}` : null,
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  return res.json({
+    ok: true,
+    prompt,
+    runDocPath: doc.runDocPathRel,
+    runDocPathAbs: runDocPathForPrompt,
+    task: {
+      id: hit.id,
+      done: Boolean(hit.done),
+      title: hit.title,
+      core: hit.core,
+      details: hit.details,
+      depends: Array.isArray(hit.depends) ? hit.depends : [],
+      ac: hit.ac,
+      originalIndex: hit.originalIndex,
+      originalTitle: hit.originalTitle,
+    },
+  });
+});
 
 app.post('/specs/:name/tasks_atomic/codex', (req, res) => {
   const specName = sanitizeSpecName(req.params.name);
@@ -7380,6 +8500,7 @@ app.post('/specs/:name/tasks_atomic/codex', (req, res) => {
       title: hit.title,
       core: hit.core,
       details: hit.details,
+      depends: Array.isArray(hit.depends) ? hit.depends : [],
       ac: hit.ac,
       originalIndex: hit.originalIndex,
       originalTitle: hit.originalTitle,
@@ -7461,6 +8582,7 @@ app.post('/specs/:name/tasks_atomic/codex/terminal', (req, res) => {
       title: hit.title,
       core: hit.core,
       details: hit.details,
+      depends: Array.isArray(hit.depends) ? hit.depends : [],
       ac: hit.ac,
       originalIndex: hit.originalIndex,
       originalTitle: hit.originalTitle,
@@ -7521,46 +8643,316 @@ app.post('/cli/input', (req, res) => {
 
 // ========== MVP5: 智能任务编排 API ==========
 
+function normalizeCliAvailabilityForMvp5(value) {
+  const obj = value && typeof value === 'object' ? value : {};
+  return {
+    codex: obj.codex !== false,
+    claude: obj.claude !== false,
+  };
+}
+
+function normalizeCliChoice(value) {
+  return value === 'codex' || value === 'claude' ? value : null;
+}
+
+function normalizeMvp5PlanPayload(payload, taskIds, maxCliConcurrencyLimit) {
+  const obj = payload && typeof payload === 'object' ? payload : null;
+  if (!obj) return null;
+
+  const rawMax =
+    obj.maxCliConcurrency ?? obj.maxConcurrency ?? obj.concurrency ?? obj.max_concurrency ?? obj.max_cli_concurrency;
+  const parsed = Number(rawMax);
+  const maxCliConcurrency = Number.isFinite(parsed)
+    ? Math.min(maxCliConcurrencyLimit, Math.max(1, Math.floor(parsed)))
+    : maxCliConcurrencyLimit;
+
+  const defaultCli = normalizeCliChoice(obj.defaultCli ?? obj.default_cli) || null;
+
+  const overridesRaw = obj.cliOverrides ?? obj.cli_overrides ?? obj.cliAllocation ?? obj.cli_allocation ?? null;
+  const overrides = overridesRaw && typeof overridesRaw === 'object' ? overridesRaw : {};
+
+  const cliAllocation = {};
+  for (const taskId of taskIds) {
+    const overrideCli = normalizeCliChoice(overrides?.[taskId]);
+    const chosen = overrideCli || defaultCli;
+    if (chosen) cliAllocation[taskId] = chosen;
+  }
+
+  const rationaleRaw = obj.rationale ?? obj.reason ?? '';
+  const rationale = typeof rationaleRaw === 'string' ? rationaleRaw.trim().slice(0, 800) : '';
+
+  if (Object.keys(cliAllocation).length === 0) return null;
+
+  return { maxCliConcurrency, cliAllocation, rationale };
+}
+
+function formatMvp5CliAvailability(value) {
+  const availability = normalizeCliAvailabilityForMvp5(value);
+  return `codex:${availability.codex ? 'on' : 'off'}, claude:${availability.claude ? 'on' : 'off'}`;
+}
+
+function formatMvp5TasksForPrompt(tasks) {
+  const list = Array.isArray(tasks) ? tasks : [];
+  return list
+    .map((t) => {
+      const id = String(t?.id || '').trim();
+      if (!id) return null;
+      const title = String(t?.title || '').trim().replace(/\s+/g, ' ').slice(0, 120);
+      const risk = String(t?.riskLevel || '').trim() || '-';
+      const interaction = t?.requiresInteraction ? 'yes' : 'no';
+      return `- ${id}｜${title || '（无标题）'}｜${risk}｜${interaction}`;
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+function formatMvp5DependenciesForPrompt(dag, limit = 240) {
+  const edges = Array.isArray(dag?.edges) ? dag.edges : [];
+  const lines = [];
+  for (const edge of edges) {
+    if (lines.length >= limit) break;
+    const from = String(edge?.from || '').trim();
+    const to = String(edge?.to || '').trim();
+    if (!from || !to) continue;
+    const type = String(edge?.type || '').trim() || '-';
+    const strength = String(edge?.strength || '').trim() || '-';
+    lines.push(`- ${from} -> ${to}｜${type}｜${strength}`);
+  }
+  if (edges.length > lines.length) {
+    lines.push(`- ...(共 ${edges.length} 条依赖，已截断显示前 ${lines.length} 条)`);
+  }
+  return lines.join('\n');
+}
+
+async function generateMvp5PlanWithModel({
+  specId,
+  tasks,
+  dag,
+  maxCliConcurrencyLimit,
+  cliAvailability,
+  preferredModelId,
+}) {
+  const normalizedModel = LLM_MODEL_ALIASES[preferredModelId] || preferredModelId;
+  const cfg = getLlmConfigForModel(normalizedModel);
+  if (!cfg?.baseUrl || !cfg?.apiKey || !cfg?.model) {
+    return { ok: false, skipped: true, error: { message: 'LLM config unavailable', context: describeLlmConfig(cfg) } };
+  }
+
+  const promptConfig = loadPromptConfig();
+  const stage = promptConfig?.stages?.mvp5Plan;
+  if (!stage) {
+    return { ok: false, skipped: true, error: { message: 'Prompt stage mvp5Plan missing', context: null } };
+  }
+
+  const variables = {
+    specId: String(specId || '').trim(),
+    maxCliConcurrency: String(maxCliConcurrencyLimit),
+    cliAvailability: formatMvp5CliAvailability(cliAvailability),
+    tasks: formatMvp5TasksForPrompt(tasks),
+    dependencies: formatMvp5DependenciesForPrompt(dag),
+    summary: `tasks=${Array.isArray(dag?.tasks) ? dag.tasks.length : 0}, edges=${Array.isArray(dag?.edges) ? dag.edges.length : 0}`,
+  };
+
+  const promptRendered = {
+    system: applyPromptTemplate(stage.system, variables),
+    user: applyPromptTemplate(stage.user, variables),
+  };
+
+  const messages = [
+    { role: 'system', content: promptRendered.system },
+    { role: 'user', content: promptRendered.user },
+  ];
+
+  const timeoutMs = Math.min(
+    Math.max(8000, Number(process.env.LLM_MVP5_PLAN_TIMEOUT_MS || 60000)),
+    120000,
+  );
+
+  const content = await callLlm(messages, { ...cfg, timeoutMs }, {});
+  const payload = tryParseJson(content);
+  const taskIds = Array.isArray(dag?.tasks) ? dag.tasks.map((t) => t.id) : [];
+  const normalized = normalizeMvp5PlanPayload(payload, taskIds, maxCliConcurrencyLimit);
+  if (!normalized) {
+    throw new Error(`LLM mvp5Plan output invalid: ${String(content).slice(0, 240)}`);
+  }
+
+  return {
+    ok: true,
+    skipped: false,
+    result: normalized,
+    llmContext: describeLlmConfig(cfg),
+    prompt: { templates: { system: stage.system, user: stage.user }, rendered: promptRendered, variables },
+  };
+}
+
 /**
  * POST /api/mvp5/analyze-dependencies
  * 分析任务依赖关系
  */
-app.post('/api/mvp5/analyze-dependencies', (req, res) => {
+app.post('/api/mvp5/analyze-dependencies', async (req, res) => {
   try {
-    const { specId, atomicTasks, options = {} } = req.body;
+    const { specId, tasksContent, tasks: tasksInput, atomicTasks, options = {} } = req.body;
 
-    if (!atomicTasks || !Array.isArray(atomicTasks)) {
-      return res.status(400).json({ error: 'atomicTasks 数组缺失' });
+    let dagTasks = null;
+    let usedLegacyAtomic = false;
+
+    if (Array.isArray(tasksInput)) {
+      dagTasks = ensureUniqueDagTaskIds(
+        tasksInput.map((t, idx) => normalizeDagTaskObject(t, idx)).filter(Boolean),
+      );
+    } else if (typeof tasksContent === 'string') {
+      dagTasks = parseDagTasksFromTasksContent(tasksContent);
+    } else if (Array.isArray(atomicTasks)) {
+      // Legacy fallback: keep compatibility but prefer TASKS_JSON.
+      usedLegacyAtomic = true;
+      const parsed = typeof atomicTasks[0] === 'string'
+        ? dependencyAnalyzer.parseAtomicTasks(atomicTasks.join('\n'))
+        : atomicTasks;
+      dagTasks = ensureUniqueDagTaskIds(
+        parsed
+          .map((t, idx) => ({
+            id: String(t?.id || `T${idx + 1}`).trim() || `T${idx + 1}`,
+            title: String(t?.title || '').trim(),
+            description: String(t?.description || t?.details || '').trim(),
+            dependencies: [],
+            scope: [],
+            estimated_complexity: 'Medium',
+          }))
+          .filter((t) => t.title),
+      );
     }
 
-    // 解析任务（如果是字符串内容）
-    const tasks = typeof atomicTasks[0] === 'string'
-      ? dependencyAnalyzer.parseAtomicTasks(atomicTasks.join('\n'))
-      : atomicTasks;
-
-    if (tasks.length === 0) {
-      return res.status(400).json({ error: '没有有效的任务' });
+    if (!dagTasks || dagTasks.length === 0) {
+      return res.status(400).json({
+        error:
+          '没有有效的任务：请在 tasks.md 的 ## TASKS_JSON 块中提供 { "tasks": [...] }，或直接传 tasksContent。',
+      });
     }
 
-    // 分析依赖关系
-    const analysis = dependencyAnalyzer.analyzeAllDependencies(tasks);
+    const warnings = [];
+    if (usedLegacyAtomic) {
+      warnings.push('提示：当前分析使用 legacy atomicTasks 输入，建议改用 tasks.md 的 TASKS_JSON。');
+    }
+    if (dagTasks.length > 25) {
+      warnings.push(`任务数量为 ${dagTasks.length}，建议 ≤ 25（参照 docs/任务编排.md）。`);
+    }
 
-    // 构建 DAG
-    const dag = dagBuilder.buildDAG(tasks, analysis.dependencies);
+    const taskIds = new Set(dagTasks.map((t) => t.id));
+    const dependencyEdges = [];
+    const unknownDeps = new Set();
 
-    // 生成推荐方案
-    const recommendations = recommender.generateRecommendations(dag, {
-      cliAvailability: options.cliAvailability,
+    dagTasks.forEach((task) => {
+      const deps = Array.isArray(task?.dependencies) ? task.dependencies : [];
+      deps.forEach((depId) => {
+        const dep = String(depId ?? '').trim();
+        if (!dep || dep === task.id) return;
+        if (!taskIds.has(dep)) {
+          unknownDeps.add(`${task.id} -> ${dep}`);
+          return;
+        }
+        dependencyEdges.push({
+          from: dep,
+          to: task.id,
+          type: 'explicit',
+          strength: 'strong',
+          description: `显式依赖: ${task.id} 依赖 ${dep}`,
+        });
+      });
     });
 
+    if (unknownDeps.size) {
+      const items = Array.from(unknownDeps).slice(0, 12);
+      warnings.push(
+        `检测到无效 dependencies 引用（已忽略）：${items.join('；')}${unknownDeps.size > items.length ? '…' : ''}`,
+      );
+    }
+
+    const scopeConflicts = detectDagScopeConflicts(dagTasks);
+    warnings.push(...scopeConflicts.warnings);
+
+    const tasksForDag = dagTasks.map((t) => {
+      const meta = [];
+      if (Array.isArray(t.scope) && t.scope.length) meta.push(`scope: ${t.scope.join(', ')}`);
+      if (t.estimated_complexity) meta.push(`complexity: ${t.estimated_complexity}`);
+      const metaBlock = meta.length ? `\n\n${meta.join('\n')}` : '';
+      return {
+        id: t.id,
+        title: t.title,
+        description: `${t.description || ''}${metaBlock}`.trim(),
+      };
+    });
+
+    // 构建 DAG（只使用 dependencies，scope 冲突只做提示，不影响拓扑）
+    const dag = dagBuilder.buildDAG(tasksForDag, dependencyEdges);
+    if (scopeConflicts.edges.length) {
+      dag.edges = [...dag.edges, ...scopeConflicts.edges];
+    }
+
+    // 并发约束：最大 CLI 并发数（上限 8）
+    const rawMaxCliConcurrency = options.maxCliConcurrency ?? process.env.MVP5_MAX_CLI_CONCURRENCY;
+    const parsedMaxCliConcurrency = Number(rawMaxCliConcurrency);
+    const maxCliConcurrency = Number.isFinite(parsedMaxCliConcurrency)
+      ? Math.min(8, Math.max(1, Math.floor(parsedMaxCliConcurrency)))
+      : 8;
+
+    const cliAvailability = normalizeCliAvailabilityForMvp5(options.cliAvailability);
+
+    // 生成推荐方案（默认：规则引擎 + 可选 LLM 方案）
+    const recommendations = recommender.generateRecommendations(dag, {
+      cliAvailability,
+      maxCliConcurrency,
+    });
+
+    const wantLlmPlan = options.useLlmPlan !== false;
+    const preferredPlanModelRaw =
+      typeof options.planModel === 'string' && options.planModel.trim()
+        ? options.planModel.trim()
+        : (process.env.MVP5_PLAN_LLM_MODEL || 'claude-opus-4-5-20251101');
+    const preferredPlanModel = LLM_MODEL_ALIASES[preferredPlanModelRaw] || preferredPlanModelRaw;
+
+    if (wantLlmPlan) {
+      try {
+        const modelPlan = await generateMvp5PlanWithModel({
+          specId,
+          tasks: tasksForDag.map((t) => ({
+            id: t.id,
+            title: t.title,
+            description: t.description,
+            riskLevel: recommender.assessTaskRisk(t),
+            requiresInteraction: recommender.requiresInteraction(t),
+          })),
+          dag,
+          maxCliConcurrencyLimit: maxCliConcurrency,
+          cliAvailability,
+          preferredModelId: preferredPlanModel,
+        });
+
+        if (modelPlan?.ok && modelPlan.result) {
+          const effectiveConcurrency = Math.min(maxCliConcurrency, modelPlan.result.maxCliConcurrency || maxCliConcurrency);
+          const llmRec = recommender.generateRecommendation(dag, {
+            cliAvailability,
+            maxCliConcurrency: effectiveConcurrency,
+            cliAllocationOverride: modelPlan.result.cliAllocation,
+          });
+          if (llmRec?.feasible) {
+            llmRec.label = `模型方案（${preferredPlanModel}）`;
+            llmRec.priority = 'high';
+            llmRec.generatedBy = 'llm';
+            llmRec.llm = { model: preferredPlanModel, providerId: modelPlan.llmContext?.providerId || null };
+            if (modelPlan.result.rationale) {
+              llmRec.rationale = modelPlan.result.rationale;
+            }
+            recommendations.unshift(llmRec);
+          }
+        }
+      } catch (error) {
+        // LLM plan is best-effort; fall back to heuristic recommendations.
+        console.warn('[MVP5] LLM plan generation skipped:', error?.message || error);
+      }
+    }
+
     // 跨平台路径检查
-    const allPaths = [
-      ...analysis.tasks.flatMap(t => [
-        ...t.fileOperations.read,
-        ...t.fileOperations.write,
-        ...t.fileOperations.delete,
-      ]),
-    ];
+    const allPaths = dagTasks.flatMap((t) => (Array.isArray(t?.scope) ? t.scope : []));
     const compatibility = pathAdapter.checkCompatibility(
       allPaths,
       options.devPlatform || 'windows',
@@ -7572,8 +8964,9 @@ app.post('/api/mvp5/analyze-dependencies', (req, res) => {
     const result = {
       analysisId,
       specId,
+      maxCliConcurrency,
       analyzedAt: new Date().toISOString(),
-      tasks: tasks.map(t => ({
+      tasks: tasksForDag.map((t) => ({
         id: t.id,
         title: t.title,
         description: t.description,
@@ -7582,9 +8975,9 @@ app.post('/api/mvp5/analyze-dependencies', (req, res) => {
       })),
       graph: dag,
       recommendations,
-      warnings: analysis.warnings,
+      warnings,
       platformNotes: compatibility.issues.length > 0 ? compatibility : undefined,
-      summary: recommender.generateExecutionSummary({ graph: dag, warnings: analysis.warnings }),
+      summary: recommender.generateExecutionSummary({ graph: dag, warnings, maxCliConcurrency }),
     };
 
     analysisResults.set(analysisId, result);

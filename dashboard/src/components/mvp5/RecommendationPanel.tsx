@@ -97,6 +97,18 @@ export function RecommendationPanel({
                       推荐
                     </span>
                   )}
+                  {rec.generatedBy === 'llm' ? (
+                    <span
+                      className="text-xs px-2 py-0.5 bg-purple-100 text-purple-700 rounded"
+                      title={rec.llm?.model ? `模型：${rec.llm.model}` : undefined}
+                    >
+                      模型
+                    </span>
+                  ) : rec.generatedBy ? (
+                    <span className="text-xs px-2 py-0.5 bg-gray-100 text-gray-700 rounded">
+                      规则
+                    </span>
+                  ) : null}
                 </div>
                 <p className="text-sm text-gray-600 mb-2">{rec.description}</p>
 
@@ -105,11 +117,11 @@ export function RecommendationPanel({
                   <div className="flex items-center gap-4 text-xs text-gray-500">
                     <span className="flex items-center gap-1">
                       <Cpu className="w-3 h-3" />
-                      Codex: {Object.values(rec.cliAllocation).filter((x) => x === 'codex').length}
+                      Codex 任务: {Object.values(rec.cliAllocation).filter((x) => x === 'codex').length}
                     </span>
                     <span className="flex items-center gap-1">
                       <Zap className="w-3 h-3" />
-                      Claude: {Object.values(rec.cliAllocation).filter((x) => x === 'claude').length}
+                      Claude 任务: {Object.values(rec.cliAllocation).filter((x) => x === 'claude').length}
                     </span>
                     <span>
                       预计: {formatDuration(rec.estimatedTotalTime)}
@@ -176,7 +188,7 @@ export function RecommendationPanel({
 
 function PhaseCard({ phase, index }: { phase: Recommendation['phases'][number]; index: number }) {
   const typeBadge = phase.type === 'parallel' ? (
-    <span className="text-xs px-2 py-0.5 bg-green-100 text-green-700 rounded">并行</span>
+    <span className="text-xs px-2 py-0.5 bg-green-100 text-green-700 rounded">并发</span>
   ) : (
     <span className="text-xs px-2 py-0.5 bg-gray-100 text-gray-700 rounded">串行</span>
   );
@@ -196,7 +208,10 @@ function PhaseCard({ phase, index }: { phase: Recommendation['phases'][number]; 
         {typeBadge}
         {cliBadge}
       </div>
-      <span className="text-xs text-gray-500">{phase.taskIds.length} 个任务</span>
+      <span className="text-xs text-gray-500">
+        {phase.taskIds.length} 个任务
+        {Number.isFinite(phase.maxConcurrency as number) ? ` · 并发上限 ${phase.maxConcurrency}` : ''}
+      </span>
     </div>
   );
 }

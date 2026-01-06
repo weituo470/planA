@@ -1,13 +1,12 @@
 /**
  * TaskOrchestrator - MVP5 智能任务编排入口组件
- * 整合依赖分析、DAG 可视化、推荐方案和执行控制
+ * 整合依赖分析、推荐方案和执行控制
  */
 
 import { useState, useCallback } from 'react';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 
 import { DependencyPanel } from './DependencyPanel';
-import { DAGVisualization } from './DAGVisualization';
 import { RecommendationPanel } from './RecommendationPanel';
 import { ExecutionConsole } from './ExecutionConsole';
 import type {
@@ -21,16 +20,26 @@ const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
 
 interface TaskOrchestratorProps {
   specId: string;
-  atomicTasks: string[];
+  tasksContent: string;
   className?: string;
 }
 
-type Section = 'analysis' | 'dag' | 'recommendation' | 'execution';
+type Section = 'analysis' | 'recommendation' | 'execution';
 
-export function TaskOrchestrator({ specId, atomicTasks, className = '' }: TaskOrchestratorProps) {
+export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskOrchestratorProps) {
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
+
+  const [maxCliConcurrency, setMaxCliConcurrency] = useState<number>(() => {
+    try {
+      const raw = Number(localStorage.getItem('mvp5MaxCliConcurrency') || '');
+      if (Number.isFinite(raw)) return Math.min(8, Math.max(1, Math.floor(raw)));
+    } catch {
+      // ignore
+    }
+    return 8;
+  });
 
   const [plan, setPlan] = useState<ExecutionPlan | null>(null);
   const [creatingPlan, setCreatingPlan] = useState(false);
@@ -40,7 +49,7 @@ export function TaskOrchestrator({ specId, atomicTasks, className = '' }: TaskOr
 
   const [selectedRecommendation, setSelectedRecommendation] = useState<number>(0);
   const [expandedSections, setExpandedSections] = useState<Set<Section>>(
-    new Set(['analysis', 'dag'])
+    new Set(['analysis', 'recommendation'])
   );
 
   // 分析依赖
@@ -57,10 +66,13 @@ export function TaskOrchestrator({ specId, atomicTasks, className = '' }: TaskOr
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           specId,
-          atomicTasks,
+          tasksContent,
           options: {
             devPlatform: 'windows',
             targetPlatform: 'linux',
+            maxCliConcurrency,
+            useLlmPlan: true,
+            planModel: 'claude-opus-4-5-20251101',
           },
         }),
       });
@@ -77,7 +89,7 @@ export function TaskOrchestrator({ specId, atomicTasks, className = '' }: TaskOr
     } finally {
       setAnalyzing(false);
     }
-  }, [specId, atomicTasks]);
+  }, [specId, tasksContent, maxCliConcurrency]);
 
   // 选择推荐方案
   const handleSelectRecommendation = useCallback((index: number, _rec: Recommendation) => {
@@ -217,6 +229,30 @@ export function TaskOrchestrator({ specId, atomicTasks, className = '' }: TaskOr
         expanded={expandedSections.has('analysis')}
         onToggle={toggleSection}
       >
+        <div className="mb-3 flex flex-wrap items-end gap-3">
+          <div className="flex items-center gap-2">
+            <label className="text-xs font-medium text-gray-600">最大 CLI 并发（≤ 8）</label>
+            <input
+              type="number"
+              min={1}
+              max={8}
+              value={maxCliConcurrency}
+              onChange={(e) => {
+                const next = Math.min(8, Math.max(1, Math.floor(Number(e.target.value || 0))));
+                setMaxCliConcurrency(next);
+                try {
+                  localStorage.setItem('mvp5MaxCliConcurrency', String(next));
+                } catch {
+                  // ignore
+                }
+              }}
+              className="w-20 rounded border border-gray-300 px-2 py-1 text-sm"
+            />
+          </div>
+          <div className="text-xs text-gray-500">
+            方案生成：优先使用 Claude 4.5 Opus（可在提示词配置里调整行为）
+          </div>
+        </div>
         <DependencyPanel
           analysis={analysis}
           loading={analyzing}
@@ -224,25 +260,6 @@ export function TaskOrchestrator({ specId, atomicTasks, className = '' }: TaskOr
           onAnalyze={handleAnalyze}
         />
       </CollapsibleSection>
-
-      {/* DAG 可视化区域 */}
-      {analysis && (
-        <CollapsibleSection
-          title="任务依赖图 (DAG)"
-          section="dag"
-          expanded={expandedSections.has('dag')}
-          onToggle={toggleSection}
-        >
-          <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
-            <div className="h-[400px]">
-              <DAGVisualization
-                graph={analysis.graph}
-                cliAllocation={analysis.recommendations[selectedRecommendation]?.cliAllocation}
-              />
-            </div>
-          </div>
-        </CollapsibleSection>
-      )}
 
       {/* 推荐方案区域 */}
       {analysis && (

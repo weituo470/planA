@@ -98,14 +98,20 @@ export interface LlmPingResult {
 
 export interface PromptStageTemplate {
   label: string;
+  scenario?: string;
   variables: string[];
   system: string;
   user: string;
 }
 
+export interface PromptMeta {
+  projectOverview: string;
+}
+
 export interface PromptConfig {
   version: number;
   updatedAt: string | null;
+  meta?: PromptMeta;
   stages: Record<string, PromptStageTemplate>;
 }
 

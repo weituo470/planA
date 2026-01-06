@@ -13,6 +13,7 @@ task/mvp2/.mvp2env
 
 # runtime artifacts
 bridge/data/
+workflow/specs/
 
 # generated flow reports (saved locally for analysis)
 docs/flow_*.md
@@ -26,3 +27,7 @@ tmp_*.png
 # nested repos (keep separate)
 openspec/
 planA/
+
+# local editor / drafts
+.vscode/
+task/mvp6/

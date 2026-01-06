@@ -49,6 +49,7 @@ export interface ExecutionPhase {
   type: 'parallel' | 'serial';
   taskIds: string[];
   canRunSimultaneously: boolean;
+  maxConcurrency?: number;
   dependsOnPhases: string[];
   suggestedCli?: 'codex' | 'claude' | 'mixed';
   estimatedDuration?: number;
@@ -61,10 +62,17 @@ export interface Recommendation {
   phases: ExecutionPhase[];
   estimatedTotalTime: number;
   cliAllocation: Record<string, 'codex' | 'claude'>;
+  generatedBy?: 'llm' | 'heuristic' | string;
+  llm?: {
+    model?: string;
+    providerId?: string | null;
+  };
+  maxCliConcurrency?: number;
   parallelism?: {
     score: number;
     description: string;
     maxParallelGroupSize: number;
+    maxCliConcurrency?: number;
   };
   rationale?: string;
   priority?: 'high' | 'medium' | 'low';
@@ -85,6 +93,8 @@ export interface ExecutionSummary {
   totalDependencies: number;
   parallelGroups: number;
   maxParallelGroupSize: number;
+  maxCliConcurrency?: number;
+  uncappedMaxParallelGroupSize?: number;
   criticalPathLength: number;
   estimatedDuration: number;
   warnings: string[];
@@ -95,6 +105,7 @@ export interface ExecutionSummary {
 export interface AnalysisResult {
   analysisId: string;
   specId: string;
+  maxCliConcurrency?: number;
   analyzedAt: string;
   tasks: Array<{
     id: string;

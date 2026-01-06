@@ -57,6 +57,12 @@ export function DependencyPanel({
   }
 
   const { summary, warnings, platformNotes } = analysis;
+  const uncappedParallel = summary.uncappedMaxParallelGroupSize ?? null;
+  const cappedParallel = summary.maxParallelGroupSize;
+  const parallelDisplay =
+    uncappedParallel != null && uncappedParallel > cappedParallel
+      ? `${cappedParallel}（理论 ${uncappedParallel}）`
+      : cappedParallel;
 
   return (
     <div className={`bg-white border border-gray-200 rounded-lg ${className}`}>
@@ -84,15 +90,15 @@ export function DependencyPanel({
         />
         <StatCard
           icon={<Layers className="w-4 h-4" />}
-          label="并行组"
-          value={summary.parallelGroups}
-          color="green"
+          label="单阶段并行"
+          value={parallelDisplay}
+          color="purple"
         />
         <StatCard
           icon={<Clock className="w-4 h-4" />}
-          label="预计耗时"
-          value={formatDuration(summary.estimatedDuration)}
-          color="purple"
+          label="并发上限"
+          value={summary.maxCliConcurrency ?? '-'}
+          color="green"
         />
         <StatCard
           icon={summary.hasCycle || summary.hasConflicts ? <AlertTriangle className="w-4 h-4" /> : <CheckCircle2 className="w-4 h-4" />}

@@ -31,13 +31,26 @@ type TerminalListItem = {
 };
 
 type TerminalTab = TerminalListItem & {
-  kind?: 'shell' | 'codex' | 'claude' | 'codex-task';
+  kind?: 'shell' | 'codex' | 'claude' | 'codex-task' | 'custom';
   specName?: string;
   taskId?: string;
   runDocPath?: string;
 };
 
 type TerminalBufferItem = { seq: number; data: string };
+
+type CliToolInfo = {
+  id: string;
+  label: string;
+  command: string;
+  args: string[];
+  baseUrl?: string;
+  baseUrlPresent?: boolean;
+  apiKeyPresent?: boolean;
+  baseUrlEnvKey?: string;
+  apiKeyEnvKey?: string;
+  env?: Record<string, string>;
+};
 
 type TerminalController = {
   id: string;
@@ -119,15 +132,29 @@ function pickClaudeAutoTemplate() {
   };
 }
 
+export type AssignableCliTerminal = {
+  id: string;
+  title: string;
+  kind: 'codex' | 'claude' | 'custom';
+};
+
 export type TerminalPanelHandle = {
   startCodexAtomicTask: (
     specName: string,
     taskId: string,
   ) => Promise<{ terminalId: string; title: string; runDocPath?: string }>;
+  listAssignableCliTerminals: () => AssignableCliTerminal[];
+  focusTerminal: (terminalId: string) => void;
+  sendTerminalInput: (terminalId: string, input: string) => Promise<void>;
+  createClaudeAutoTerminal: () => Promise<{ terminalId: string; title: string }>;
 };
 
 export function TerminalPanelInner(
-  { className, heightClass = 'h-[520px]' }: { className?: string; heightClass?: string },
+  {
+    className,
+    heightClass = 'h-[520px]',
+    onOpenCliConfig,
+  }: { className?: string; heightClass?: string; onOpenCliConfig?: () => void },
   ref: ForwardedRef<TerminalPanelHandle>,
 ) {
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
@@ -146,6 +173,11 @@ export function TerminalPanelInner(
   const [newFolderName, setNewFolderName] = useState('');
   const [mkdirLoading, setMkdirLoading] = useState(false);
   const [mkdirError, setMkdirError] = useState<string | null>(null);
+  const [cwdFolderName, setCwdFolderName] = useState('');
+  const [cwdMkdirLoading, setCwdMkdirLoading] = useState(false);
+  const [cwdMkdirError, setCwdMkdirError] = useState<string | null>(null);
+  const [cliTools, setCliTools] = useState<CliToolInfo[]>([]);
+  const [cliToolsError, setCliToolsError] = useState<string | null>(null);
 
   const socketRef = useRef<Socket | null>(null);
   const containersRef = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -185,6 +217,19 @@ export function TerminalPanelInner(
       method: 'POST',
       body: JSON.stringify({ cols, rows }),
     }, 8000);
+  }, []);
+
+  const sendTerminalInput = useCallback(async (terminalId: string, input: string) => {
+    const socket = socketRef.current;
+    if (socket?.connected) {
+      socket.emit('terminal:input', { terminalId, input });
+      return;
+    }
+    await apiJson(
+      `/terminals/${encodeURIComponent(terminalId)}/input`,
+      { method: 'POST', body: JSON.stringify({ input }) },
+      8000,
+    );
   }, []);
 
   const fitAndReport = useCallback(
@@ -379,6 +424,22 @@ export function TerminalPanelInner(
     [disposeController],
   );
 
+  const refreshCliTools = useCallback(async () => {
+    try {
+      setCliToolsError(null);
+      const data = await apiJson<{ tools?: CliToolInfo[] }>('/cli-tools', undefined, 12000);
+      setCliTools(Array.isArray(data.tools) ? data.tools : []);
+    } catch (e: any) {
+      setCliTools([]);
+      setCliToolsError(e?.message ? String(e.message) : '读取 CLI 工具失败');
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!createMenuOpen) return;
+    void refreshCliTools();
+  }, [createMenuOpen, refreshCliTools]);
+
   const createTerminal = useCallback(
     async (
       template: { title: string; command: string; args: string[] },
@@ -409,6 +470,40 @@ export function TerminalPanelInner(
         running: true,
         createdAt: new Date().toISOString(),
         ...(meta ?? {}),
+      });
+      setActiveId(data.id);
+      return data.id;
+    },
+    [addOrUpdateTab, desiredCwd, getPreferredSize],
+  );
+
+  const createCliToolTerminal = useCallback(
+    async (tool: CliToolInfo) => {
+      const toolId = String(tool?.id || '').trim();
+      if (!toolId) return null;
+      const size = getPreferredSize();
+      const data = await apiJson<{ id: string; pid: number; title: string }>(
+        '/terminals',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            toolId,
+            ...(desiredCwd ? { cwd: desiredCwd } : {}),
+            cols: size.cols,
+            rows: size.rows,
+          }),
+        },
+        15000,
+      );
+      addOrUpdateTab({
+        id: data.id,
+        pid: data.pid,
+        title: data.title || tool.label || tool.id,
+        command: tool.command,
+        args: Array.isArray(tool.args) ? tool.args : [],
+        running: true,
+        createdAt: new Date().toISOString(),
+        kind: 'custom',
       });
       setActiveId(data.id);
       return data.id;
@@ -454,12 +549,49 @@ export function TerminalPanelInner(
     [addOrUpdateTab, desiredCwd, getPreferredSize],
   );
 
+  const listAssignableCliTerminals = useCallback((): AssignableCliTerminal[] => {
+    const normalize = (value: any) => String(value || '').trim().toLowerCase();
+    const inferKind = (tab: TerminalTab): AssignableCliTerminal['kind'] | null => {
+      if (!tab?.running) return null;
+      if (tab.kind === 'codex' || tab.kind === 'claude' || tab.kind === 'custom') return tab.kind;
+      if (tab.kind === 'codex-task') return null;
+
+      const title = normalize(tab.title);
+      const cmd = normalize(tab.command);
+      const args = Array.isArray(tab.args) ? tab.args.map((v) => normalize(v)).join(' ') : '';
+      const merged = `${title} ${cmd} ${args}`;
+      if (merged.includes('claude')) return 'claude';
+      if (merged.includes('codex')) return 'codex';
+      return null;
+    };
+
+    return tabs
+      .map((t) => {
+        const kind = inferKind(t);
+        if (!kind) return null;
+        return { id: t.id, title: t.title, kind };
+      })
+      .filter(Boolean) as AssignableCliTerminal[];
+  }, [tabs]);
+
   useImperativeHandle(
     ref,
     () => ({
       startCodexAtomicTask,
+      listAssignableCliTerminals,
+      focusTerminal: (terminalId: string) => {
+        const id = String(terminalId || '').trim();
+        if (!id) return;
+        setActiveId(id);
+      },
+      sendTerminalInput,
+      createClaudeAutoTerminal: async () => {
+        const template = pickClaudeAutoTemplate();
+        const terminalId = await createTerminal(template, { kind: 'claude' });
+        return { terminalId, title: template.title };
+      },
     }),
-    [startCodexAtomicTask],
+    [createTerminal, listAssignableCliTerminals, sendTerminalInput, startCodexAtomicTask],
   );
 
   const refreshWorkspace = useCallback(async () => {
@@ -523,6 +655,31 @@ export function TerminalPanelInner(
       setCwdSaving(false);
     }
   }, [refreshWorkspace]);
+
+  const createFolderUnderCwd = useCallback(async () => {
+    const parent = desiredCwd;
+    const name = cwdFolderName.trim();
+    if (!parent || !name) return;
+
+    try {
+      setCwdMkdirLoading(true);
+      setCwdMkdirError(null);
+      const data = await apiJson<{ ok?: boolean; path?: string; error?: string }>(
+        '/fs/mkdir',
+        { method: 'POST', body: JSON.stringify({ parent, name }) },
+        12000,
+      );
+      if (data?.error) throw new Error(String(data.error));
+      if (data?.path) {
+        setCwdDraft(data.path);
+      }
+      setCwdFolderName('');
+    } catch (e: any) {
+      setCwdMkdirError(e?.message ? String(e.message) : '新建目录失败');
+    } finally {
+      setCwdMkdirLoading(false);
+    }
+  }, [cwdFolderName, desiredCwd]);
 
   const loadDirListing = useCallback(async (dirPath?: string | null) => {
     try {
@@ -704,6 +861,15 @@ export function TerminalPanelInner(
           >
             ＋ 新建终端
           </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => onOpenCliConfig?.()}
+            disabled={!onOpenCliConfig}
+            title="配置 CLI 工具"
+          >
+            CLI 配置
+          </Button>
           {createMenuOpen ? (
             <div className="relative">
               <div className="absolute right-0 z-50 mt-2 w-56 overflow-hidden rounded-md border border-slate-700 bg-slate-950 shadow-xl">
@@ -743,6 +909,29 @@ export function TerminalPanelInner(
                 >
                   Claude Code（全自动）
                 </button>
+                {cliTools.length ? (
+                  <>
+                    <div className="border-t border-slate-800" />
+                    <div className="px-3 py-1 text-[11px] text-slate-400">CLI Tools</div>
+                    {cliTools.map((tool) => (
+                      <button
+                        key={tool.id}
+                        className="w-full px-3 py-2 text-left text-xs text-slate-200 hover:bg-slate-900"
+                        onClick={() => {
+                          setCreateMenuOpen(false);
+                          void createCliToolTerminal(tool);
+                        }}
+                      >
+                        {tool.label || tool.id}
+                      </button>
+                    ))}
+                  </>
+                ) : null}
+                {cliToolsError ? (
+                  <div className="border-t border-slate-800 px-3 py-2 text-[11px] text-red-300">
+                    {cliToolsError}
+                  </div>
+                ) : null}
               </div>
             </div>
           ) : null}
@@ -780,6 +969,27 @@ export function TerminalPanelInner(
         >
           重置
         </Button>
+        <div className="h-4 w-px bg-slate-800" />
+        <div className="text-slate-400">新建文件夹</div>
+        <input
+          className="h-8 w-[220px] max-w-full rounded-md border border-slate-700 bg-slate-950 px-2 font-mono text-xs text-slate-100 outline-none focus:ring-2 focus:ring-cyan-500"
+          value={cwdFolderName}
+          onChange={(e) => setCwdFolderName(e.target.value)}
+          placeholder="子目录名"
+          disabled={!desiredCwd || cwdMkdirLoading}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') void createFolderUnderCwd();
+          }}
+        />
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => void createFolderUnderCwd()}
+          disabled={!desiredCwd || !cwdFolderName.trim() || cwdMkdirLoading}
+        >
+          新建并切换
+        </Button>
+        {cwdMkdirError ? <div className="text-red-300">{cwdMkdirError}</div> : null}
         {workspace?.effectiveCwd ? (
           <div className="text-slate-500">
             生效：<span className="font-mono">{workspace.effectiveCwd}</span>
@@ -1016,6 +1226,7 @@ export function TerminalPanelInner(
   );
 }
 
-export const TerminalPanel = forwardRef<TerminalPanelHandle, { className?: string; heightClass?: string }>(
-  TerminalPanelInner,
-);
+export const TerminalPanel = forwardRef<
+  TerminalPanelHandle,
+  { className?: string; heightClass?: string; onOpenCliConfig?: () => void }
+>(TerminalPanelInner);

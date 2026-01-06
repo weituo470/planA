@@ -236,7 +236,7 @@ function PhaseCard({
         <div className="flex items-center gap-2">
           <span className={`${config.text} font-medium`}>{config.icon}</span>
           <span className={`font-medium ${config.text}`}>
-            Phase {index + 1} ({phase.type === 'parallel' ? '并行' : '串行'})
+            Phase {index + 1} ({phase.type === 'parallel' ? '并发' : '串行'})
           </span>
           {isCurrent && (
             <span className="text-xs px-2 py-0.5 bg-blue-100 text-blue-700 rounded">
@@ -246,6 +246,7 @@ function PhaseCard({
         </div>
         <span className={`text-xs ${config.text}`}>
           {phase.taskIds.length} 个任务
+          {Number.isFinite(phase.maxConcurrency as number) ? ` · 并发上限 ${phase.maxConcurrency}` : ''}
         </span>
       </div>
 
