@@ -6550,8 +6550,8 @@ function getDefaultWorkspaceCwd() {
   const candidates = [
     resolveExistingDirectory(cfg?.defaultCwd),
     resolveExistingDirectory(process.env.WORKFLOW_DEFAULT_CWD || ''),
-    resolveExistingDirectory(DEFAULT_TESTCLI_DIR),
     resolveExistingDirectory(REPO_DIR),
+    resolveExistingDirectory(DEFAULT_TESTCLI_DIR),
   ].filter(Boolean);
   return candidates[0] || REPO_DIR;
 }
@@ -9222,7 +9222,9 @@ function quoteCmdArgument(value) {
 }
 
 function buildMvp5TaskRunDoc(specName, task, options = {}) {
-  const runsDir = path.join(resolveSpecDir(specName), '.runlogs', 'mvp5-runs');
+  const projectDir = typeof options?.projectDir === 'string' ? options.projectDir.trim() : '';
+  const baseDir = projectDir || REPO_DIR;
+  const runsDir = path.join(baseDir, '.runlogs', 'mvp5-runs', String(specName || 'spec'));
   fs.mkdirSync(runsDir, { recursive: true });
 
   const taskId = String(task?.id || 'unknown').trim() || 'unknown';
@@ -9239,6 +9241,17 @@ function buildMvp5TaskRunDoc(specName, task, options = {}) {
     design: resolveSpecFile(specName, 'design'),
     tasks: resolveSpecFile(specName, 'tasks'),
   };
+  const readIfExists = (filePath) => {
+    try {
+      if (!filePath || !fs.existsSync(filePath)) return '';
+      return fs.readFileSync(filePath, 'utf8');
+    } catch {
+      return '';
+    }
+  };
+  const requirementsSnapshot = readIfExists(artifacts.requirements);
+  const designSnapshot = readIfExists(artifacts.design);
+  const tasksSnapshot = readIfExists(artifacts.tasks);
 
   const lines = [];
   lines.push('# Codex 任务执行文档（MVP5）');
@@ -9254,10 +9267,36 @@ function buildMvp5TaskRunDoc(specName, task, options = {}) {
   if (options.sandbox) lines.push(`- Sandbox: ${options.sandbox}`);
   if (options.projectDir) lines.push(`- ProjectDir: ${normalizePathForPrompt(options.projectDir)}`);
   lines.push('');
-  lines.push('## Spec 入口');
+  lines.push('## Spec 快照（只读引用）');
+  lines.push(
+    '- 说明：出于 Codex CLI 沙箱限制，运行时可能无法访问外部 spec 目录；本次已将 requirements/design/tasks 快照内嵌，优先以快照为准。',
+  );
+  lines.push('');
+  lines.push('### 原始 spec 路径（仅供人工定位，CLI 可能不可访问）');
   lines.push(`- requirements: \`${normalizePathForPrompt(artifacts.requirements)}\``);
   lines.push(`- design: \`${normalizePathForPrompt(artifacts.design)}\``);
   lines.push(`- tasks: \`${normalizePathForPrompt(artifacts.tasks)}\``);
+  if (requirementsSnapshot.trim()) {
+    lines.push('');
+    lines.push('### requirements.md（截断）');
+    lines.push('```markdown');
+    lines.push(truncateText(requirementsSnapshot, 6000).trimEnd());
+    lines.push('```');
+  }
+  if (designSnapshot.trim()) {
+    lines.push('');
+    lines.push('### design.md（截断）');
+    lines.push('```markdown');
+    lines.push(truncateText(designSnapshot, 6000).trimEnd());
+    lines.push('```');
+  }
+  if (tasksSnapshot.trim()) {
+    lines.push('');
+    lines.push('### tasks.md（截断）');
+    lines.push('```markdown');
+    lines.push(truncateText(tasksSnapshot, 8000).trimEnd());
+    lines.push('```');
+  }
   lines.push('');
   lines.push('## 本次任务（来自 tasks.md 的 TASKS_JSON）');
   lines.push(`- title: ${String(task?.title || '').trim()}`);
@@ -9271,7 +9310,9 @@ function buildMvp5TaskRunDoc(specName, task, options = {}) {
   lines.push('## 执行要求');
   lines.push('- 以本任务为“闭环交付物”，不要做微观步骤拆解。');
   lines.push('- 按仓库既有约束实现与自测；必要时补充最小可行验证步骤。');
-  lines.push('- 完成后将关键变更、验证方式与结果回写到 tasks.md（建议追加到对应任务条目下）。');
+  lines.push(
+    '- 完成后输出“关键变更/验证方式/验证结果”；如运行环境允许访问 spec 文件，再回写到 tasks.md（建议追加到对应任务条目下）。',
+  );
   lines.push('');
 
   fs.writeFileSync(runDocPath, lines.join('\n'), 'utf8');
@@ -9427,14 +9468,8 @@ function startMvp5TaskOnWorker(runner, worker, taskId, phaseIndex) {
   const marker = `__MVP5_TASK_DONE__${runId}__`;
 
   const codexExecutable = (process.env.CODEX_COMMAND || 'codex').trim() || 'codex';
-  const args = [
-    '-a',
-    'never',
-    '-s',
-    sandbox,
-    '--add-dir',
-    SPEC_ROOT,
-  ];
+  // 固定使用非交互 exec，并强制 approval_policy=never，避免 CLI 卡在确认提示。
+  const args = ['-a', 'never', 'exec', '-s', sandbox, '--skip-git-repo-check'];
   if (model) {
     args.push('-m', model);
   }

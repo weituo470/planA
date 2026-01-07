@@ -1,20 +1,15 @@
 /**
  * TaskOrchestrator - MVP5 智能任务编排入口组件
- * 整合依赖分析、推荐方案和执行控制
+ * 入口 + 展示区：编排 / 计划 / 执行
  */
 
-import { useMemo, useState, useCallback, useEffect } from 'react';
-import { ChevronDown, ChevronRight } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 
-import { DependencyPanel } from './DependencyPanel';
-import { RecommendationPanel } from './RecommendationPanel';
-import { ExecutionConsole } from './ExecutionConsole';
 import { TaskDagGraph } from './TaskDagGraph';
 import type {
   AnalysisResult,
   ExecutionPlan,
   ExecutionState,
-  Recommendation,
 } from './types';
 
 const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
@@ -25,17 +20,103 @@ interface TaskOrchestratorProps {
   className?: string;
 }
 
-type Section = 'analysis' | 'recommendation' | 'execution';
+type ViewTab = 'dag' | 'tasks' | 'plan' | 'execution';
+
+function clampCliConcurrency(input: number) {
+  if (!Number.isFinite(input)) return 8;
+  return Math.min(8, Math.max(1, Math.floor(input)));
+}
+
+function buildTaskTitleMap(analysis: AnalysisResult | null) {
+  const map = new Map<string, string>();
+  if (!analysis) return map;
+  for (const task of analysis.graph.tasks) {
+    if (!task?.id) continue;
+    map.set(task.id, task.title || task.id);
+  }
+  for (const task of analysis.tasks) {
+    if (!task?.id) continue;
+    if (!map.has(task.id)) map.set(task.id, task.title || task.id);
+  }
+  return map;
+}
+
+function renderPlanMarkdown(plan: ExecutionPlan, analysis: AnalysisResult | null) {
+  const titleById = buildTaskTitleMap(analysis);
+  const lines: string[] = [];
+  lines.push('# 执行计划（plan）');
+  lines.push('');
+  lines.push(`- planId: ${plan.planId}`);
+  lines.push(`- specId: ${plan.specId}`);
+  lines.push(`- createdAt: ${plan.createdAt}`);
+  lines.push(`- status: ${plan.status}`);
+  if (analysis?.summary?.maxCliConcurrency != null) {
+    lines.push(`- maxCliConcurrency: ${analysis.summary.maxCliConcurrency}`);
+  }
+  lines.push('');
+  lines.push('## Phases');
+  lines.push('');
+  plan.phases.forEach((phase, idx) => {
+    lines.push(`### Phase ${idx + 1}（${phase.type === 'parallel' ? '并发' : '串行'}）`);
+    lines.push('');
+    if (phase.dependsOnPhases?.length) {
+      lines.push(`- dependsOnPhases: ${phase.dependsOnPhases.join(', ')}`);
+    }
+    if (phase.maxConcurrency != null) {
+      lines.push(`- maxConcurrency: ${phase.maxConcurrency}`);
+    }
+    lines.push('');
+    for (const taskId of phase.taskIds) {
+      const title = titleById.get(taskId) || taskId;
+      lines.push(`- ${taskId}：${title}`);
+    }
+    lines.push('');
+  });
+  return lines.join('\n').trimEnd();
+}
+
+function renderExecutionMarkdown(
+  plan: ExecutionPlan,
+  executionState: ExecutionState,
+  analysis: AnalysisResult | null,
+) {
+  const titleById = buildTaskTitleMap(analysis);
+  const lines: string[] = [];
+  lines.push('# 执行状态（execution）');
+  lines.push('');
+  lines.push(`- executionId: ${executionState.executionId}`);
+  lines.push(`- status: ${executionState.status}`);
+  lines.push(`- currentPhase: ${executionState.currentPhase + 1}`);
+  lines.push(`- startedAt: ${executionState.startedAt}`);
+  lines.push(`- updatedAt: ${executionState.updatedAt}`);
+  lines.push('');
+  lines.push('## 任务状态');
+  lines.push('');
+  for (const phase of plan.phases) {
+    for (const taskId of phase.taskIds) {
+      const task = executionState.tasks[taskId];
+      const title = titleById.get(taskId) || taskId;
+      if (!task) {
+        lines.push(`- ${taskId}：${title}（unknown）`);
+        continue;
+      }
+      const suffix = task.error ? `（${task.status}，${task.error}）` : `（${task.status}）`;
+      lines.push(`- ${taskId}：${title}${suffix}`);
+    }
+  }
+  return lines.join('\n').trimEnd();
+}
 
 export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskOrchestratorProps) {
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<ViewTab>('tasks');
 
   const [maxCliConcurrency, setMaxCliConcurrency] = useState<number>(() => {
     try {
       const raw = Number(localStorage.getItem('mvp5MaxCliConcurrency') || '');
-      if (Number.isFinite(raw)) return Math.min(8, Math.max(1, Math.floor(raw)));
+      if (Number.isFinite(raw)) return clampCliConcurrency(raw);
     } catch {
       // ignore
     }
@@ -47,17 +128,6 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
 
   const [executionState, setExecutionState] = useState<ExecutionState | null>(null);
   const [starting, setStarting] = useState(false);
-
-  const [selectedRecommendation, setSelectedRecommendation] = useState<number>(0);
-  const [expandedSections, setExpandedSections] = useState<Set<Section>>(
-    new Set(['analysis', 'recommendation'])
-  );
-
-  const taskTitleById = useMemo(() => {
-    const map = new Map<string, string>();
-    (analysis?.tasks ?? []).forEach((t) => map.set(t.id, t.title));
-    return map;
-  }, [analysis]);
 
   // 分析依赖
   const handleAnalyze = useCallback(async () => {
@@ -91,6 +161,7 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
 
       const result: AnalysisResult = await response.json();
       setAnalysis(result);
+      setActiveTab('dag');
     } catch (err) {
       setAnalysisError(err instanceof Error ? err.message : '未知错误');
     } finally {
@@ -98,19 +169,7 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
     }
   }, [specId, tasksContent, maxCliConcurrency]);
 
-  // 选择推荐方案
-  const handleSelectRecommendation = useCallback((index: number, _rec: Recommendation) => {
-    setSelectedRecommendation(index);
-  }, []);
-
-  // 创建执行计划
-  const handleCreatePlan = useCallback(async (
-    recommendation: Recommendation,
-    modifications: {
-      taskCliOverrides?: Record<string, 'codex' | 'claude'>;
-      excludedTasks?: string[];
-    }
-  ) => {
+  const handleCreatePlan = useCallback(async () => {
     if (!analysis) return;
 
     setCreatingPlan(true);
@@ -122,8 +181,8 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
         body: JSON.stringify({
           specId,
           analysisId: analysis.analysisId,
-          selectedRecommendation: selectedRecommendation,
-          modifications,
+          selectedRecommendation: 0,
+          modifications: {},
         }),
       });
 
@@ -134,12 +193,13 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
 
       const result: ExecutionPlan = await response.json();
       setPlan(result);
+      setActiveTab('plan');
     } catch (err) {
       console.error('创建执行计划失败:', err);
     } finally {
       setCreatingPlan(false);
     }
-  }, [analysis, specId, selectedRecommendation]);
+  }, [analysis, specId]);
 
   // 启动执行
   const handleStart = useCallback(async () => {
@@ -171,6 +231,7 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
           startedAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
         });
+        setActiveTab('execution');
       }
     } catch (err) {
       console.error('启动执行失败:', err);
@@ -202,6 +263,16 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
       window.clearInterval(timer);
     };
   }, [executionState?.executionId]);
+
+  const planMarkdown = useMemo(() => {
+    if (!plan) return '';
+    return renderPlanMarkdown(plan, analysis);
+  }, [plan, analysis]);
+
+  const executionMarkdown = useMemo(() => {
+    if (!plan || !executionState) return '';
+    return renderExecutionMarkdown(plan, executionState, analysis);
+  }, [plan, executionState, analysis]);
 
   // 重启任务
   const handleRetry = useCallback(async (taskId: string) => {
@@ -238,29 +309,11 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
     }
   }, [executionState]);
 
-  // 切换区域展开/收起
-  const toggleSection = useCallback((section: Section) => {
-    setExpandedSections((prev) => {
-      const next = new Set(prev);
-      if (next.has(section)) {
-        next.delete(section);
-      } else {
-        next.add(section);
-      }
-      return next;
-    });
-  }, []);
-
   return (
-    <div className={`space-y-4 ${className}`}>
-      {/* 依赖分析区域 */}
-      <CollapsibleSection
-        title="依赖分析"
-        section="analysis"
-        expanded={expandedSections.has('analysis')}
-        onToggle={toggleSection}
-      >
-        <div className="mb-3 flex flex-wrap items-end gap-3">
+    <div className={`rounded-lg border border-gray-200 bg-white ${className}`}>
+      {/* 入口：编排 / 计划 / 执行 */}
+      <div className="border-b border-gray-200 p-4">
+        <div className="flex flex-wrap items-end gap-3">
           <div className="flex items-center gap-2">
             <label className="text-xs font-medium text-gray-600">最大 CLI 并发（≤ 8）</label>
             <input
@@ -269,7 +322,7 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
               max={8}
               value={maxCliConcurrency}
               onChange={(e) => {
-                const next = Math.min(8, Math.max(1, Math.floor(Number(e.target.value || 0))));
+                const next = clampCliConcurrency(Number(e.target.value || 0));
                 setMaxCliConcurrency(next);
                 try {
                   localStorage.setItem('mvp5MaxCliConcurrency', String(next));
@@ -280,153 +333,161 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
               className="w-20 rounded border border-gray-300 px-2 py-1 text-sm"
             />
           </div>
-          <div className="text-xs text-gray-500">
-            方案生成：优先使用 Claude 4.5 Opus（可在提示词配置里调整行为）
+          <div className="text-xs text-gray-500">方案生成：优先使用 Claude 4.5 Opus</div>
+          <div className="flex flex-wrap gap-2 sm:ml-auto">
+            <button
+              onClick={handleAnalyze}
+              disabled={analyzing}
+              className="rounded-lg bg-blue-600 px-3 py-1.5 text-sm text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-gray-300"
+            >
+              {analyzing ? '编排中...' : '编排任务'}
+            </button>
+            <button
+              onClick={handleCreatePlan}
+              disabled={!analysis || creatingPlan}
+              className="rounded-lg bg-gray-900 px-3 py-1.5 text-sm text-white hover:bg-gray-800 disabled:cursor-not-allowed disabled:bg-gray-300"
+            >
+              {creatingPlan ? '生成中...' : '生成执行计划'}
+            </button>
+            <button
+              onClick={handleStart}
+              disabled={!plan || starting || executionState?.status === 'running'}
+              className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-gray-300"
+            >
+              {starting ? '启动中...' : '开始执行（Phase 1）'}
+            </button>
           </div>
         </div>
-        <DependencyPanel
-          analysis={analysis}
-          loading={analyzing}
-          error={analysisError}
-          onAnalyze={handleAnalyze}
-        />
-
-        {analysis ? (
-          <div className="mt-4 space-y-4">
-            <div>
-              <div className="mb-2 flex items-center justify-between gap-2">
-                <div className="text-sm font-semibold text-gray-800">任务 DAG</div>
-                <div className="text-xs text-gray-500">拖拽/缩放查看依赖关系</div>
-              </div>
-              <TaskDagGraph graph={analysis.graph} />
-            </div>
-            <div>
-              <div className="mb-2 flex items-center justify-between gap-2">
-                <div className="text-sm font-semibold text-gray-800">tasks.md（Markdown）</div>
-                <button
-                  className="text-xs text-blue-600 hover:text-blue-700"
-                  onClick={async () => {
-                    try {
-                      await navigator.clipboard.writeText(tasksContent ?? '');
-                    } catch {
-                      // ignore
-                    }
-                  }}
-                >
-                  复制
-                </button>
-              </div>
-              <pre className="max-h-72 overflow-auto rounded border border-gray-200 bg-gray-50 p-3 text-xs text-gray-800 whitespace-pre-wrap font-mono">
-                {tasksContent || ''}
-              </pre>
-            </div>
+        {analysisError ? (
+          <div className="mt-3 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+            {analysisError}
           </div>
         ) : null}
-      </CollapsibleSection>
+      </div>
 
-      {/* 推荐方案区域 */}
-      {analysis && (
-        <CollapsibleSection
-          title="执行方案推荐"
-          section="recommendation"
-          expanded={expandedSections.has('recommendation')}
-          onToggle={toggleSection}
-        >
-          <RecommendationPanel
-            recommendations={analysis.recommendations}
-            loading={creatingPlan}
-            onSelectRecommendation={handleSelectRecommendation}
-            onCreatePlan={handleCreatePlan}
-            createdPlan={plan}
-          />
-          <div className="mt-4">
-            <div className="mb-2 text-sm font-semibold text-gray-800">执行计划预览（Markdown）</div>
-            <pre className="max-h-64 overflow-auto rounded border border-gray-200 bg-gray-50 p-3 text-xs text-gray-800 whitespace-pre-wrap font-mono">
-              {buildPhasesMarkdown(
-                analysis.recommendations[selectedRecommendation]?.phases ?? [],
-                taskTitleById
-              )}
-            </pre>
-          </div>
-        </CollapsibleSection>
-      )}
+      {/* 展示区：DAG / tasks.md / plan / execution */}
+      <div className="p-4">
+        <div className="flex flex-wrap gap-2">
+          <TabButton active={activeTab === 'tasks'} onClick={() => setActiveTab('tasks')}>
+            tasks.md
+          </TabButton>
+          <TabButton active={activeTab === 'dag'} onClick={() => setActiveTab('dag')}>
+            DAG
+          </TabButton>
+          <TabButton active={activeTab === 'plan'} onClick={() => setActiveTab('plan')} disabled={!plan}>
+            plan
+          </TabButton>
+          <TabButton
+            active={activeTab === 'execution'}
+            onClick={() => setActiveTab('execution')}
+            disabled={!executionState}
+          >
+            execution
+          </TabButton>
+        </div>
 
-      {/* 执行控制区域 */}
-      {plan && (
-        <CollapsibleSection
-          title="执行控制台"
-          section="execution"
-          expanded={expandedSections.has('execution')}
-          onToggle={toggleSection}
-        >
-          <div className="mb-4">
-            <div className="mb-2 text-sm font-semibold text-gray-800">执行计划（Markdown）</div>
-            <pre className="max-h-64 overflow-auto rounded border border-gray-200 bg-gray-50 p-3 text-xs text-gray-800 whitespace-pre-wrap font-mono">
-              {buildPhasesMarkdown(plan.phases ?? [], taskTitleById)}
-            </pre>
-          </div>
-          <ExecutionConsole
-            plan={plan}
-            executionState={executionState}
-            loading={starting}
-            onStart={handleStart}
-            onRetry={handleRetry}
-          />
-        </CollapsibleSection>
-      )}
+        <div className="mt-3">
+          {activeTab === 'dag' ? (
+            analysis ? (
+              <TaskDagGraph graph={analysis.graph} />
+            ) : (
+              <EmptyState text="还没有编排结果（先点“编排任务”）" />
+            )
+          ) : null}
+
+          {activeTab === 'tasks' ? (
+            <MarkdownBlock title="tasks.md（Markdown）" content={tasksContent || ''} />
+          ) : null}
+
+          {activeTab === 'plan' ? (
+            plan ? (
+              <MarkdownBlock title="plan（Markdown）" content={planMarkdown} />
+            ) : (
+              <EmptyState text="还没有执行计划（先点“生成执行计划”）" />
+            )
+          ) : null}
+
+          {activeTab === 'execution' ? (
+            executionState && plan ? (
+              <div className="space-y-3">
+                <MarkdownBlock title="execution（Markdown）" content={executionMarkdown} />
+                {executionState.failures?.length ? (
+                  <div className="rounded border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                    <div className="font-medium">失败任务</div>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {executionState.failures.map((f) => (
+                        <button
+                          key={f.taskId}
+                          className="rounded bg-white px-2 py-1 text-xs text-red-700 hover:bg-red-100"
+                          onClick={() => handleRetry(f.taskId)}
+                        >
+                          重试 {f.taskId}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            ) : (
+              <EmptyState text="还没有执行状态（先点“开始执行（Phase 1）”）" />
+            )
+          ) : null}
+        </div>
+      </div>
     </div>
   );
 }
 
-type SectionProps = {
-  title: string;
-  section: Section;
-  expanded: boolean;
-  onToggle: (section: Section) => void;
+function TabButton({
+  active,
+  disabled,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  disabled?: boolean;
+  onClick: () => void;
   children: React.ReactNode;
-};
-
-function CollapsibleSection({ title, section, expanded, onToggle, children }: SectionProps) {
+}) {
   return (
-    <div className="border border-gray-200 rounded-lg overflow-hidden">
-      <button
-        onClick={() => onToggle(section)}
-        className="w-full px-4 py-3 bg-gray-50 hover:bg-gray-100 flex items-center justify-between transition-colors"
-      >
-        <span className="font-semibold text-gray-800">{title}</span>
-        {expanded ? (
-          <ChevronDown className="w-5 h-5 text-gray-500" />
-        ) : (
-          <ChevronRight className="w-5 h-5 text-gray-500" />
-        )}
-      </button>
-      {expanded && <div className="p-4">{children}</div>}
-    </div>
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`rounded px-3 py-1 text-sm transition-colors ${
+        active ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+      } ${disabled ? 'cursor-not-allowed opacity-50 hover:bg-gray-100' : ''}`}
+    >
+      {children}
+    </button>
   );
 }
 
-function buildPhasesMarkdown(
-  phases: Array<ExecutionPlan['phases'][number]>,
-  titleById: Map<string, string>,
-) {
-  if (!phases.length) return '（空）';
+function EmptyState({ text }: { text: string }) {
+  return <div className="rounded border border-gray-200 bg-gray-50 p-4 text-sm text-gray-600">{text}</div>;
+}
 
-  const lines: string[] = [];
-  lines.push('## 执行计划');
-  lines.push('');
-
-  phases.forEach((phase, idx) => {
-    const typeLabel = phase.type === 'parallel' ? '并发' : '串行';
-    const limit = Number.isFinite(phase.maxConcurrency as number)
-      ? `（并发上限 ${phase.maxConcurrency}）`
-      : '';
-    lines.push(`### Phase ${idx + 1}：${typeLabel}${limit}`);
-    (phase.taskIds ?? []).forEach((taskId) => {
-      const title = titleById.get(taskId) || '';
-      lines.push(`- ${taskId}${title ? `：${title}` : ''}`);
-    });
-    lines.push('');
-  });
-
-  return lines.join('\n').trimEnd();
+function MarkdownBlock({ title, content }: { title: string; content: string }) {
+  return (
+    <div>
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="text-sm font-semibold text-gray-800">{title}</div>
+        <button
+          className="text-xs text-blue-600 hover:text-blue-700"
+          onClick={async () => {
+            try {
+              await navigator.clipboard.writeText(content ?? '');
+            } catch {
+              // ignore
+            }
+          }}
+        >
+          复制
+        </button>
+      </div>
+      <pre className="max-h-96 overflow-auto whitespace-pre-wrap rounded border border-gray-200 bg-gray-50 p-3 font-mono text-xs text-gray-800">
+        {content || ''}
+      </pre>
+    </div>
+  );
 }
