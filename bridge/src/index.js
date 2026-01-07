@@ -3747,17 +3747,8 @@ function generateDesignContent(requirements, prompt) {
 }
 
 function generateTasksContent(design, prompt) {
-  const summary = summarizeForTemplate(
-    normalizePrompt(prompt) ||
-      extractOriginalRequirement(design) ||
-      normalizePrompt(design),
-  );
   // 已切换为“任务级 DAG（TASKS_JSON）”编排；fallback 直接返回模板，避免生成过度拆解内容。
   return SPEC_TEMPLATES.tasks;
-  if (!summary) {
-    return SPEC_TEMPLATES.tasks;
-  }
-  return `# 任务（tasks）\n\n## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务总览与回写入口（范围约束 / 验收记录）。\n- AI IDE 开发时优先按 tasks_atomic.md（原子化任务表单）逐条执行；完成情况与关键变更回写到 tasks.md，保持任务与代码同步。\n- 如发现遗漏或范围变化：先更新 tasks.md，再重新生成 tasks_atomic.md 后继续。\n\n## 任务清单\n\n- [ ] **Task 1**: 梳理“${summary}”的模块清单与页面/服务边界\n  - **核心逻辑**: 明确交付范围（做什么/不做什么）与模块拆分边界。\n  - **技术细节**: 列出关键页面/组件/服务/数据流，并标注各自职责与输入输出。\n  - **依赖**: 无\n  - **验收准则 (AC)**: tasks.md 中写清模块清单与边界，且能指出 3 个关键落点。\n\n- [ ] **Task 2**: 明确最小可运行结构（入口、路由/页面、核心依赖）\n  - **核心逻辑**: 让项目在本地可启动并可访问核心页面/接口。\n  - **技术细节**: 明确启动命令、端口、路由与核心依赖；记录需要的环境变量。\n  - **依赖**:\n    - 模块清单与边界（来自 Task 1）\n  - **验收准则 (AC)**: 能提供可执行的启动与访问步骤（命令 + 访问地址/路径）。\n\n- [ ] **Task 3**: 拆分关键流程并标注对应代码落点\n  - **核心逻辑**: 将核心用户流程拆到可实现的步骤，并映射到代码落点。\n  - **技术细节**: 标注需要新增/修改的文件路径、关键函数/组件/接口名。\n  - **依赖**:\n    - 最小可运行结构（来自 Task 2）\n  - **验收准则 (AC)**: 至少输出 1 条端到端流程与对应落点清单。\n\n- [ ] **Task 4**: 明确数据结构/接口草案（字段、命名、约束）\n  - **核心逻辑**: 先定义数据结构/接口，再进入具体实现。\n  - **技术细节**: 给出字段列表、类型、校验规则与默认值，并说明与 UI/存储的关系。\n  - **依赖**:\n    - 关键流程与落点（来自 Task 3）\n  - **验收准则 (AC)**: 数据结构/接口草案可直接转为代码实现。\n\n- [ ] **Task 5**: 记录环境变量/配置项与运行约束\n  - **核心逻辑**: 将运行所需配置显式化，避免隐式假设。\n  - **技术细节**: 列出 Base URL / API Key / 端口 / 目录等配置项与默认值。\n  - **依赖**:\n    - 数据结构/接口草案（来自 Task 4）\n  - **验收准则 (AC)**: 至少列出 3 项配置及其作用与默认值。\n\n- [ ] **Task 6**: 补齐边界与异常场景清单\n  - **核心逻辑**: 覆盖失败/无权限/缺配置/网络异常等关键边界。\n  - **技术细节**: 针对每个边界给出处理策略与可观察的提示信息。\n  - **依赖**:\n    - 关键流程与接口草案（来自 Task 3/Task 4）\n  - **验收准则 (AC)**: 至少列出 6 个边界场景与对应处理策略。\n`;
 }
 
 function tryParseJson(text) {
@@ -3984,7 +3975,7 @@ function buildDesignMarkdown(prompt, payload) {
 
 function buildTasksMarkdown(prompt, payload) {
   const fallbackSummary = normalizePrompt(prompt);
-  const guide = `## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务总览与回写入口（范围约束 / 验收记录）。\n- AI IDE 开发时优先按 tasks_atomic.md（原子化任务表单）逐条执行；完成情况与关键变更回写到 tasks.md，保持任务与代码同步。\n- 如发现遗漏或范围变化：先更新 tasks.md，再重新生成 tasks_atomic.md 后继续。\n\n## 任务清单`;
+  const guide = `## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务总览与回写入口（范围约束 / 验收记录）。\n- 建议任务粒度为模块级/交付物级（≤ 25），避免原子化拆解。\n- 如发现遗漏或范围变化：先更新 tasks.md，再继续推进实现与回写。\n\n## 任务清单`;
 
   const rawTasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
   const tasks = rawTasks
@@ -8139,7 +8130,64 @@ app.post('/specs/:name/confirm', async (req, res) => {
           );
         } catch (error) {
           console.error('Tasks generation failed:', error?.message || error);
-          content = `# 任务（tasks）\n\n## AI IDE 使用说明\n- 本文件是“规范驱动开发”的任务总览与回写入口（范围约束 / 验收记录）。\n- AI IDE 开发时优先按 tasks_atomic.md（原子化任务表单）逐条执行；完成情况与关键变更回写到 tasks.md，保持任务与代码同步。\n- 如发现遗漏或范围变化：先更新 tasks.md，再重新生成 tasks_atomic.md 后继续。\n\n## 任务清单\n- [ ] 1. 明确交付目标、受众与范围边界（写清不做什么）。\n- [ ] 2. 输出提纲/目录结构（章节顺序与每章要点）。\n- [ ] 3. 补齐关键内容：时间线/预算/分工/资源清单（按需求选择）。\n- [ ] 4. 输出风险清单与预案（触发条件/影响/应对措施）。\n- [ ] 5. 进行一致性校对（术语/数字/口径）并给出最终版本说明。\n- [ ] 6. 生成可交付版本（Markdown/PDF/Slides 其一或多份）。\n`;
+          content = buildTasksDagMarkdown({
+            tasks: [
+              {
+                id: 'T1_BRIEF',
+                title: '明确交付目标与范围边界',
+                description:
+                  '定义受众、交付物形态（Markdown/PDF/Slides）、范围/不做事项清单；产出 docs/brief.md（或写入 requirements/design）。',
+                dependencies: [],
+                scope: ['docs/'],
+                estimated_complexity: 'Medium',
+              },
+              {
+                id: 'T2_OUTLINE',
+                title: '输出目录与提纲结构',
+                description:
+                  '基于 T1 输出目录结构与每章要点；产出 docs/outline.md（或写入 design）。',
+                dependencies: ['T1_BRIEF'],
+                scope: ['docs/'],
+                estimated_complexity: 'Medium',
+              },
+              {
+                id: 'T3_CONTENT',
+                title: '补齐核心内容与素材',
+                description:
+                  '填充各章节内容，包含时间线/预算/分工/资源清单（按需求选择）；产出 docs/draft.md。',
+                dependencies: ['T2_OUTLINE'],
+                scope: ['docs/'],
+                estimated_complexity: 'High',
+              },
+              {
+                id: 'T4_RISK',
+                title: '整理风险清单与预案',
+                description:
+                  '列出触发条件/影响/应对措施；产出 docs/risk.md。',
+                dependencies: ['T2_OUTLINE'],
+                scope: ['docs/'],
+                estimated_complexity: 'Medium',
+              },
+              {
+                id: 'T5_REVIEW',
+                title: '一致性校对与终稿修订',
+                description:
+                  '统一术语、数字、口径并修订；产出 docs/final.md。',
+                dependencies: ['T3_CONTENT', 'T4_RISK'],
+                scope: ['docs/'],
+                estimated_complexity: 'Medium',
+              },
+              {
+                id: 'T6_EXPORT',
+                title: '导出可交付版本与版本说明',
+                description:
+                  '按交付形态导出 Markdown/PDF/Slides，并给出版本说明与获取方式。',
+                dependencies: ['T5_REVIEW'],
+                scope: ['docs/'],
+                estimated_complexity: 'Low',
+              },
+            ],
+          });
         }
         stream?.write({ type: 'delta', stage: 'tasks', delta: content });
         stream?.write({ type: 'stage', stage: 'tasks', state: 'end' });

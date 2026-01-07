@@ -117,32 +117,42 @@ function buildBatchedExecutionPhases(dag, cliAllocation, maxCliConcurrency) {
     });
   }
 
-  // Fallback: if we failed to schedule everything, return the original level-based groups.
-  if (scheduled.size !== tasks.length && Array.isArray(dag.parallelGroups)) {
-    return dag.parallelGroups.map((group, index) => {
-      const maxConcurrency = Math.max(1, Math.min(concurrency, group.taskIds.length));
-      const stageClis = new Set(group.taskIds.map((id) => cliAllocation?.[id]).filter(Boolean));
+  // Fallback: if scheduling failed unexpectedly, chunk tasks by topo order so we never
+  // end up with a single "187 tasks in one parallel phase" group.
+  if (scheduled.size !== tasks.length) {
+    const fallbackOrder = topo.length === tasks.length ? topo : tasks.map((t) => t.id);
+    const fallbackPhases = [];
+
+    for (let i = 0; i < fallbackOrder.length; i += concurrency) {
+      const batch = fallbackOrder.slice(i, i + concurrency);
+      if (!batch.length) continue;
+
+      const maxConcurrency = Math.max(1, Math.min(concurrency, batch.length));
+      const stageClis = new Set(batch.map((id) => cliAllocation?.[id]).filter(Boolean));
       const hasCodex = stageClis.has('codex');
       const hasClaude = stageClis.has('claude');
       let suggestedCli = 'mixed';
       if (hasCodex && !hasClaude) suggestedCli = 'codex';
       if (!hasCodex && hasClaude) suggestedCli = 'claude';
 
-      const durations = group.taskIds.map((id) => estimateTaskDuration(taskById.get(id) || {}));
+      const durations = batch.map((id) => estimateTaskDuration(taskById.get(id) || {}));
       const estimatedDuration = estimateParallelMakespan(durations, maxConcurrency);
 
-      return {
-        phaseId: `phase-${index + 1}`,
-        phaseIndex: index,
-        type: maxConcurrency > 1 && group.taskIds.length > 1 ? 'parallel' : 'serial',
-        taskIds: group.taskIds,
-        canRunSimultaneously: maxConcurrency > 1 && group.taskIds.length > 1,
+      const phaseIndex = fallbackPhases.length;
+      fallbackPhases.push({
+        phaseId: `phase-${phaseIndex + 1}`,
+        phaseIndex,
+        type: maxConcurrency > 1 && batch.length > 1 ? 'parallel' : 'serial',
+        taskIds: batch,
+        canRunSimultaneously: maxConcurrency > 1 && batch.length > 1,
         maxConcurrency,
-        dependsOnPhases: index > 0 ? [`phase-${index}`] : [],
+        dependsOnPhases: phaseIndex > 0 ? [`phase-${phaseIndex}`] : [],
         suggestedCli,
         estimatedDuration,
-      };
-    });
+      });
+    }
+
+    return fallbackPhases;
   }
 
   return phases;

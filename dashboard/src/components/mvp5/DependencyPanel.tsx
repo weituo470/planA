@@ -59,10 +59,11 @@ export function DependencyPanel({
   const { summary, warnings, platformNotes } = analysis;
   const uncappedParallel = summary.uncappedMaxParallelGroupSize ?? null;
   const cappedParallel = summary.maxParallelGroupSize;
-  const parallelDisplay =
+  const parallelNote =
     uncappedParallel != null && uncappedParallel > cappedParallel
-      ? `${cappedParallel}（理论 ${uncappedParallel}）`
-      : cappedParallel;
+      ? `理论可并行 ${uncappedParallel}，将按并发上限 ${summary.maxCliConcurrency ?? cappedParallel} 分批执行。`
+      : null;
+  const extraNotes = parallelNote ? [parallelNote] : [];
 
   return (
     <div className={`bg-white border border-gray-200 rounded-lg ${className}`}>
@@ -90,8 +91,8 @@ export function DependencyPanel({
         />
         <StatCard
           icon={<Layers className="w-4 h-4" />}
-          label="单阶段并行"
-          value={parallelDisplay}
+          label="单阶段并发"
+          value={cappedParallel}
           color="purple"
         />
         <StatCard
@@ -117,6 +118,12 @@ export function DependencyPanel({
               <span>注意事项</span>
             </div>
             <ul className="text-sm text-amber-700 space-y-1">
+              {extraNotes.map((note, i) => (
+                <li key={`note-${i}`} className="flex items-start gap-2">
+                  <span className="text-amber-400">•</span>
+                  <span>{note}</span>
+                </li>
+              ))}
               {warnings.map((warning, i) => (
                 <li key={i} className="flex items-start gap-2">
                   <span className="text-amber-400">•</span>
