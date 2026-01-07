@@ -3748,8 +3748,71 @@ function generateDesignContent(requirements, prompt) {
 }
 
 function generateTasksContent(design, prompt) {
-  // 已切换为“任务级 DAG（TASKS_JSON）”编排；fallback 直接返回模板，避免生成过度拆解内容。
-  return SPEC_TEMPLATES.tasks;
+  const summary = summarizeForTemplate(
+    normalizePrompt(prompt) || normalizePrompt(design) || extractOriginalRequirement(design),
+    120,
+  );
+  const tasks = [
+    {
+      id: 'T1_SCOPE',
+      title: '明确范围与验收口径',
+      description:
+        '基于 requirements/design 明确范围边界、优先级与验收方式，补齐缺失信息，并在 tasks.md 固定可执行的 DAG 输入（TASKS_JSON）。',
+      dependencies: [],
+      scope: [],
+      estimated_complexity: 'Medium',
+    },
+    {
+      id: 'T2_SETUP',
+      title: '项目基建与运行链路打通',
+      description:
+        '完成依赖安装、本地运行/构建链路与基础健康检查，确保后续任务能在可复现环境中推进。',
+      dependencies: ['T1_SCOPE'],
+      scope: [],
+      estimated_complexity: 'Medium',
+    },
+    {
+      id: 'T3_CONTRACT',
+      title: '数据模型与接口契约确定',
+      description:
+        '确定核心数据结构与接口契约（含错误处理/权限边界/边界条件）；必要时先补齐 schema/DTO/类型定义再进入功能实现。',
+      dependencies: ['T1_SCOPE'],
+      scope: [],
+      estimated_complexity: 'Medium',
+    },
+    {
+      id: 'T4_CORE',
+      title: summary ? `实现核心功能模块（${summary}）` : '实现核心功能模块',
+      description:
+        '按 design 的关键流程实现核心功能闭环（包含必要的 API/业务逻辑/页面/交互），并将关键变更与验证方式回写到 tasks.md。',
+      dependencies: ['T2_SETUP', 'T3_CONTRACT'],
+      scope: [],
+      estimated_complexity: 'High',
+    },
+    {
+      id: 'T5_INTEGRATION',
+      title: '联调与回归验证',
+      description:
+        '按验收标准进行联调，补齐异常分支与边界处理，形成可复现验证步骤（命令/接口/页面路径/可观察结果）。',
+      dependencies: ['T4_CORE'],
+      scope: [],
+      estimated_complexity: 'Medium',
+    },
+    {
+      id: 'T6_RELEASE',
+      title: '构建与交付物整理',
+      description:
+        '完成构建/测试/打包并整理运行说明；在回写记录中记录最终验证结果与注意事项。',
+      dependencies: ['T5_INTEGRATION'],
+      scope: [],
+      estimated_complexity: 'Low',
+    },
+  ];
+
+  const notes = [
+    '提示：本次 tasks.md 为兜底任务模板（模型输出不满足质量约束时会降级）。可直接在 TASKS_JSON 内替换/增删为更贴合的任务。',
+  ];
+  return buildTasksDagMarkdown({ tasks }, { notes });
 }
 
 function tryParseJson(text) {
@@ -4043,18 +4106,23 @@ function buildTasksMarkdown(prompt, payload) {
   return `# 任务（tasks）\n\n${guide}\n\n${blocks}\n`;
 }
 
-function buildTasksDagMarkdown(payload) {
+function buildTasksDagMarkdown(payload, options = {}) {
   const rawTasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
+  const notes = Array.isArray(options?.notes)
+    ? options.notes.map((v) => String(v ?? '').trim()).filter(Boolean).slice(0, 8)
+    : [];
   const normalized = ensureUniqueDagTaskIds(
     rawTasks.map((t, idx) => normalizeDagTaskObject(t, idx)).filter(Boolean),
   );
   const json = JSON.stringify({ tasks: normalized }, null, 2);
+  const noteLines = notes.length ? `${notes.map((n) => `- ${n}\n`).join('')}` : '';
   return (
     `# 任务（tasks）\n\n` +
     `## 说明\n` +
     `- 任务粒度：模块级/交付物级（建议 ≤ 25），不要原子化。\n` +
     `- 编排系统会解析下方 TASKS_JSON 区块生成 DAG，并据此限制并发（≤ 8）调度 CLI worker 池。\n` +
     `- 参考：docs/任务编排.md\n\n` +
+    `${noteLines}` +
     `## TASKS_JSON\n` +
     `${json}\n` +
     `## END_TASKS_JSON\n\n` +
@@ -5323,9 +5391,7 @@ async function generateTasksWithModel(design, prompt, options = {}) {
     const normalized = ensureUniqueDagTaskIds(
       rawTasks.map((t, idx) => normalizeDagTaskObject(t, idx)).filter(Boolean),
     );
-    const hasEnough = normalized.length >= Math.min(minTasks, maxTasks);
-    const isChinese = normalized.every((t) => looksLikeChinese(`${t.title} ${t.description}`));
-    if (!hasEnough || !isChinese) {
+    if (!normalized.length) {
       recordTelemetry(null);
       return generateTasksContent(design, prompt);
     }
@@ -5344,8 +5410,16 @@ async function generateTasksWithModel(design, prompt, options = {}) {
       const scope = Array.from(new Set(Array.isArray(t.scope) ? t.scope : [])).slice(0, 32);
       return { ...t, dependencies, scope };
     });
+
+    const notes = [];
+    if (finalTasks.length < Math.min(minTasks, maxTasks)) {
+      notes.push(`提示：本次任务数量为 ${finalTasks.length}，低于建议值 ${Math.min(minTasks, maxTasks)}，可酌情补充。`);
+    }
+    if (!finalTasks.every((t) => looksLikeChinese(`${t.title} ${t.description}`))) {
+      notes.push('提示：任务文本包含非中文内容，建议按需调整为简体中文。');
+    }
     recordTelemetry(null);
-    return buildTasksDagMarkdown({ tasks: finalTasks });
+    return buildTasksDagMarkdown({ tasks: finalTasks }, { notes });
   } catch (error) {
     recordTelemetry(error);
     throw error;
