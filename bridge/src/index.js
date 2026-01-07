@@ -84,6 +84,7 @@ const state = {
 
 const atomizeJobs = new Map();
 const reportScoreJobs = new Map();
+const tasksIterateJobs = new Map();
 
 const fileSnapshots = new Map();
 let isPaused = false;
@@ -221,23 +222,20 @@ const DEFAULT_PROMPT_CONFIG = {
 	    tasks: {
 	      label: '任务生成',
 	      scenario:
-	        '在设计确认后调用。用于将设计草案拆成 tasks.md 的任务列表（模块/流程级别，不要求原子化），并要求每条任务可执行、可验收、无占位符路径。',
+	        '在设计确认后调用。用于将设计草案拆成 tasks.md 的任务列表（模块/交付物级别，禁止原子化），并显式声明 dependencies 以便后续 DAG 并发编排与冲突预警。',
 	      variables: ['design', 'prompt', 'minTasks', 'maxTasks'],
 	      system:
-	        '你是项目任务拆解助手。你的输出将作为后续“任务原子化”的输入，并会交付给 AI IDE 执行。只输出 JSON，不要解释。',
+	        '你是项目任务拆解助手。按 docs/任务编排.md 输出模块级任务清单与依赖拓扑。只输出 JSON，不要解释，不要包含分析或思考过程。',
 	      user:
 	        `设计内容如下：\n{{design}}\n\n补充描述：{{prompt}}\n\n` +
-	        '请输出 {{minTasks}}-{{maxTasks}} 条任务（不要求原子化）。' +
-	        '每条任务必须包含 title/core/details/ac/depends 五个字段，简体中文；严禁输出 TBD/待定/[path]/占位符。\n' +
-	        'title 写清任务名称与产出（模块/流程级别即可）。\n' +
-	        'core 写清关键目标与范围边界（做什么/不做什么）。\n' +
-	        'details 写清关键技术点/接口/数据结构/页面与路由，不要空泛。\n' +
-	        'ac 必须可验证：写清验证步骤（命令/接口/页面路径/可观察结果）。\n' +
-	        'depends 声明依赖关系：如果本任务依赖其他任务完成后才能执行，填写依赖任务在 JSON 数组中的索引（从 0 开始）。\n' +
-	        '   - 示例：depends:[0] 表示依赖第 1 个任务；depends:[0,2] 表示依赖第 1 和第 3 个任务。\n' +
-	        '   - 如果任务可以独立执行（无依赖），填写 depends:[]。\n' +
-	        '   - 重要：文件写入冲突（多任务操作同一文件）必须串行；API 依赖（调用上一任务创建的接口）必须声明依赖。\n' +
-	        '请严格输出 JSON：{"tasks":[{title,core,details,ac,depends}]}。',
+	        '请按 docs/任务编排.md 生成任务清单，严格只输出 JSON：\n' +
+	        '{"tasks":[{"id":"TASK_ID","title":"动宾结构","description":"任务目标契约（输入/输出/验收点）","dependencies":["PREV_TASK_ID"],"scope":["/path"],"estimated_complexity":"Low|Medium|High"}]}\n\n' +
+	        '要求：\n' +
+	        '- 任务粒度：模块级/交付物级；严禁原子级/指令级拆解；总数 ≤ {{maxTasks}} 且必须 ≤ 25；建议 ≥ {{minTasks}}。\n' +
+	        '- dependencies 必须仅引用本次输出中的 id；无依赖填 []。\n' +
+	        '- scope：建议主要修改的文件范围（仓库相对路径或目录前缀），尽量减少重叠以降低冲突。\n' +
+	        '- estimated_complexity 只能是 Low/Medium/High。\n' +
+	        '- 只输出 JSON。',
 	    },
 	    atomize: {
 	      label: '任务原子化',
@@ -269,17 +267,10 @@ const DEFAULT_PROMPT_CONFIG = {
     reportScore: {
       label: '流程报告评分',
       scenario:
-        '在生成 flow report 后调用。用于从 requirements/design/tasks/tasks_atomic 快照中评审原子任务质量并打分，同时输出可直接作为下一轮生成约束的 suggestions。',
-      variables: [
-        'specName',
-        'prompt',
-        'requirements',
-        'design',
-        'tasks',
-        'tasksAtomic',
-      ],
+        '在生成 flow report 后调用。用于从 requirements/design/tasks 快照中评审“任务拆解质量（任务级 DAG，可直接交付 CLI 执行）”并打分，同时输出可直接作为下一轮生成约束的 suggestions。',
+      variables: ['specName', 'prompt', 'requirements', 'design', 'tasks'],
       system:
-        '你是项目经理 + 资深工程评审。你将对 planA 的“任务拆解质量（尤其 tasks_atomic.md）”打分。只输出 JSON，不要解释。',
+        '你是项目经理 + 资深工程评审。你将对 planA 的“任务拆解质量（任务级 DAG）”打分。只输出 JSON，不要解释。',
       user:
         `Spec：{{specName}}\n` +
         `原始需求：{{prompt}}\n\n` +
@@ -287,15 +278,14 @@ const DEFAULT_PROMPT_CONFIG = {
         '【requirements.md】\n{{requirements}}\n\n' +
         '【design.md】\n{{design}}\n\n' +
         '【tasks.md】\n{{tasks}}\n\n' +
-        '【tasks_atomic.md】\n{{tasksAtomic}}\n\n' +
-        '请按“任务可执行性与可验收性”评审并评分（0-100）。评分维度建议：\n' +
-        '1) 覆盖度：是否覆盖需求与关键边界\n' +
-	        '2) 原子性：单任务是否 15 分钟内可完成，是否拆到无法再拆\n' +
-	        '3) 具体性：是否包含明确文件路径/函数名/变量名/命令/验证步骤\n' +
-	        '4) 顺序合理：是否遵循定义先行，先 types/schema 再逻辑\n' +
-	        '5) 验收清晰：AC 是否可复现、可证明（最好可用 CLI/接口/页面操作验证）\n' +
-	        '6) 路径精确：是否存在 TBD/待定/[path]/占位符路径（出现则应显著扣分）\n' +
-	        '7) 可改进性：suggestions 是否足够具体，能直接转化为下一轮生成约束\n\n' +
+        '请基于以下事实评审：本流程已取消“任务原子化”阶段；tasks.md 将直接交付给 CLI Agent 执行（不会再进行二次拆解）。\n' +
+        '请按“任务粒度合理性 + DAG 依赖质量 + scope 冲突可控性 + 可执行性/可验收性”评审并评分（0-100）。\n' +
+        '重点检查：\n' +
+        '1) 粒度与数量：任务必须是模块级/交付物级，总数 <= 25；禁止原子级/步骤级拆解。\n' +
+	        '2) 可执行性：description 是否写清输入/输出/验收点，并给出关键接口/数据结构/页面路由/命令等必要细节，避免空泛。\n' +
+	        '3) 依赖质量：dependencies 是否准确引用任务 id，能形成无环 DAG，尽量最大化可并行性。\n' +
+	        '4) scope 冲突：scope 是否能有效隔离主要修改范围，减少重叠；必要重叠是否用依赖关系串行化。\n' +
+	        '5) 可验收性：是否提供可复现的验证方式（构建/测试/接口/页面路径与可观察结果）。\n\n' +
 	        '请严格只输出 JSON，字段必须包含：\n' +
 	        '- score：0-100 的整数\n' +
 	        '- summary：一句话总评\n' +
@@ -2381,6 +2371,243 @@ function startReportScoreJob(specName, runId, options = {}) {
   logReportScore(job, '评分任务已启动');
   setImmediate(() => {
     runReportScoreJob(specName, id, job, options);
+  });
+  return job;
+}
+
+function tasksIterateJobKey(specName, runId) {
+  return `${String(specName || '').trim()}::${String(runId || '').trim()}`;
+}
+
+function logTasksIterate(job, message) {
+  const entry = { at: new Date().toISOString(), message: String(message || '') };
+  job.logs.push(entry);
+  if (job.logs.length > 200) job.logs.shift();
+  job.updatedAt = entry.at;
+}
+
+function getTasksIterateStatus(job) {
+  return {
+    running: job.running,
+    total: job.total,
+    completed: job.completed,
+    logs: job.logs,
+    error: job.error,
+    startedAt: job.startedAt,
+    updatedAt: job.updatedAt,
+    outputRunId: job.outputRunId ?? null,
+    outputReportPath: job.outputReportPath ?? null,
+  };
+}
+
+function getTasksIterateJob(specName, runId) {
+  const id = sanitizeRunId(runId);
+  if (!id) return null;
+  return tasksIterateJobs.get(tasksIterateJobKey(specName, id)) || null;
+}
+
+async function runTasksIterateJob(specName, runId, job, options = {}) {
+  const id = sanitizeRunId(runId);
+  try {
+    if (!id) throw new Error('Invalid runId');
+    const baseRun = readFlowRun(specName, id);
+    if (!baseRun) throw new Error('Flow run not found');
+
+    const ensured = ensureFlowRunArtifactsSnapshot(specName, baseRun);
+    const artifacts = ensured.artifacts || readSpecArtifacts(specName);
+
+    const prompt = String(baseRun?.prompt || readSpecStatus(specName)?.prompt || '');
+    const requirements = String(artifacts?.requirements || '');
+    const design = String(artifacts?.design || '');
+    const tasks = String(artifacts?.tasks || '');
+
+    const userNote = sanitizeReviewText(options?.userNote, 1800);
+    const feedback = buildTasksIterationReasonFromReport(baseRun, userNote);
+    const feedbackBlock = feedback ? `\n\n【评分与用户反馈（用于迭代约束）】\n${feedback}\n` : '';
+
+    const status = readSpecStatus(specName);
+    const { run: nextRun } = ensureActiveFlowRun(specName, status, {
+      forceNew: true,
+      reason: `tasks_iterate_from:${id}`,
+    });
+    const nextRunId = nextRun?.runId || null;
+    if (!nextRunId) throw new Error('Failed to create flow run');
+    job.outputRunId = nextRunId;
+    logTasksIterate(job, `已创建新 runId：${nextRunId}`);
+
+    const tasksJsonBlock = extractTasksJsonBlockFromMarkdown(tasks);
+    const tasksForPrompt = tasksJsonBlock
+      ? `## TASKS_JSON\n${tasksJsonBlock}\n## END_TASKS_JSON`
+      : truncateTextMiddle(tasks, 14000);
+
+    const variables = {
+      specName,
+      prompt: truncateTextMiddle(prompt, 6000),
+      requirements: truncateTextMiddle(requirements, 14000),
+      design: truncateTextMiddle(design, 14000),
+      tasks: truncateTextMiddle(tasksForPrompt, 16000),
+    };
+
+    const promptTemplates = {
+      system:
+        '你是资深项目经理 + 工程架构评审。目标：基于需求/设计/现有 tasks.md 与评分反馈，迭代优化模块级任务清单（<=25），并显式给出 dependencies/scope，以便 DAG 并发编排与冲突预警。只输出 JSON，不要解释，不要包含分析或思考过程。',
+      user:
+        'Spec：{{specName}}\n原始需求：{{prompt}}\n\n【requirements.md】\n{{requirements}}\n\n【design.md】\n{{design}}\n\n【现有 tasks.md（仅供参考）】\n{{tasks}}' +
+        feedbackBlock +
+        '\n请按 docs/任务编排.md 迭代优化任务清单，要求：\n' +
+        '1) 任务必须是模块级/交付物级，总数 <= 25；禁止原子级/步骤级拆解。\n' +
+        '2) 尽量保持现有任务 id 不变；若必须新增/合并/拆分，也要保持 id 唯一且语义清晰。\n' +
+        '3) title：动宾结构；description：写清输入/输出/验收点，避免空泛；严禁 TBD/待定/[path]/占位符。\n' +
+        '4) dependencies：仅引用任务 id，形成无环 DAG；文件写入冲突/接口依赖必须串行化。\n' +
+        '5) scope：尽量精确到主要目录/文件集合，用于冲突预警；estimated_complexity 只能是 Low/Medium/High。\n\n' +
+        '请严格只输出 JSON：{"tasks":[{"id":"T1_INFRA","title":"...","description":"...","dependencies":[],"scope":["/path"],"estimated_complexity":"Medium"}]}。',
+    };
+
+    const promptRendered = {
+      system: applyPromptTemplate(promptTemplates.system, variables),
+      user: applyPromptTemplate(promptTemplates.user, variables),
+    };
+    const messages = [
+      { role: 'system', content: promptRendered.system },
+      { role: 'user', content: promptRendered.user },
+    ];
+
+    const modelId = 'claude-opus-4-5-20251101';
+    const cfg = getLlmConfigForModel(modelId);
+    let usage = null;
+    const startedAt = new Date().toISOString();
+    const startedMs = Date.now();
+
+    logTasksIterate(job, `开始调用模型：${getModelLabel(modelId)}（用于任务迭代）`);
+    let content;
+    try {
+      assertValidLlmConfig(cfg);
+      const timeoutMs = Math.min(
+        Math.max(8000, Number(process.env.LLM_TASK_ITERATE_TIMEOUT_MS || 120000)),
+        240000,
+      );
+      content = await callLlm(messages, { ...cfg, timeoutMs }, {
+        onUsage: (u) => {
+          usage = u;
+        },
+      });
+    } catch (error) {
+      const endedAt = new Date().toISOString();
+      appendFlowRunStageAttemptToRun(specName, nextRunId, 'tasks', {
+        label: `iterate:${modelId}`,
+        stream: false,
+        startedAt,
+        endedAt,
+        durationMs: Date.now() - startedMs,
+        usage,
+        llmContext: describeLlmConfig(cfg),
+        prompt: { templates: promptTemplates, rendered: promptRendered, variables },
+        meta: { modelId, providerId: cfg.providerId, baseRunId: id },
+        error: { message: error?.message || String(error || ''), context: error?.llmContext || null },
+      });
+      throw error;
+    }
+
+    const payload = tryParseJson(content);
+    const rawTasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
+    const normalized = ensureUniqueDagTaskIds(
+      rawTasks.map((t, idx) => normalizeDagTaskObject(t, idx)).filter(Boolean),
+    );
+    if (!normalized.length) {
+      throw new Error(`LLM tasks iterate output invalid: ${String(content).slice(0, 240)}`);
+    }
+
+    const trimmed = normalized.slice(0, 25);
+    const idSet = new Set(trimmed.map((t) => t.id));
+    const finalTasks = trimmed.map((t) => {
+      const deps = Array.isArray(t.dependencies) ? t.dependencies : [];
+      const dependencies = Array.from(
+        new Set(
+          deps
+            .map((d) => String(d ?? '').trim())
+            .filter((d) => d && d !== t.id && idSet.has(d)),
+        ),
+      ).slice(0, 24);
+      const scope = Array.from(new Set(Array.isArray(t.scope) ? t.scope : [])).slice(0, 32);
+      return { ...t, dependencies, scope };
+    });
+
+    const notes = [
+      `由 Claude 4.5 Opus 基于评分迭代生成（from runId: ${id}）`,
+      userNote ? '包含用户补充修改意见' : null,
+    ].filter(Boolean);
+    const tasksMarkdown = buildTasksDagMarkdown({ tasks: finalTasks }, { notes });
+    writeSpecFile(specName, 'tasks', tasksMarkdown);
+
+    const nextStatus = readSpecStatus(specName);
+    if (nextStatus.tasksConfirmed) {
+      writeSpecStatus(specName, { ...nextStatus, tasksConfirmed: false });
+    }
+
+    const endedAt = new Date().toISOString();
+    appendFlowRunStageAttemptToRun(specName, nextRunId, 'tasks', {
+      label: `iterate:${modelId}`,
+      stream: false,
+      startedAt,
+      endedAt,
+      durationMs: Date.now() - startedMs,
+      usage,
+      llmContext: describeLlmConfig(cfg),
+      prompt: { templates: promptTemplates, rendered: promptRendered, variables },
+      meta: { modelId, providerId: cfg.providerId, baseRunId: id },
+      error: null,
+    });
+
+    const reportPath = refreshFlowReport(specName, nextRunId);
+    if (reportPath) {
+      job.outputReportPath = reportPath;
+      logTasksIterate(job, `新流程报告已生成：${reportPath}`);
+    }
+
+    job.completed = 1;
+    job.running = false;
+    job.error = null;
+    logTasksIterate(job, '任务迭代完成');
+  } catch (error) {
+    job.running = false;
+    job.error = error?.message || String(error);
+    logTasksIterate(job, `任务迭代失败：${job.error}`);
+  }
+}
+
+function startTasksIterateJob(specName, runId, options = {}) {
+  const id = sanitizeRunId(runId);
+  if (!id) return null;
+  const key = tasksIterateJobKey(specName, id);
+  const existing = tasksIterateJobs.get(key);
+  if (existing && existing.running) return existing;
+  const now = new Date().toISOString();
+  const job = existing || {
+    specName,
+    runId: id,
+    running: false,
+    total: 1,
+    completed: 0,
+    logs: [],
+    error: null,
+    startedAt: now,
+    updatedAt: now,
+    outputRunId: null,
+    outputReportPath: null,
+  };
+  job.running = true;
+  job.error = null;
+  job.total = 1;
+  job.completed = 0;
+  job.startedAt = now;
+  job.updatedAt = now;
+  job.outputRunId = null;
+  job.outputReportPath = null;
+  if (options?.resetLogs === true) job.logs = [];
+  tasksIterateJobs.set(key, job);
+  logTasksIterate(job, '任务迭代任务已启动');
+  setImmediate(() => {
+    runTasksIterateJob(specName, id, job, options);
   });
   return job;
 }
@@ -5818,6 +6045,67 @@ function buildAtomizeIterationReasonFromReport(run, userNote = '') {
   return joined.length > 3600 ? joined.slice(0, 3600) : joined;
 }
 
+function buildTasksIterationReasonFromReport(run, userNote = '') {
+  const note = sanitizeReviewText(userNote, 1800);
+  const ratings = run?.ratings && typeof run.ratings === 'object' ? run.ratings : {};
+  const byModel =
+    ratings?.byModel && typeof ratings.byModel === 'object' ? ratings.byModel : {};
+  const modelIds = LLM_MODEL_OPTIONS.map((m) => String(m?.id || '')).filter(Boolean);
+
+  const blocks = [];
+  const hasAnyModelResult = modelIds.some((id) => Boolean(byModel?.[id]?.result));
+  if (hasAnyModelResult) {
+    blocks.push('多模型评分意见（针对 tasks.md，作为本次任务迭代约束）：');
+    modelIds.forEach((modelId) => {
+      const item =
+        byModel?.[modelId] && typeof byModel[modelId] === 'object' ? byModel[modelId] : null;
+      const result = item?.result && typeof item.result === 'object' ? item.result : null;
+      if (!result) return;
+      const score = Number(result.score);
+      const scoreText =
+        Number.isFinite(score) && score >= 0 && score <= 100 ? String(Math.round(score)) : 'n/a';
+      const summary = sanitizeReviewText(String(result.summary || ''), 180) || '（无）';
+      blocks.push(`- ${getModelLabel(modelId)}：${scoreText}/100｜${summary}`);
+      const weaknesses = Array.isArray(result.weaknesses)
+        ? result.weaknesses.map((x) => sanitizeReviewText(String(x || ''), 140)).filter(Boolean)
+        : [];
+      if (weaknesses.length) {
+        blocks.push(`  - 主要问题：${weaknesses.slice(0, 3).join('； ')}`);
+      }
+      const suggestions = Array.isArray(result.suggestions)
+        ? result.suggestions.map((x) => sanitizeReviewText(String(x || ''), 160)).filter(Boolean)
+        : [];
+      if (suggestions.length) {
+        blocks.push('  - 建议：');
+        suggestions.slice(0, 8).forEach((s) => blocks.push(`    - ${s}`));
+      }
+    });
+  }
+
+  const userRatings = Array.isArray(run?.userRatings) ? run.userRatings : [];
+  if (userRatings.length) {
+    blocks.push('');
+    blocks.push('用户评分记录（用于迭代约束）：');
+    userRatings.slice(-5).forEach((r) => {
+      const score = Number(r?.score);
+      const scoreText = Number.isFinite(score) ? String(Math.round(score)) : 'n/a';
+      const comment = sanitizeReviewText(String(r?.comment || ''), 220);
+      const createdAt = sanitizeReviewText(String(r?.createdAt || ''), 40);
+      blocks.push(`- ${createdAt || 'unknown'}：${scoreText}/100${comment ? `｜${comment}` : ''}`);
+    });
+  }
+
+  if (note) {
+    blocks.push('');
+    blocks.push('用户补充修改意见：');
+    blocks.push(note);
+  }
+
+  const joined = blocks.join('\n').trim();
+  if (!joined) return '';
+  return joined.length > 4200 ? joined.slice(0, 4200) : joined;
+}
+
 async function runAtomizeJob(specName, job, options = {}) {
   try {
     const specDir = resolveSpecDir(specName);
@@ -7790,6 +8078,50 @@ app.post('/specs/:name/reports/:runId/user-score', (req, res) => {
   writeFlowRun(specName, { ...run, updatedAt: now, userRatings: nextUserRatings });
   refreshFlowReport(specName, runId);
   return res.json({ ok: true, userRatings: nextUserRatings });
+});
+
+app.get('/specs/:name/reports/:runId/tasks-iterate', (req, res) => {
+  const specName = sanitizeSpecName(req.params.name);
+  const runId = sanitizeRunId(req.params.runId);
+  if (!specName || !runId) {
+    return res.status(400).json({ error: 'Invalid report request' });
+  }
+  const job = getTasksIterateJob(specName, runId);
+  if (!job) {
+    return res.json({
+      running: false,
+      total: 1,
+      completed: 0,
+      logs: [],
+      error: null,
+      startedAt: null,
+      updatedAt: null,
+      outputRunId: null,
+      outputReportPath: null,
+    });
+  }
+  return res.json(getTasksIterateStatus(job));
+});
+
+app.post('/specs/:name/reports/:runId/tasks-iterate', (req, res) => {
+  const specName = sanitizeSpecName(req.params.name);
+  const runId = sanitizeRunId(req.params.runId);
+  if (!specName || !runId) {
+    return res.status(400).json({ error: 'Invalid report request' });
+  }
+  const run = readFlowRun(specName, runId);
+  if (!run) {
+    return res.status(404).json({ error: 'Report run not found' });
+  }
+  const userNote = sanitizeReviewText(
+    req.body?.userNote ?? req.body?.iterateUserNote ?? req.body?.note,
+    1800,
+  );
+  const job = startTasksIterateJob(specName, runId, { userNote, resetLogs: true });
+  if (!job) {
+    return res.status(500).json({ error: 'Failed to start iterate job' });
+  }
+  return res.json(getTasksIterateStatus(job));
 });
 
 app.get('/specs/:name/:artifact', (req, res) => {

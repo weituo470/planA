@@ -68,7 +68,7 @@
     },
     "reportScore": {
       "label": "流程报告评分",
-      "scenario": "在生成 flow report 后调用。用于从 requirements/design/tasks 快照中评审“任务拆解质量（任务级 DAG）”并打分，同时输出可直接作为下一轮生成约束的 suggestions。",
+      "scenario": "在生成 flow report 后调用。用于从 requirements/design/tasks 快照中评审“任务拆解质量（任务级 DAG，可直接交付 CLI 执行）”并打分，同时输出可直接作为下一轮生成约束的 suggestions。",
       "variables": [
         "specName",
         "prompt",
@@ -77,7 +77,7 @@
         "tasks"
       ],
       "system": "你是项目经理 + 资深工程评审。你将对 planA 的“任务拆解质量（任务级 DAG）”打分。只输出 JSON，不要解释。",
-      "user": "Spec：{{specName}}\n原始需求：{{prompt}}\n\n以下是该需求的核心文档快照：\n\n【requirements.md】\n{{requirements}}\n\n【design.md】\n{{design}}\n\n【tasks.md】\n{{tasks}}\n\n请按“任务粒度合理性 + DAG 依赖质量 + scope 冲突可控性 + 可验收性”评审并评分（0-100）。\n请严格只输出 JSON，字段必须包含：\n- score：0-100 的整数\n- summary：一句话总评\n- strengths：3-8 条字符串数组\n- weaknesses：3-8 条字符串数组\n- suggestions：3-10 条字符串数组（每条以“必须/禁止/确保”开头，可直接作为下一轮约束）"
+      "user": "Spec：{{specName}}\n原始需求：{{prompt}}\n\n以下是该需求的核心文档快照：\n\n【requirements.md】\n{{requirements}}\n\n【design.md】\n{{design}}\n\n【tasks.md】\n{{tasks}}\n\n请基于以下事实评审：本流程已取消“任务原子化”阶段；tasks.md 将直接交付给 CLI Agent 执行（不会再进行二次拆解）。\n请按“任务粒度合理性 + DAG 依赖质量 + scope 冲突可控性 + 可执行性/可验收性”评审并评分（0-100）。\n\n重点检查：\n1) 粒度与数量：任务必须是模块级/交付物级，总数 <= 25；禁止原子级/步骤级拆解。\n2) 可执行性：description 是否写清输入/输出/验收点，并给出关键接口/数据结构/页面路由/命令等必要细节，避免空泛。\n3) 依赖质量：dependencies 是否准确引用任务 id，能形成无环 DAG，尽量最大化可并行性。\n4) scope 冲突：scope 是否能有效隔离主要修改范围，减少重叠；必要重叠是否用依赖关系串行化。\n5) 可验收性：是否提供可复现的验证方式（构建/测试/接口/页面路径与可观察结果）。\n\n请严格只输出 JSON，字段必须包含：\n- score：0-100 的整数\n- summary：一句话总评\n- strengths：3-8 条字符串数组\n- weaknesses：3-8 条字符串数组\n- suggestions：3-10 条字符串数组（每条以“必须/禁止/确保”开头，可直接作为下一轮约束）"
     },
     "mvp5Plan": {
       "label": "MVP5 执行方案生成",

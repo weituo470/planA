@@ -847,6 +847,7 @@ export function TerminalPanelInner(
     () => (activeId ? tabs.find((t) => t.id === activeId) ?? null : null),
     [activeId, tabs],
   );
+  const hasTabs = tabs.length > 0;
 
   return (
     <div className={className}>
@@ -860,7 +861,9 @@ export function TerminalPanelInner(
             当前：{activeTab.title}
             {!activeTab.running && activeTab.exitCode != null ? ` (exit ${activeTab.exitCode})` : ''}
           </div>
-        ) : null}
+        ) : hasTabs ? null : (
+          <div className="text-slate-500">暂无终端</div>
+        )}
         <div className="ml-auto flex items-center gap-2" ref={createMenuRef}>
           <Button
             variant="outline"
@@ -1138,98 +1141,94 @@ export function TerminalPanelInner(
         </div>
       ) : null}
 
-      <div className="mt-2 flex items-center gap-2 overflow-auto rounded-md border border-slate-800 bg-slate-950/50 px-2 py-1">
-        {tabs.length ? (
-          tabs.map((t) => {
-            const isActive = t.id === activeId;
-            return (
+      {!hasTabs ? (
+        <div className="mt-2 text-xs text-slate-500">未创建终端（点击“＋ 新建终端”后显示终端区域）</div>
+      ) : null}
+
+      {hasTabs ? (
+        <>
+          <div className="mt-2 flex items-center gap-2 overflow-auto rounded-md border border-slate-800 bg-slate-950/50 px-2 py-1">
+            {tabs.map((t) => {
+              const isActive = t.id === activeId;
+              return (
+                <div
+                  key={t.id}
+                  className={`flex items-center gap-1 rounded px-2 py-1 text-xs ${
+                    isActive ? 'bg-slate-800 text-slate-100' : 'bg-transparent text-slate-300'
+                  }`}
+                >
+                  <button
+                    className="max-w-[220px] truncate"
+                    onClick={() => setActiveId(t.id)}
+                    title={t.title}
+                  >
+                    {t.title}
+                  </button>
+                  <button
+                    className="ml-1 text-slate-400 hover:text-slate-200"
+                    onClick={() => void closeTab(t.id)}
+                    title="关闭终端"
+                  >
+                    ×
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="mt-2 overflow-hidden rounded-md border border-slate-700 bg-slate-950">
+            {tabs.map((t) => (
               <div
                 key={t.id}
-                className={`flex items-center gap-1 rounded px-2 py-1 text-xs ${
-                  isActive ? 'bg-slate-800 text-slate-100' : 'bg-transparent text-slate-300'
-                }`}
-              >
-                <button
-                  className="max-w-[220px] truncate"
-                  onClick={() => setActiveId(t.id)}
-                  title={t.title}
-                >
-                  {t.title}
-                </button>
-                <button
-                  className="ml-1 text-slate-400 hover:text-slate-200"
-                  onClick={() => void closeTab(t.id)}
-                  title="关闭终端"
-                >
-                  ×
-                </button>
-              </div>
-            );
-          })
-        ) : (
-          <div className="py-1 text-xs text-slate-400">暂无终端（可点击“＋ 新建终端”）</div>
-        )}
-      </div>
-
-      <div className="mt-2 overflow-hidden rounded-md border border-slate-700 bg-slate-950">
-        {tabs.length ? (
-          tabs.map((t) => (
-            <div
-              key={t.id}
-              ref={registerContainerRef(t.id)}
-              className={`${t.id === activeId ? heightClass : 'hidden'} w-full`}
-              onMouseDown={() => {
-                controllersRef.current.get(t.id)?.terminal.focus();
-              }}
-            />
-          ))
-        ) : (
-          <div
-            className={`flex ${heightClass} w-full items-center justify-center text-xs text-slate-500`}
-          >
-            终端面板为空
+                ref={registerContainerRef(t.id)}
+                className={`${t.id === activeId ? heightClass : 'hidden'} w-full`}
+                onMouseDown={() => {
+                  controllersRef.current.get(t.id)?.terminal.focus();
+                }}
+              />
+            ))}
           </div>
-        )}
-      </div>
 
-      <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-400">
-        <div>点击窗口后可输入；切换 Tab 类似 VSCode 终端</div>
-        <div className="ml-auto flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => {
-              if (!activeId) return;
-              controllersRef.current.get(activeId)?.terminal.clear();
-            }}
-            disabled={!activeId}
-          >
-            清屏
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => {
-              if (!activeId) return;
-              void hydrateFromBuffer(activeId);
-            }}
-            disabled={!activeId}
-          >
-            补历史
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => {
-              if (!activeId) return;
-              void fitAndReport(activeId);
-            }}
-            disabled={!activeId}
-          >
-            适配大小
-          </Button>
-        </div>
-      </div>
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+            <div>点击窗口后可输入；切换 Tab 类似 VSCode 终端</div>
+            <div className="ml-auto flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  if (!activeId) return;
+                  controllersRef.current.get(activeId)?.terminal.clear();
+                }}
+                disabled={!activeId}
+              >
+                清屏
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  if (!activeId) return;
+                  void hydrateFromBuffer(activeId);
+                }}
+                disabled={!activeId}
+              >
+                补历史
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  if (!activeId) return;
+                  void fitAndReport(activeId);
+                }}
+                disabled={!activeId}
+              >
+                适配大小
+              </Button>
+            </div>
+          </div>
+        </>
+      ) : null}
     </div>
   );
 }

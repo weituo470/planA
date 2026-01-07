@@ -104,6 +104,18 @@ type ReportScoreJobStatus = {
   updatedAt?: string | null;
 };
 
+type TasksIterateJobStatus = {
+  running: boolean;
+  total: number;
+  completed: number;
+  logs: AtomizeLogEntry[];
+  error?: string | null;
+  startedAt?: string | null;
+  updatedAt?: string | null;
+  outputRunId?: string | null;
+  outputReportPath?: string | null;
+};
+
 type SpecReportSummary = {
   runId: string;
   createdAt: string | null;
@@ -769,6 +781,7 @@ export default function App() {
   const [activeReportRunId, setActiveReportRunId] = useState('');
   const [reportMarkdown, setReportMarkdown] = useState('');
   const [reportScoreStatus, setReportScoreStatus] = useState<ReportScoreJobStatus | null>(null);
+  const [tasksIterateStatus, setTasksIterateStatus] = useState<TasksIterateJobStatus | null>(null);
   const [userReportScoreText, setUserReportScoreText] = useState('');
   const [userReportCommentText, setUserReportCommentText] = useState('');
   const [iterateUserNoteText, setIterateUserNoteText] = useState('');
@@ -785,6 +798,7 @@ export default function App() {
     running: boolean;
   } | null>(null);
   const reportScoreRunningPrevRef = useRef(false);
+  const tasksIterateRunningPrevRef = useRef(false);
   const baselineContentRef = useRef<Record<SpecArtifact, string>>({
     requirements: '',
     design: '',
@@ -1015,6 +1029,14 @@ export default function App() {
     return data;
   }, []);
 
+  const fetchTasksIterateStatus = useCallback(async (specName: string, runId: string) => {
+    const data = await apiJson<TasksIterateJobStatus>(
+      `/specs/${encodeURIComponent(specName)}/reports/${encodeURIComponent(runId)}/tasks-iterate`,
+    );
+    setTasksIterateStatus(data);
+    return data;
+  }, []);
+
   const loadReportMarkdown = useCallback(async (specName: string, runId: string) => {
     const data = await apiJson<{ reportPath: string | null; content: string }>(
       `/specs/${encodeURIComponent(specName)}/reports/${encodeURIComponent(runId)}/markdown`,
@@ -1035,6 +1057,22 @@ export default function App() {
     setReportScoreStatus(data);
     return data;
   }, []);
+
+  const startTasksIterateJob = useCallback(
+    async (specName: string, runId: string, userNote: string) => {
+      const data = await apiJson<TasksIterateJobStatus>(
+        `/specs/${encodeURIComponent(specName)}/reports/${encodeURIComponent(runId)}/tasks-iterate`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ userNote }),
+        },
+        TASK_TIMEOUT_MS,
+      );
+      setTasksIterateStatus(data);
+      return data;
+    },
+    [],
+  );
 
   const submitUserReportRating = useCallback(async () => {
     if (!selectedSpecName || !activeReportRunId) return;
@@ -1603,6 +1641,7 @@ export default function App() {
       setActiveReportRunId('');
       setReportMarkdown('');
       setReportScoreStatus(null);
+      setTasksIterateStatus(null);
       return;
     }
     void refreshReports(selectedSpecName).catch((e) => showToast(humanizeError(e)));
@@ -1611,12 +1650,20 @@ export default function App() {
   useEffect(() => {
     if (!selectedSpecName || !activeReportRunId) {
       setReportScoreStatus(null);
+      setTasksIterateStatus(null);
       return;
     }
     void fetchReportScoreStatus(selectedSpecName, activeReportRunId).catch((e) =>
       showToast(humanizeError(e)),
     );
   }, [activeReportRunId, fetchReportScoreStatus, selectedSpecName, showToast]);
+
+  useEffect(() => {
+    if (!selectedSpecName || !activeReportRunId) return;
+    void fetchTasksIterateStatus(selectedSpecName, activeReportRunId).catch((e) =>
+      showToast(humanizeError(e)),
+    );
+  }, [activeReportRunId, fetchTasksIterateStatus, selectedSpecName, showToast]);
 
   useEffect(() => {
     if (!selectedSpecName || !activeReportRunId) return;
@@ -1657,6 +1704,62 @@ export default function App() {
     reportScoreStatus?.running,
     selectedSpecName,
     showToast,
+  ]);
+
+  useEffect(() => {
+    if (!selectedSpecName || !activeReportRunId) return;
+    if (!tasksIterateStatus?.running) return;
+    const timer = window.setInterval(() => {
+      void fetchTasksIterateStatus(selectedSpecName, activeReportRunId).catch((e) =>
+        showToast(humanizeError(e)),
+      );
+      void refreshReports(selectedSpecName).catch(() => null);
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [
+    activeReportRunId,
+    fetchTasksIterateStatus,
+    refreshReports,
+    selectedSpecName,
+    showToast,
+    tasksIterateStatus?.running,
+  ]);
+
+  useEffect(() => {
+    const prevRunning = tasksIterateRunningPrevRef.current;
+    const nowRunning = Boolean(tasksIterateStatus?.running);
+    tasksIterateRunningPrevRef.current = nowRunning;
+    if (!prevRunning || nowRunning) return;
+    if (!selectedSpecName) return;
+
+    if (tasksIterateStatus?.error) {
+      showToast(tasksIterateStatus.error);
+      return;
+    }
+
+    showToast('任务迭代完成', 'info');
+    const outputRunId = (tasksIterateStatus?.outputRunId ?? '').trim();
+    void refreshReports(selectedSpecName)
+      .then((nextReports) => {
+        if (outputRunId && nextReports.some((r) => r.runId === outputRunId)) {
+          setActiveReportRunId(outputRunId);
+        } else if (!activeReportRunId && nextReports.length) {
+          setActiveReportRunId(nextReports[0]?.runId ?? '');
+        }
+        setReportMarkdown('');
+      })
+      .catch((e) => showToast(humanizeError(e)));
+    void loadArtifact(selectedSpecName, 'tasks').catch((e) => showToast(humanizeError(e)));
+  }, [
+    activeReportRunId,
+    fetchTasksIterateStatus,
+    loadArtifact,
+    refreshReports,
+    selectedSpecName,
+    showToast,
+    tasksIterateStatus?.error,
+    tasksIterateStatus?.outputRunId,
+    tasksIterateStatus?.running,
   ]);
 
   useEffect(() => {
@@ -2019,41 +2122,23 @@ export default function App() {
     }
   }, [atomicTaskStartDialog, selectedSpecName, showToast]);
 
-  const startIterateAtomize = useCallback(async () => {
+  const startIterateTasks = useCallback(async () => {
     if (!selectedSpecName || !activeReportRunId) return;
     setToast(null);
     try {
       setActiveArtifact('tasks');
-      setTaskView('atomic');
-      setTasksAtomicContent('');
-      const batchSize = Math.min(
-        20,
-        Math.max(1, Number.parseInt(atomizeBatchSizeText || '3', 10) || 3),
+      setTaskView('tasks');
+      const data = await startTasksIterateJob(
+        selectedSpecName,
+        activeReportRunId,
+        iterateUserNoteText,
       );
-      const data = await apiJson<AtomizeStatus>(
-        `/specs/${encodeURIComponent(selectedSpecName)}/tasks/atomize`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            batchSize,
-            resetAtomic: true,
-            iterateFromRunId: activeReportRunId,
-            iterateUserNote: iterateUserNoteText,
-          }),
-        },
-      );
-      setAtomizeStatus(data);
-      showToast('已启动迭代原子化', 'info');
+      showToast('已启动任务迭代（Opus 4.5）', 'info');
+      return data;
     } catch (e: any) {
       showToast(humanizeError(e));
     }
-  }, [
-    activeReportRunId,
-    atomizeBatchSizeText,
-    iterateUserNoteText,
-    selectedSpecName,
-    showToast,
-  ]);
+  }, [activeReportRunId, iterateUserNoteText, selectedSpecName, showToast, startTasksIterateJob]);
 
   useEffect(() => {
     if (!selectedSpecName) {
@@ -3758,6 +3843,66 @@ export default function App() {
                   </div>
                 </details>
 
+                <div className="mt-3 rounded-md border border-slate-800 bg-slate-950/40 p-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="text-xs font-semibold text-slate-200">任务迭代优化</div>
+                    <div className="ml-auto text-xs text-slate-400">模型：Claude 4.5 Opus</div>
+                  </div>
+                  <div className="mt-1 text-xs text-slate-400">
+                    点击后会收集上方多模型评价、用户评分记录，以及本次 runId 的 requirements/design/tasks，提交给 Opus 4.5 生成新的 tasks.md，并创建新的流程报告。
+                  </div>
+                  <textarea
+                    className="mt-2 h-24 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100"
+                    value={iterateUserNoteText}
+                    onChange={(e) => setIterateUserNoteText(e.target.value)}
+                    placeholder="可选：补充修改意见（例如：必须补齐缺失边界、禁止占位符路径、description 必须写清输入/输出/验收点等）"
+                  />
+                  <div className="mt-2 flex flex-wrap items-center justify-end gap-2">
+                    <Button
+                      size="sm"
+                      onClick={() => void startIterateTasks()}
+                      disabled={!activeReportRunId || Boolean(tasksIterateStatus?.running)}
+                    >
+                      {tasksIterateStatus?.running ? '迭代中…' : '提交迭代'}
+                    </Button>
+                  </div>
+
+                  {tasksIterateStatus &&
+                    (tasksIterateStatus.running ||
+                      tasksIterateStatus.logs?.length ||
+                      tasksIterateStatus.error) && (
+                      <div className="mt-2 rounded-md border border-slate-800 bg-slate-950/30 p-2">
+                        <div className="text-xs text-slate-400">
+                          进度：{tasksIterateStatus.completed}/{tasksIterateStatus.total || 1}
+                        </div>
+                        <div className="mt-2 h-24 overflow-auto rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-300">
+                          {tasksIterateStatus.logs?.length ? (
+                            tasksIterateStatus.logs.map((entry, idx) => (
+                              <div key={`${entry.at}-${idx}`}>{entry.message}</div>
+                            ))
+                          ) : (
+                            <div className="text-slate-400">暂无日志</div>
+                          )}
+                        </div>
+                        {tasksIterateStatus.error && (
+                          <div className="mt-2 text-xs text-red-300">
+                            失败：{tasksIterateStatus.error}
+                          </div>
+                        )}
+                        {tasksIterateStatus.outputRunId && (
+                          <div className="mt-2 text-xs text-slate-400 break-all">
+                            新 runId：{tasksIterateStatus.outputRunId}
+                          </div>
+                        )}
+                        {tasksIterateStatus.outputReportPath && (
+                          <div className="mt-1 text-xs text-slate-500 break-all">
+                            新报告：{tasksIterateStatus.outputReportPath}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                </div>
+
                 {ATOMIZE_ENABLED ? (
                   <div className="mt-3 rounded-md border border-slate-800 bg-slate-950/40 p-2">
                   <div className="flex flex-wrap items-center gap-2">
@@ -3781,7 +3926,7 @@ export default function App() {
                   <div className="mt-2 flex justify-end">
                     <Button
                       size="sm"
-                      onClick={() => void startIterateAtomize()}
+                      onClick={() => void startIterateTasks()}
                       disabled={!activeReportRunId || Boolean(atomizeStatus?.running)}
                     >
                       迭代原子化
@@ -3869,47 +4014,115 @@ export default function App() {
               </div>
             )}
 
-            <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-slate-400">
-              <div>可按需编辑内容</div>
-              <div className="ml-auto flex flex-wrap items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={undoEdit}
-                  disabled={
-                    !selectedSpecName ||
-                    isAtomicView ||
-                    historyState[activeArtifact].undo === 0
-                  }
-                >
-                  撤销
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={redoEdit}
-                  disabled={
-                    !selectedSpecName ||
-                    isAtomicView ||
-                    historyState[activeArtifact].redo === 0
-                  }
-                >
-                  还原
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={resetToBaseline}
-                  disabled={!selectedSpecName || isAtomicView}
-                >
-                  回到初始
-                </Button>
-              </div>
-            </div>
+            {activeArtifact === 'tasks' ? (
+              <details className="mb-2 rounded-md border border-slate-800 bg-slate-950/20 p-2">
+                <summary className="cursor-pointer select-none text-xs font-semibold text-slate-200">
+                  其它功能（终端 / 编辑 / 编排）
+                </summary>
+                <div className="mt-2 space-y-2">
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() =>
+                        setTasksDisplayMode((prev) => (prev === 'raw' ? 'markdown' : 'raw'))
+                      }
+                      disabled={Boolean(streamStage) || Boolean(busyLabel)}
+                    >
+                      {tasksDisplayMode === 'raw' ? '返回 DAG+任务清单' : '编辑 tasks.md'}
+                    </Button>
+                    <div className="ml-auto flex flex-wrap items-center gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={undoEdit}
+                        disabled={
+                          !selectedSpecName ||
+                          isAtomicView ||
+                          historyState[activeArtifact].undo === 0
+                        }
+                      >
+                        撤销
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={redoEdit}
+                        disabled={
+                          !selectedSpecName ||
+                          isAtomicView ||
+                          historyState[activeArtifact].redo === 0
+                        }
+                      >
+                        还原
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={resetToBaseline}
+                        disabled={!selectedSpecName || isAtomicView}
+                      >
+                        回到初始
+                      </Button>
+                    </div>
+                  </div>
 
-            {activeArtifact === 'tasks' && (
-              <div className="mb-2 rounded-md border border-slate-800 bg-slate-950/40 p-2 text-xs text-slate-300">
-                <TerminalPanel ref={terminalPanelRef} onOpenCliConfig={openCliConfig} />
+                  {selectedSpecName ? (
+                    <details className="rounded-md border border-slate-800 bg-slate-950/30 p-2">
+                      <summary className="cursor-pointer select-none text-xs font-semibold text-slate-200">
+                        编排 / DAG（高级）
+                      </summary>
+                      <div className="mt-2">
+                        <TaskOrchestrator
+                          specId={selectedSpecName}
+                          tasksContent={artifactContent.tasks ?? ''}
+                        />
+                      </div>
+                    </details>
+                  ) : null}
+
+                  <div className="rounded-md border border-slate-800 bg-slate-950/30 p-2 text-xs text-slate-300">
+                    <TerminalPanel ref={terminalPanelRef} onOpenCliConfig={openCliConfig} />
+                  </div>
+                </div>
+              </details>
+            ) : (
+              <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                <div>可按需编辑内容</div>
+                <div className="ml-auto flex flex-wrap items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={undoEdit}
+                    disabled={
+                      !selectedSpecName ||
+                      isAtomicView ||
+                      historyState[activeArtifact].undo === 0
+                    }
+                  >
+                    撤销
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={redoEdit}
+                    disabled={
+                      !selectedSpecName ||
+                      isAtomicView ||
+                      historyState[activeArtifact].redo === 0
+                    }
+                  >
+                    还原
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={resetToBaseline}
+                    disabled={!selectedSpecName || isAtomicView}
+                  >
+                    回到初始
+                  </Button>
+                </div>
               </div>
             )}
 
@@ -4018,67 +4231,23 @@ export default function App() {
                   <>
                     {activeArtifact === 'tasks' && selectedSpecName ? (
                       <>
-                        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                          {tasksDisplayMode === 'markdown' ? (
-                            <div className="flex flex-wrap items-center gap-2">
-                              <Button
-                                size="sm"
-                                variant={tasksMarkdownTab === 'runner' ? 'default' : 'outline'}
-                                onClick={() => setTasksMarkdownTab('runner')}
-                                disabled={Boolean(streamStage) || Boolean(busyLabel)}
-                              >
-                                任务列表
-                              </Button>
-                              <Button
-                                size="sm"
-                                variant={tasksMarkdownTab === 'orchestrator' ? 'default' : 'outline'}
-                                onClick={() => setTasksMarkdownTab('orchestrator')}
-                                disabled={Boolean(streamStage) || Boolean(busyLabel)}
-                              >
-                                编排 / DAG
-                              </Button>
-                            </div>
-                          ) : (
-                            <div />
-                          )}
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() =>
-                              setTasksDisplayMode((prev) =>
-                                prev === 'raw' ? 'markdown' : 'raw',
-                              )
-                            }
-                            disabled={Boolean(streamStage) || Boolean(busyLabel)}
-                          >
-                            {tasksDisplayMode === 'raw' ? '返回任务列表' : '编辑 tasks.md'}
-                          </Button>
-                        </div>
-
                         {tasksDisplayMode === 'markdown' ? (
-                          tasksMarkdownTab === 'orchestrator' ? (
-                            <TaskOrchestrator
-                              specId={selectedSpecName}
-                              tasksContent={artifactContent.tasks ?? ''}
-                            />
-                          ) : (
-                            <ManualTaskRunner
-                              specId={selectedSpecName}
-                              tasksContent={artifactContent.tasks ?? ''}
-                              disabled={Boolean(streamStage) || Boolean(busyLabel)}
-                              onSaveTasksContent={async (next) => {
-                                setArtifactContent((prev) => ({ ...prev, tasks: next }));
-                                await saveArtifact('tasks', next);
-                              }}
-                              onToast={(message, tone = 'error') => showToast(message, tone)}
-                            />
-                          )
+                          <ManualTaskRunner
+                            specId={selectedSpecName}
+                            tasksContent={artifactContent.tasks ?? ''}
+                            disabled={Boolean(streamStage) || Boolean(busyLabel)}
+                            onSaveTasksContent={async (next) => {
+                              setArtifactContent((prev) => ({ ...prev, tasks: next }));
+                              await saveArtifact('tasks', next);
+                            }}
+                            onToast={(message, tone = 'error') => showToast(message, tone)}
+                          />
                         ) : (
                           <textarea
                             ref={(el) => {
                               outputScrollRef.current = el;
                             }}
-                            className={`h-[520px] w-full rounded-md border bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent ${
+                            className={`min-h-[520px] w-full rounded-md border bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent ${
                               shouldTypewriter ? 'border-slate-600' : 'border-slate-700'
                             }`}
                             value={outputText}

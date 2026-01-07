@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { Button } from '../ui/button';
+import { TaskDagGraph } from './TaskDagGraph';
+import type { TaskGraph } from './types';
 
 const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
 
@@ -157,6 +159,194 @@ function getTaskDone(task: DagTask) {
   return task.done === true || task.status === 'completed';
 }
 
+async function copyTextToClipboard(text: string) {
+  const payload = String(text ?? '');
+  if (!payload) return false;
+  try {
+    await navigator.clipboard.writeText(payload);
+    return true;
+  } catch {
+    // ignore
+  }
+
+  try {
+    const textarea = document.createElement('textarea');
+    textarea.value = payload;
+    textarea.setAttribute('readonly', 'true');
+    textarea.style.position = 'fixed';
+    textarea.style.top = '-9999px';
+    textarea.style.left = '-9999px';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    const ok = document.execCommand('copy');
+    textarea.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+function buildTaskGraphFromDagTasks(tasks: DagTask[]): TaskGraph {
+  const taskIds = new Set(tasks.map((t) => t.id));
+
+  const nodes: TaskGraph['tasks'] = tasks.map((t) => ({
+    id: t.id,
+    title: t.title || t.id,
+    description: t.description || '',
+    level: 0,
+    inDegree: 0,
+    outDegree: 0,
+    riskLevel: undefined,
+    requiresInteraction: false,
+  }));
+
+  const edges: TaskGraph['edges'] = [];
+  for (const task of tasks) {
+    for (const dep of task.dependencies ?? []) {
+      const depId = String(dep || '').trim();
+      if (!depId || depId === task.id) continue;
+      if (!taskIds.has(depId)) continue;
+      edges.push({
+        from: depId,
+        to: task.id,
+        type: 'explicit',
+        strength: 'strong',
+        description: 'depends-on',
+      });
+    }
+  }
+
+  const adjacency: TaskGraph['adjacency'] = {};
+  const inDegree = new Map<string, number>();
+  const outDegree = new Map<string, number>();
+
+  for (const node of nodes) {
+    adjacency[node.id] = { in: [], out: [] };
+    inDegree.set(node.id, 0);
+    outDegree.set(node.id, 0);
+  }
+
+  for (const edge of edges) {
+    if (!adjacency[edge.from] || !adjacency[edge.to]) continue;
+    adjacency[edge.from].out.push({ from: edge.to, type: edge.type });
+    adjacency[edge.to].in.push({ to: edge.from, type: edge.type });
+    inDegree.set(edge.to, (inDegree.get(edge.to) ?? 0) + 1);
+    outDegree.set(edge.from, (outDegree.get(edge.from) ?? 0) + 1);
+  }
+
+  const queue: string[] = [];
+  for (const [id, deg] of inDegree.entries()) {
+    if (deg === 0) queue.push(id);
+  }
+  queue.sort();
+
+  const inDegreeWork = new Map(inDegree);
+  const topologicalOrder: string[] = [];
+
+  while (queue.length) {
+    const id = queue.shift()!;
+    topologicalOrder.push(id);
+    for (const outEdge of adjacency[id]?.out ?? []) {
+      const to = outEdge.from;
+      const next = (inDegreeWork.get(to) ?? 0) - 1;
+      inDegreeWork.set(to, next);
+      if (next === 0) {
+        queue.push(to);
+        queue.sort();
+      }
+    }
+  }
+
+  const hasCycle = topologicalOrder.length !== nodes.length;
+  const cycles = hasCycle
+    ? nodes
+        .map((n) => n.id)
+        .filter((id) => (inDegreeWork.get(id) ?? 0) > 0)
+        .sort()
+    : [];
+
+  const levelById = new Map<string, number>();
+  for (const id of topologicalOrder) {
+    const incoming = adjacency[id]?.in ?? [];
+    let level = 0;
+    for (const inc of incoming) {
+      const from = inc.to;
+      const prev = levelById.get(from) ?? 0;
+      level = Math.max(level, prev + 1);
+    }
+    levelById.set(id, level);
+  }
+
+  let criticalPath: string[] = [];
+  let totalDuration = 0;
+  if (!hasCycle && topologicalOrder.length) {
+    const dist = new Map<string, number>();
+    const prev = new Map<string, string | null>();
+    for (const id of topologicalOrder) {
+      dist.set(id, 0);
+      prev.set(id, null);
+    }
+
+    for (const id of topologicalOrder) {
+      const base = dist.get(id) ?? 0;
+      for (const outEdge of adjacency[id]?.out ?? []) {
+        const to = outEdge.from;
+        const next = base + 1;
+        if (next > (dist.get(to) ?? 0)) {
+          dist.set(to, next);
+          prev.set(to, id);
+        }
+      }
+    }
+
+    let bestId = topologicalOrder[0];
+    for (const id of topologicalOrder) {
+      if ((dist.get(id) ?? 0) > (dist.get(bestId) ?? 0)) bestId = id;
+    }
+
+    totalDuration = (dist.get(bestId) ?? 0) + 1;
+    const path: string[] = [];
+    let cur: string | null | undefined = bestId;
+    while (cur) {
+      path.push(cur);
+      cur = prev.get(cur) ?? null;
+    }
+    criticalPath = path.reverse();
+  }
+
+  for (const node of nodes) {
+    node.inDegree = inDegree.get(node.id) ?? 0;
+    node.outDegree = outDegree.get(node.id) ?? 0;
+    node.level = levelById.get(node.id) ?? 0;
+  }
+
+  const groupMap = new Map<number, string[]>();
+  for (const node of nodes) {
+    const list = groupMap.get(node.level) ?? [];
+    list.push(node.id);
+    groupMap.set(node.level, list);
+  }
+  const parallelGroups = Array.from(groupMap.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([level, taskIds]) => ({
+      level,
+      taskIds: taskIds.sort(),
+      canRunSimultaneously: true,
+    }));
+
+  return {
+    tasks: nodes,
+    edges,
+    adjacency,
+    topologicalOrder,
+    hasCycle,
+    cycles,
+    parallelGroups,
+    criticalPath: { path: criticalPath, totalDuration },
+  };
+}
+
 export function ManualTaskRunner({
   specId,
   tasksContent,
@@ -177,6 +367,7 @@ export function ManualTaskRunner({
     runDocPathAbs?: string;
   } | null>(null);
   const [promptLoadingTaskId, setPromptLoadingTaskId] = useState<string | null>(null);
+  const [dagExpanded, setDagExpanded] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
@@ -203,7 +394,6 @@ export function ManualTaskRunner({
   const parsed = useMemo(() => parseDagTasksFromTasksContent(tasksContent), [tasksContent]);
 
   const tasks = useMemo(() => parsed?.tasks ?? [], [parsed]);
-  const taskById = useMemo(() => new Map(tasks.map((t) => [t.id, t])), [tasks]);
   const doneById = useMemo(() => {
     const map = new Map<string, boolean>();
     for (const task of tasks) map.set(task.id, getTaskDone(task));
@@ -217,14 +407,30 @@ export function ManualTaskRunner({
     return map;
   }, [tasks]);
 
+  const taskGraph = useMemo(() => buildTaskGraphFromDagTasks(tasks), [tasks]);
+  const taskStatusByIdForDag = useMemo(() => {
+    const map: Record<string, 'pending' | 'running' | 'completed' | 'failed'> = {};
+    for (const task of tasks) {
+      const status = task.status ?? (getTaskDone(task) ? 'completed' : 'pending');
+      map[task.id] = status === 'running' ? 'running' : status === 'completed' ? 'completed' : 'pending';
+    }
+    return map;
+  }, [tasks]);
+
   const handleGeneratePrompt = useCallback(
-    async (task: DagTask) => {
+    async (
+      task: DagTask,
+      options?: { autoCopy?: boolean; showPanel?: boolean },
+    ) => {
       const deps = task.dependencies ?? [];
       const missing = deps.filter((depId) => !doneById.get(depId));
       if (missing.length) {
         onToast(`前置任务未完成：${missing.join(', ')}`, 'error');
         return;
       }
+
+      const autoCopy = options?.autoCopy === true;
+      const showPanel = options?.showPanel !== false;
 
       setPromptLoadingTaskId(task.id);
       try {
@@ -243,7 +449,21 @@ export function ManualTaskRunner({
         if (!res.ok) throw new Error(data?.error || '生成提示词失败');
         const prompt = String(data?.prompt || '').trim();
         if (!prompt) throw new Error('生成提示词失败：prompt 为空');
-        setPromptForTask({ taskId: task.id, prompt, runDocPathAbs: data.runDocPathAbs });
+
+        if (autoCopy) {
+          const ok = await copyTextToClipboard(prompt);
+          if (ok) {
+            onToast('已自动复制任务提示词', 'info');
+          } else {
+            setPromptForTask({ taskId: task.id, prompt, runDocPathAbs: data.runDocPathAbs });
+            onToast('自动复制失败：已生成提示词，可手动复制', 'error');
+          }
+          return;
+        }
+
+        if (showPanel) {
+          setPromptForTask({ taskId: task.id, prompt, runDocPathAbs: data.runDocPathAbs });
+        }
         onToast('已生成提示词（可复制发给 CLI）', 'info');
       } catch (e: any) {
         onToast(String(e?.message || e || '生成提示词失败'), 'error');
@@ -327,6 +547,57 @@ export function ManualTaskRunner({
     [disabled, doneById, onSaveTasksContent, onToast, tasksContent],
   );
 
+  const taskActionsByIdForDag = useMemo(() => {
+    const map: Record<
+      string,
+      {
+        start: { label: string; title: string; disabled: boolean; onClick: () => void };
+        running: { label: string; title: string; disabled: boolean; onClick: () => void };
+        done: { label: string; title: string; disabled: boolean; onClick: () => void };
+      }
+    > = {};
+
+    for (const task of tasks) {
+      const done = doneById.get(task.id) === true;
+      const status = statusById.get(task.id) ?? (done ? 'completed' : 'pending');
+      const missingDeps = (task.dependencies || []).filter((depId) => !doneById.get(depId));
+      const blocked = missingDeps.length > 0;
+      const promptLoading = promptLoadingTaskId === task.id;
+
+      map[task.id] = {
+        start: {
+          label: promptLoading ? '生成中…' : '开始',
+          title: '开始并自动复制提示词',
+          disabled: Boolean(disabled) || done || promptLoading,
+          onClick: () => void handleGeneratePrompt(task, { autoCopy: true, showPanel: false }),
+        },
+        running: {
+          label: '进行中',
+          title: blocked ? `被阻塞：${missingDeps.join(', ')}` : '标记进行中',
+          disabled: Boolean(disabled) || done || blocked || status === 'running',
+          onClick: () => void handleMarkRunning(task),
+        },
+        done: {
+          label: '已完成',
+          title: '标记已完成',
+          disabled: Boolean(disabled) || done,
+          onClick: () => void handleMarkDone(task),
+        },
+      };
+    }
+
+    return map;
+  }, [
+    disabled,
+    doneById,
+    handleGeneratePrompt,
+    handleMarkDone,
+    handleMarkRunning,
+    promptLoadingTaskId,
+    statusById,
+    tasks,
+  ]);
+
   if (!parsed || !tasks.length) {
     return (
       <div className="h-[520px] w-full overflow-auto rounded-md border border-slate-700 bg-slate-950 px-3 py-3 text-sm text-slate-200">
@@ -336,7 +607,7 @@ export function ManualTaskRunner({
   }
 
   return (
-    <div className="h-[520px] w-full overflow-auto rounded-md border border-slate-700 bg-slate-950 px-3 py-3 text-sm text-slate-100">
+    <div className="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-3 text-sm text-slate-100">
       <div className="mb-3 flex flex-wrap items-center gap-2">
         <div className="text-sm font-semibold text-slate-200">任务列表（Markdown）</div>
         <div className="text-xs text-slate-500">
@@ -347,6 +618,51 @@ export function ManualTaskRunner({
           ) : (
             'CLI 根目录：未加载'
           )}
+        </div>
+      </div>
+
+      <div className="mb-3 rounded-md border border-slate-800 bg-slate-950/40 px-2 py-2">
+        <div className="flex items-center justify-between gap-2 px-1">
+          <div className="text-xs font-semibold text-slate-200">DAG 图（依赖关系）</div>
+          <button
+            type="button"
+            onClick={() => setDagExpanded((prev) => !prev)}
+            className="text-xs text-slate-400 transition-colors hover:text-slate-200"
+          >
+            {dagExpanded ? '收起' : '展开'}
+          </button>
+        </div>
+        {dagExpanded ? (
+          <div className="mt-2">
+            <TaskDagGraph
+              graph={taskGraph}
+              taskStatusById={taskStatusByIdForDag}
+              taskActionsById={taskActionsByIdForDag}
+              height={420}
+            />
+          </div>
+        ) : (
+          <div className="mt-2 px-1 text-xs text-slate-500">已收起</div>
+        )}
+      </div>
+
+      <div className="mb-3 rounded-md border border-slate-800 bg-slate-950/40 px-3 py-2 text-xs text-slate-400">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+          <div className="flex items-center gap-2">
+            <span
+              className="h-2.5 w-2.5 rounded-full bg-blue-400 shadow-[0_0_10px_rgba(59,130,246,0.45)]"
+              aria-hidden="true"
+            />
+            <span>点击右侧“进行中”状态灯，写回 tasks.md</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span
+              className="h-2.5 w-2.5 rounded-full bg-green-400 shadow-[0_0_10px_rgba(34,197,94,0.45)]"
+              aria-hidden="true"
+            />
+            <span>点击右侧“已完成”状态灯，写回 tasks.md</span>
+          </div>
+          <div className="text-slate-500">（被阻塞任务需先完成前置）</div>
         </div>
       </div>
 
@@ -366,16 +682,38 @@ export function ManualTaskRunner({
               <div className="flex flex-wrap items-start gap-2">
                 <div className="text-xs font-semibold text-slate-100">{task.id}</div>
                 <div className="text-xs text-slate-300">{task.title || ''}</div>
-                <div
-                  className={`text-xs ${
-                    status === 'completed'
-                      ? 'text-green-400'
+                <div className="flex items-center gap-2 text-xs">
+                  <span
+                    className={`h-2 w-2 rounded-full ${
+                      status === 'completed'
+                        ? 'bg-green-400'
+                        : status === 'running'
+                          ? 'bg-blue-300'
+                          : blocked
+                            ? 'bg-amber-300'
+                            : 'bg-slate-600'
+                    }`}
+                    aria-hidden="true"
+                  />
+                  <span
+                    className={`${
+                      status === 'completed'
+                        ? 'text-green-400'
+                        : status === 'running'
+                          ? 'text-blue-300'
+                          : blocked
+                            ? 'text-amber-300'
+                            : 'text-slate-500'
+                    }`}
+                  >
+                    {status === 'completed'
+                      ? '已完成'
                       : status === 'running'
-                        ? 'text-blue-300'
-                        : 'text-slate-500'
-                  }`}
-                >
-                  {status === 'completed' ? '已完成' : status === 'running' ? '进行中' : blocked ? '被前置任务阻塞' : '未开始'}
+                        ? '进行中'
+                        : blocked
+                          ? '被前置任务阻塞'
+                          : '未开始'}
+                  </span>
                 </div>
                 <div className="ml-auto flex flex-wrap items-center gap-2">
                   <Button
@@ -385,22 +723,48 @@ export function ManualTaskRunner({
                   >
                     {promptLoadingTaskId === task.id ? '生成中…' : '开始'}
                   </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => void handleMarkRunning(task)}
-                    disabled={disabled || done || blocked || status === 'running'}
-                  >
-                    进行中
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => void handleMarkDone(task)}
-                    disabled={disabled || done}
-                  >
-                    已完成提交
-                  </Button>
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => void handleMarkRunning(task)}
+                      disabled={disabled || done || blocked || status === 'running'}
+                      className={`group inline-flex items-center gap-1 rounded px-1 py-0.5 text-xs transition-colors hover:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500/30 disabled:cursor-not-allowed disabled:opacity-40 ${
+                        status === 'running' ? 'text-blue-300' : 'text-slate-400'
+                      }`}
+                      title="点亮=进行中"
+                      aria-label="标记进行中"
+                    >
+                      <span
+                        className={`h-3 w-3 rounded-full bg-slate-700 transition-colors ${
+                          status === 'running'
+                            ? 'bg-blue-400 shadow-[0_0_10px_rgba(59,130,246,0.55)]'
+                            : 'group-hover:bg-blue-400/70'
+                        }`}
+                        aria-hidden="true"
+                      />
+                      <span>进行中</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleMarkDone(task)}
+                      disabled={disabled || done}
+                      className={`group inline-flex items-center gap-1 rounded px-1 py-0.5 text-xs transition-colors hover:text-slate-100 focus:outline-none focus:ring-2 focus:ring-green-500/30 disabled:cursor-not-allowed disabled:opacity-40 ${
+                        status === 'completed' || done ? 'text-green-400' : 'text-slate-400'
+                      }`}
+                      title="点亮=已完成"
+                      aria-label="标记已完成"
+                    >
+                      <span
+                        className={`h-3 w-3 rounded-full bg-slate-700 transition-colors ${
+                          status === 'completed' || done
+                            ? 'bg-green-400 shadow-[0_0_10px_rgba(34,197,94,0.55)]'
+                            : 'group-hover:bg-green-400/70'
+                        }`}
+                        aria-hidden="true"
+                      />
+                      <span>已完成</span>
+                    </button>
+                  </div>
                 </div>
               </div>
 
