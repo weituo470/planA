@@ -7,6 +7,8 @@ import type { TaskGraph } from './types';
 const NODE_WIDTH = 240;
 const NODE_HEIGHT = 72;
 
+type TaskStatus = 'pending' | 'running' | 'completed' | 'failed';
+
 function layoutDag(nodes: Node[], edges: Edge[]) {
   const g = new dagre.graphlib.Graph();
   g.setDefaultEdgeLabel(() => ({}));
@@ -38,7 +40,36 @@ function nodeColorByRisk(risk: string | undefined) {
   return '#e5e7eb';
 }
 
-export function TaskDagGraph({ graph, className = '' }: { graph: TaskGraph; className?: string }) {
+function nodeBorderByStatus(status: TaskStatus) {
+  if (status === 'completed') return '#22c55e';
+  if (status === 'running') return '#3b82f6';
+  if (status === 'failed') return '#ef4444';
+  return '#d1d5db';
+}
+
+function statusLabel(status: TaskStatus) {
+  if (status === 'completed') return '已完成';
+  if (status === 'running') return '进行中';
+  if (status === 'failed') return '失败';
+  return '未开始';
+}
+
+function statusBadgeClass(status: TaskStatus) {
+  if (status === 'completed') return 'bg-green-100 text-green-700';
+  if (status === 'running') return 'bg-blue-100 text-blue-700';
+  if (status === 'failed') return 'bg-red-100 text-red-700';
+  return 'bg-gray-100 text-gray-600';
+}
+
+export function TaskDagGraph({
+  graph,
+  taskStatusById,
+  className = '',
+}: {
+  graph: TaskGraph;
+  taskStatusById?: Record<string, TaskStatus | undefined>;
+  className?: string;
+}) {
   const { nodes, edges } = useMemo(() => {
     const nodes: Node[] = (graph?.tasks ?? []).map((t) => ({
       id: t.id,
@@ -47,7 +78,16 @@ export function TaskDagGraph({ graph, className = '' }: { graph: TaskGraph; clas
       data: {
         label: (
           <div className="px-2 py-1">
-            <div className="text-xs font-mono text-gray-600">{t.id}</div>
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-xs font-mono text-gray-600">{t.id}</div>
+              <span
+                className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${statusBadgeClass(
+                  taskStatusById?.[t.id] ?? 'pending',
+                )}`}
+              >
+                {statusLabel(taskStatusById?.[t.id] ?? 'pending')}
+              </span>
+            </div>
             <div className="text-xs font-semibold text-gray-800 truncate" title={t.title}>
               {t.title}
             </div>
@@ -57,7 +97,7 @@ export function TaskDagGraph({ graph, className = '' }: { graph: TaskGraph; clas
       style: {
         width: NODE_WIDTH,
         height: NODE_HEIGHT,
-        border: '1px solid #d1d5db',
+        border: `2px solid ${nodeBorderByStatus(taskStatusById?.[t.id] ?? 'pending')}`,
         borderRadius: 8,
         background: nodeColorByRisk(t.riskLevel),
         padding: 0,

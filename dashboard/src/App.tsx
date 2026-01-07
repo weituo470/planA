@@ -4,7 +4,7 @@ import JSZip from 'jszip';
 import { Button } from './components/ui/button';
 import { ExplorerSidebar } from './ExplorerSidebar';
 import { TerminalPanel, type TerminalPanelHandle, type AssignableCliTerminal } from './TerminalPanel';
-import { TaskOrchestrator } from './components/mvp5';
+import { ManualTaskRunner, TaskOrchestrator } from './components/mvp5';
 import type {
   ClarificationQuestion,
   LlmInfo,
@@ -760,6 +760,8 @@ export default function App() {
   const [tasksAtomicContent, setTasksAtomicContent] = useState('');
   const [atomicDisplayMode, setAtomicDisplayMode] = useState<'list' | 'raw'>('list');
   const [explorerOpen, setExplorerOpen] = useState(true);
+  const [tasksDisplayMode, setTasksDisplayMode] = useState<'markdown' | 'raw'>('markdown');
+  const [tasksMarkdownTab, setTasksMarkdownTab] = useState<'runner' | 'orchestrator'>('runner');
   const [atomizeStatus, setAtomizeStatus] = useState<AtomizeStatus | null>(null);
   const [atomizeBatchSizeText, setAtomizeBatchSizeText] = useState('3');
   const [atomizeAutoContinue, setAtomizeAutoContinue] = useState(true);
@@ -770,8 +772,6 @@ export default function App() {
   const [userReportScoreText, setUserReportScoreText] = useState('');
   const [userReportCommentText, setUserReportCommentText] = useState('');
   const [iterateUserNoteText, setIterateUserNoteText] = useState('');
-  // MVP5: 智能任务编排状态
-  const [orchestratorOpen, setOrchestratorOpen] = useState(false);
   const [atomicTaskStartDialog, setAtomicTaskStartDialog] = useState<{
     taskId: string;
     mode: 'new-codex' | 'new-claude' | 'existing';
@@ -2838,7 +2838,7 @@ export default function App() {
                 <li>切到“需求”，完成“提问确认”，点“生成 requirements.md（并生成设计）”。</li>
                 <li>切到“设计”，完成“技术栈确认”，点“确认技术栈并生成任务”。</li>
                 <li>
-                  切到“任务”，在 tasks.md 的 TASKS_JSON 里维护模块级任务与 dependencies；点“打开任务编排”分析依赖并生成执行方案。
+                  切到“任务”，维护 tasks.md 的 TASKS_JSON（模块级任务 + dependencies），并按任务列表逐条执行（支持生成提示词一键复制）。
                 </li>
                 <li>
                   需要交付给 AI IDE 时，点“一键下载（ZIP）”，按 tasks.md 的任务逐条开发，并在 tasks.md 回写关键变更与验证结果。
@@ -3382,14 +3382,6 @@ export default function App() {
                 <>
                   <Button
                     size="sm"
-                    onClick={() => setOrchestratorOpen((prev) => !prev)}
-                    disabled={!selectedSpecName}
-                    className={orchestratorOpen ? 'bg-purple-700 hover:bg-purple-600' : ''}
-                  >
-                    {orchestratorOpen ? '收起任务编排' : '打开任务编排'}
-                  </Button>
-                  <Button
-                    size="sm"
                     onClick={() => void downloadAllZip()}
                     disabled={!selectedSpecName || Boolean(busyLabel)}
                     className={nextAction === 'downloadZip' ? guidedButtonClass : ''}
@@ -3412,12 +3404,6 @@ export default function App() {
                 </Button>
               </div>
             </div>
-
-            {activeArtifact === 'tasks' && selectedSpecName && orchestratorOpen ? (
-              <div className="mb-3 rounded-md border border-slate-800 bg-slate-950/40 p-3">
-                <TaskOrchestrator specId={selectedSpecName} tasksContent={artifactContent.tasks} />
-              </div>
-            ) : null}
 
             {activeArtifact === 'tasks' && ATOMIZE_ENABLED && (
               <div className="mb-3 rounded-md border border-slate-800 bg-slate-950/40 p-3">
@@ -3959,39 +3945,6 @@ export default function App() {
                   >
                     {atomicTaskGroups.length ? (
                       <>
-                        {/* MVP5: 智能任务编排按钮 */}
-                        <div className="mb-4 flex items-center justify-between rounded-md border border-purple-900/50 bg-purple-950/30 p-3">
-                          <div className="flex items-center gap-2">
-                            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-purple-900/50 text-purple-300">
-                              <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                              </svg>
-                            </div>
-                            <div>
-                              <div className="text-sm font-medium text-purple-200">智能任务编排</div>
-                              <div className="text-xs text-purple-400">AI 分析依赖关系并推荐执行方案</div>
-                            </div>
-                          </div>
-                          <Button
-                            size="sm"
-                            onClick={() => setOrchestratorOpen(!orchestratorOpen)}
-                            disabled={!selectedSpecName}
-                            className="bg-purple-700 hover:bg-purple-600"
-                          >
-                            {orchestratorOpen ? '收起' : '打开'}
-                          </Button>
-                        </div>
-
-                        {/* MVP5: TaskOrchestrator 组件 */}
-                        {orchestratorOpen && (
-                          <div className="mb-4">
-                            <TaskOrchestrator
-                              specId={selectedSpecName || ''}
-                              tasksContent={artifactContent.tasks ?? ''}
-                            />
-                          </div>
-                        )}
-
                         <div className="space-y-5">
                         {atomicTaskGroups.map((group, groupIdx) => (
                           <div key={`${group.originalIndex ?? 'na'}-${groupIdx}`}>
@@ -4063,95 +4016,152 @@ export default function App() {
                   </div>
                 ) : (
                   <>
-                    {activeArtifact === 'tasks' ? (
-                      <div className="mb-4">
-                        <div className="mb-3 flex items-center justify-between rounded-md border border-purple-900/50 bg-purple-950/30 p-3">
-                          <div className="flex items-center gap-2">
-                            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-purple-900/50 text-purple-300">
-                              <svg
-                                className="h-4 w-4"
-                                fill="none"
-                                stroke="currentColor"
-                                viewBox="0 0 24 24"
+                    {activeArtifact === 'tasks' && selectedSpecName ? (
+                      <>
+                        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                          {tasksDisplayMode === 'markdown' ? (
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Button
+                                size="sm"
+                                variant={tasksMarkdownTab === 'runner' ? 'default' : 'outline'}
+                                onClick={() => setTasksMarkdownTab('runner')}
+                                disabled={Boolean(streamStage) || Boolean(busyLabel)}
                               >
-                                <path
-                                  strokeLinecap="round"
-                                  strokeLinejoin="round"
-                                  strokeWidth={2}
-                                  d="M13 10V3L4 14h7v7l9-11h-7z"
-                                />
-                              </svg>
+                                任务列表
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant={tasksMarkdownTab === 'orchestrator' ? 'default' : 'outline'}
+                                onClick={() => setTasksMarkdownTab('orchestrator')}
+                                disabled={Boolean(streamStage) || Boolean(busyLabel)}
+                              >
+                                编排 / DAG
+                              </Button>
                             </div>
-                            <div>
-                              <div className="text-sm font-medium text-purple-200">任务编排</div>
-                              <div className="text-xs text-purple-400">
-                                基于 tasks.md 的 TASKS_JSON 分析依赖并推荐执行顺序（并发≤8）
-                              </div>
-                            </div>
-                          </div>
+                          ) : (
+                            <div />
+                          )}
                           <Button
+                            variant="outline"
                             size="sm"
-                            onClick={() => setOrchestratorOpen(!orchestratorOpen)}
-                            disabled={!selectedSpecName}
-                            className="bg-purple-700 hover:bg-purple-600"
+                            onClick={() =>
+                              setTasksDisplayMode((prev) =>
+                                prev === 'raw' ? 'markdown' : 'raw',
+                              )
+                            }
+                            disabled={Boolean(streamStage) || Boolean(busyLabel)}
                           >
-                            {orchestratorOpen ? '收起任务编排' : '打开任务编排'}
+                            {tasksDisplayMode === 'raw' ? '返回任务列表' : '编辑 tasks.md'}
                           </Button>
                         </div>
 
-                        {orchestratorOpen && (
-                          <div className="mb-4">
+                        {tasksDisplayMode === 'markdown' ? (
+                          tasksMarkdownTab === 'orchestrator' ? (
                             <TaskOrchestrator
-                              specId={selectedSpecName || ''}
+                              specId={selectedSpecName}
                               tasksContent={artifactContent.tasks ?? ''}
                             />
-                          </div>
+                          ) : (
+                            <ManualTaskRunner
+                              specId={selectedSpecName}
+                              tasksContent={artifactContent.tasks ?? ''}
+                              disabled={Boolean(streamStage) || Boolean(busyLabel)}
+                              onSaveTasksContent={async (next) => {
+                                setArtifactContent((prev) => ({ ...prev, tasks: next }));
+                                await saveArtifact('tasks', next);
+                              }}
+                              onToast={(message, tone = 'error') => showToast(message, tone)}
+                            />
+                          )
+                        ) : (
+                          <textarea
+                            ref={(el) => {
+                              outputScrollRef.current = el;
+                            }}
+                            className={`h-[520px] w-full rounded-md border bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent ${
+                              shouldTypewriter ? 'border-slate-600' : 'border-slate-700'
+                            }`}
+                            value={outputText}
+                            onChange={(e) =>
+                              setArtifactContent((prev) => {
+                                if (isAtomicView) return prev;
+                                const nextValue = e.target.value;
+                                const currentValue = prev[activeArtifact] ?? '';
+                                const next = { ...prev, [activeArtifact]: nextValue };
+
+                                if (
+                                  selectedSpecName &&
+                                  !isApplyingHistoryRef.current &&
+                                  nextValue !== currentValue
+                                ) {
+                                  const h = historyRef.current[activeArtifact];
+                                  h.undo.push(currentValue);
+                                  if (h.undo.length > 80) h.undo.shift();
+                                  h.redo = [];
+                                  setHistoryState((prevState) => ({
+                                    ...prevState,
+                                    [activeArtifact]: { undo: h.undo.length, redo: 0 },
+                                  }));
+                                }
+
+                                if (selectedSpecName) {
+                                  if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+                                  saveTimerRef.current = window.setTimeout(() => {
+                                    void saveArtifact(activeArtifact);
+                                  }, 900);
+                                }
+                                return next;
+                              })
+                            }
+                            disabled={!selectedSpecName}
+                            readOnly={isAtomicView || Boolean(streamStage)}
+                          />
                         )}
-                      </div>
-                    ) : null}
+                      </>
+                    ) : (
+                      <textarea
+                        ref={(el) => {
+                          outputScrollRef.current = el;
+                        }}
+                        className={`h-[520px] w-full rounded-md border bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent ${
+                          shouldTypewriter ? 'border-slate-600' : 'border-slate-700'
+                        }`}
+                        value={outputText}
+                        onChange={(e) =>
+                          setArtifactContent((prev) => {
+                            if (isAtomicView) return prev;
+                            const nextValue = e.target.value;
+                            const currentValue = prev[activeArtifact] ?? '';
+                            const next = { ...prev, [activeArtifact]: nextValue };
 
-                    <textarea
-                      ref={(el) => {
-                        outputScrollRef.current = el;
-                      }}
-                      className={`h-[520px] w-full rounded-md border bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent ${
-                        shouldTypewriter ? 'border-slate-600' : 'border-slate-700'
-                      }`}
-                      value={outputText}
-                      onChange={(e) =>
-                        setArtifactContent((prev) => {
-                          if (isAtomicView) return prev;
-                          const nextValue = e.target.value;
-                          const currentValue = prev[activeArtifact] ?? '';
-                          const next = { ...prev, [activeArtifact]: nextValue };
+                            if (
+                              selectedSpecName &&
+                              !isApplyingHistoryRef.current &&
+                              nextValue !== currentValue
+                            ) {
+                              const h = historyRef.current[activeArtifact];
+                              h.undo.push(currentValue);
+                              if (h.undo.length > 80) h.undo.shift();
+                              h.redo = [];
+                              setHistoryState((prevState) => ({
+                                ...prevState,
+                                [activeArtifact]: { undo: h.undo.length, redo: 0 },
+                              }));
+                            }
 
-                          if (
-                            selectedSpecName &&
-                            !isApplyingHistoryRef.current &&
-                            nextValue !== currentValue
-                          ) {
-                            const h = historyRef.current[activeArtifact];
-                            h.undo.push(currentValue);
-                            if (h.undo.length > 80) h.undo.shift();
-                            h.redo = [];
-                            setHistoryState((prevState) => ({
-                              ...prevState,
-                              [activeArtifact]: { undo: h.undo.length, redo: 0 },
-                            }));
-                          }
-
-                          if (selectedSpecName) {
-                            if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
-                            saveTimerRef.current = window.setTimeout(() => {
-                              void saveArtifact(activeArtifact);
-                            }, 900);
-                          }
-                          return next;
-                        })
-                      }
-                      disabled={!selectedSpecName}
-                      readOnly={isAtomicView || Boolean(streamStage)}
-                    />
+                            if (selectedSpecName) {
+                              if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+                              saveTimerRef.current = window.setTimeout(() => {
+                                void saveArtifact(activeArtifact);
+                              }, 900);
+                            }
+                            return next;
+                          })
+                        }
+                        disabled={!selectedSpecName}
+                        readOnly={isAtomicView || Boolean(streamStage)}
+                      />
+                    )}
                   </>
                 )
               )}

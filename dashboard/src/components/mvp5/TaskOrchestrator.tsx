@@ -27,6 +27,81 @@ function clampCliConcurrency(input: number) {
   return Math.min(8, Math.max(1, Math.floor(input)));
 }
 
+type TaskStatus = 'pending' | 'running' | 'completed' | 'failed';
+
+function tryParseJson(text: string) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeTaskStatus(value: unknown): TaskStatus {
+  const raw = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (!raw) return 'pending';
+  if (raw === 'running' || raw === 'in_progress' || raw === 'in-progress') return 'running';
+  if (raw === 'completed' || raw === 'done') return 'completed';
+  if (raw === 'failed' || raw === 'error') return 'failed';
+  return 'pending';
+}
+
+function extractTasksJsonBlockFromMarkdown(markdown: string) {
+  const raw = String(markdown ?? '');
+  const lines = raw.replace(/\r\n/g, '\n').split('\n');
+  const findMarker = (marker: string) =>
+    lines.findIndex((line) => String(line || '').trim().toUpperCase() === marker);
+
+  const start = findMarker('## TASKS_JSON');
+  if (start < 0) return null;
+
+  let end = lines.length;
+  const endIdx = findMarker('## END_TASKS_JSON');
+  if (endIdx > start) end = endIdx;
+
+  const blockLines = lines.slice(start + 1, end);
+  if (!blockLines.length) return null;
+
+  const first = String(blockLines[0] || '').trim();
+  const last = String(blockLines[blockLines.length - 1] || '').trim();
+  const hasOpenFence = first.startsWith('```');
+  const hasCloseFence = last.startsWith('```');
+
+  const begin = hasOpenFence ? 1 : 0;
+  const finish = hasCloseFence ? blockLines.length - 1 : blockLines.length;
+  const jsonText = blockLines.slice(begin, finish).join('\n').trim();
+  return jsonText ? jsonText : null;
+}
+
+function buildTaskStatusByIdFromTasksContent(tasksContent: string) {
+  const raw = String(tasksContent ?? '').trim();
+  if (!raw) return {};
+
+  const direct = tryParseJson(raw);
+  if (direct && typeof direct === 'object' && Array.isArray((direct as any).tasks)) {
+    return buildTaskStatusByIdFromTasksArray((direct as any).tasks);
+  }
+
+  const jsonBlock = extractTasksJsonBlockFromMarkdown(raw);
+  if (!jsonBlock) return {};
+
+  const payload = tryParseJson(jsonBlock);
+  if (!payload || typeof payload !== 'object' || !Array.isArray((payload as any).tasks)) return {};
+  return buildTaskStatusByIdFromTasksArray((payload as any).tasks);
+}
+
+function buildTaskStatusByIdFromTasksArray(tasks: any[]) {
+  const map: Record<string, TaskStatus> = {};
+  for (const t of tasks) {
+    const id = String(t?.id ?? '').trim();
+    if (!id) continue;
+    const done = t?.done === true;
+    const status = normalizeTaskStatus(t?.status);
+    map[id] = done || status === 'completed' ? 'completed' : status;
+  }
+  return map;
+}
+
 function buildTaskTitleMap(analysis: AnalysisResult | null) {
   const map = new Map<string, string>();
   if (!analysis) return map;
@@ -112,6 +187,13 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
   const [analyzing, setAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<ViewTab>('tasks');
+  const [autoExecutionEnabled, setAutoExecutionEnabled] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('mvp5AutoExecutionEnabled') === '1';
+    } catch {
+      return false;
+    }
+  });
 
   const [maxCliConcurrency, setMaxCliConcurrency] = useState<number>(() => {
     try {
@@ -128,6 +210,20 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
 
   const [executionState, setExecutionState] = useState<ExecutionState | null>(null);
   const [starting, setStarting] = useState(false);
+
+  const taskStatusById = useMemo(() => {
+    const base = buildTaskStatusByIdFromTasksContent(tasksContent);
+    if (executionState?.tasks) {
+      for (const [taskId, task] of Object.entries(executionState.tasks)) {
+        if (!taskId) continue;
+        if (task.status === 'running') base[taskId] = 'running';
+        else if (task.status === 'completed' || task.status === 'skipped') base[taskId] = 'completed';
+        else if (task.status === 'failed') base[taskId] = 'failed';
+        else base[taskId] = 'pending';
+      }
+    }
+    return base;
+  }, [tasksContent, executionState]);
 
   // 分析依赖
   const handleAnalyze = useCallback(async () => {
@@ -203,7 +299,7 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
 
   // 启动执行
   const handleStart = useCallback(async () => {
-    if (!plan) return;
+    if (!plan || !autoExecutionEnabled) return;
 
     setStarting(true);
 
@@ -238,7 +334,7 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
     } finally {
       setStarting(false);
     }
-  }, [plan]);
+  }, [plan, autoExecutionEnabled]);
 
   // 轮询执行状态（后端异步推进）
   useEffect(() => {
@@ -333,6 +429,22 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
               className="w-20 rounded border border-gray-300 px-2 py-1 text-sm"
             />
           </div>
+          <label className="flex items-center gap-2 text-xs text-gray-600">
+            <input
+              type="checkbox"
+              checked={autoExecutionEnabled}
+              onChange={(e) => {
+                const next = e.target.checked;
+                setAutoExecutionEnabled(next);
+                try {
+                  localStorage.setItem('mvp5AutoExecutionEnabled', next ? '1' : '0');
+                } catch {
+                  // ignore
+                }
+              }}
+            />
+            自动执行（可选）
+          </label>
           <div className="text-xs text-gray-500">方案生成：优先使用 Claude 4.5 Opus</div>
           <div className="flex flex-wrap gap-2 sm:ml-auto">
             <button
@@ -349,13 +461,15 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
             >
               {creatingPlan ? '生成中...' : '生成执行计划'}
             </button>
-            <button
-              onClick={handleStart}
-              disabled={!plan || starting || executionState?.status === 'running'}
-              className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-gray-300"
-            >
-              {starting ? '启动中...' : '开始执行（Phase 1）'}
-            </button>
+            {autoExecutionEnabled ? (
+              <button
+                onClick={handleStart}
+                disabled={!plan || starting || executionState?.status === 'running'}
+                className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-gray-300"
+              >
+                {starting ? '启动中...' : '开始执行（Phase 1）'}
+              </button>
+            ) : null}
           </div>
         </div>
         {analysisError ? (
@@ -377,19 +491,21 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
           <TabButton active={activeTab === 'plan'} onClick={() => setActiveTab('plan')} disabled={!plan}>
             plan
           </TabButton>
-          <TabButton
-            active={activeTab === 'execution'}
-            onClick={() => setActiveTab('execution')}
-            disabled={!executionState}
-          >
-            execution
-          </TabButton>
+          {autoExecutionEnabled || executionState ? (
+            <TabButton
+              active={activeTab === 'execution'}
+              onClick={() => setActiveTab('execution')}
+              disabled={!executionState}
+            >
+              execution
+            </TabButton>
+          ) : null}
         </div>
 
         <div className="mt-3">
           {activeTab === 'dag' ? (
             analysis ? (
-              <TaskDagGraph graph={analysis.graph} />
+              <TaskDagGraph graph={analysis.graph} taskStatusById={taskStatusById} />
             ) : (
               <EmptyState text="还没有编排结果（先点“编排任务”）" />
             )

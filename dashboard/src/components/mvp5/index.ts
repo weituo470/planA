@@ -3,6 +3,7 @@
  */
 
 export { TaskOrchestrator } from './TaskOrchestrator';
+export { ManualTaskRunner } from './ManualTaskRunner';
 export { DependencyPanel } from './DependencyPanel';
 export { RecommendationPanel } from './RecommendationPanel';
 export { ExecutionConsole } from './ExecutionConsole';

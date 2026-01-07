@@ -9142,6 +9142,85 @@ app.get('/api/mvp5/analyze-dependencies/:id', (req, res) => {
 });
 
 /**
+ * POST /api/mvp5/task-prompt
+ * 从 tasks.md（TASKS_JSON）生成单任务提示词（用于手动发给 CLI 执行）
+ */
+app.post('/api/mvp5/task-prompt', (req, res) => {
+  try {
+    const specName = sanitizeSpecName(req.body?.specId ?? req.body?.specName ?? req.query?.specId);
+    if (!specName) {
+      return res.status(400).json({ error: 'specId is required' });
+    }
+
+    const taskId = String(req.body?.taskId ?? req.query?.taskId ?? '').trim();
+    if (!taskId) {
+      return res.status(400).json({ error: 'taskId is required' });
+    }
+
+    const tasksContent = typeof req.body?.tasksContent === 'string' ? req.body.tasksContent : '';
+    if (!tasksContent.trim()) {
+      return res.status(400).json({ error: 'tasksContent is required' });
+    }
+
+    const dagTasks = parseDagTasksFromTasksContent(tasksContent);
+    if (!dagTasks || dagTasks.length === 0) {
+      return res.status(400).json({
+        error:
+          '没有有效的任务：请在 tasks.md 的 ## TASKS_JSON 块中提供 { "tasks": [...] }。',
+      });
+    }
+
+    const task = dagTasks.find((t) => String(t?.id || '').trim() === taskId) || null;
+    if (!task) {
+      return res.status(404).json({ error: `Task not found: ${taskId}` });
+    }
+
+    const sandbox = normalizeCodexSandbox(req.body?.sandbox ?? req.query?.sandbox);
+    const model = normalizeCodexModel(req.body?.model ?? req.query?.model);
+    const projectDir = normalizeTerminalCwd(
+      req.body?.cwd ??
+        req.body?.projectDir ??
+        (typeof req.query?.cwd === 'string' ? req.query.cwd : '') ??
+        (typeof req.query?.projectDir === 'string' ? req.query.projectDir : ''),
+    );
+
+    const doc = buildMvp5TaskRunDoc(specName, task, {
+      sandbox,
+      model,
+      projectDir,
+    });
+    const runDocPathAbs = normalizePathForPrompt(doc.runDocPath);
+    const projectDirForPrompt = normalizePathForPrompt(projectDir);
+    const prompt = [
+      `请按任务文档（绝对路径）${runDocPathAbs} 实现该任务，完成后自检并用简短要点总结变更与验证结果。`,
+      projectDirForPrompt ? `建议工作目录：${projectDirForPrompt}` : null,
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    return res.json({
+      ok: true,
+      taskId,
+      prompt,
+      runDocPathAbs,
+      runDocPath: doc.runDocPathRel,
+      projectDir: projectDirForPrompt,
+      task: {
+        id: task.id,
+        title: task.title,
+        description: task.description,
+        dependencies: Array.isArray(task.dependencies) ? task.dependencies : [],
+        scope: Array.isArray(task.scope) ? task.scope : [],
+        estimated_complexity: task.estimated_complexity || null,
+      },
+    });
+  } catch (error) {
+    console.error('[MVP5] task-prompt error:', error);
+    return res.status(500).json({ error: error?.message || 'Failed to generate prompt' });
+  }
+});
+
+/**
  * POST /api/mvp5/execution-plans
  * 创建执行计划
  */
