@@ -4,6 +4,7 @@ logs/
 coverage/
 .runlogs/
 .idea/
+.claude/
 .env
 .env.*
 *.log

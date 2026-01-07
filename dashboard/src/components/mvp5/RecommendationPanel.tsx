@@ -3,7 +3,7 @@
  * 显示并选择执行方案
  */
 
-import { CheckCircle2, Circle, Zap, Cpu } from 'lucide-react';
+import { CheckCircle2, Circle } from 'lucide-react';
 import { useState } from 'react';
 
 import type { Recommendation, ExecutionPlan } from './types';
@@ -112,22 +112,9 @@ export function RecommendationPanel({
                 </div>
                 <p className="text-sm text-gray-600 mb-2">{rec.description}</p>
 
-                {/* CLI 分配统计 */}
-                {rec.cliAllocation && (
-                  <div className="flex items-center gap-4 text-xs text-gray-500">
-                    <span className="flex items-center gap-1">
-                      <Cpu className="w-3 h-3" />
-                      Codex 任务: {Object.values(rec.cliAllocation).filter((x) => x === 'codex').length}
-                    </span>
-                    <span className="flex items-center gap-1">
-                      <Zap className="w-3 h-3" />
-                      Claude 任务: {Object.values(rec.cliAllocation).filter((x) => x === 'claude').length}
-                    </span>
-                    <span>
-                      预计: {formatDuration(rec.estimatedTotalTime)}
-                    </span>
-                  </div>
-                )}
+                <div className="flex items-center gap-4 text-xs text-gray-500">
+                  <span>预计: {formatDuration(rec.estimatedTotalTime)}</span>
+                </div>
               </div>
             </div>
           </div>
@@ -193,20 +180,11 @@ function PhaseCard({ phase, index }: { phase: Recommendation['phases'][number]; 
     <span className="text-xs px-2 py-0.5 bg-gray-100 text-gray-700 rounded">串行</span>
   );
 
-  const cliBadge = phase.suggestedCli === 'codex' ? (
-    <span className="text-xs px-2 py-0.5 bg-blue-100 text-blue-700 rounded">Codex</span>
-  ) : phase.suggestedCli === 'claude' ? (
-    <span className="text-xs px-2 py-0.5 bg-purple-100 text-purple-700 rounded">Claude</span>
-  ) : (
-    <span className="text-xs px-2 py-0.5 bg-gray-100 text-gray-700 rounded">混合</span>
-  );
-
   return (
     <div className="bg-white border border-gray-200 rounded p-2 flex items-center justify-between">
       <div className="flex items-center gap-2">
         <span className="text-sm font-medium text-gray-700">Phase {index + 1}</span>
         {typeBadge}
-        {cliBadge}
       </div>
       <span className="text-xs text-gray-500">
         {phase.taskIds.length} 个任务

@@ -20,6 +20,7 @@ const recommender = require('./services/recommender.service');
 const analysisResults = new Map();
 const executionPlans = new Map();
 const executionStates = new Map();
+const mvp5ExecutionRunners = new Map();
 
 function nanoid(size = 21) {
   return crypto.randomBytes(size).toString('base64url').slice(0, size);
@@ -6633,6 +6634,20 @@ function createTerminalSession(options) {
   };
 
   terminalSessions.set(id, session);
+  io.emit('terminal:created', {
+    terminal: {
+      id: session.id,
+      title: session.title,
+      pid: session.pid,
+      command: session.command,
+      args: session.args,
+      cwd: session.cwd,
+      running: session.running,
+      createdAt: session.createdAt,
+      exitedAt: session.exitedAt,
+      exitCode: session.exitCode,
+    },
+  });
 
   proc.onData((data) => {
     const item = { seq: (session.seq += 1), data };
@@ -9073,11 +9088,6 @@ app.post('/api/mvp5/execution-plans', (req, res) => {
     }
 
     // 应用修改
-    let cliAllocation = { ...recommendation.cliAllocation };
-    if (modifications.taskCliOverrides) {
-      cliAllocation = { ...cliAllocation, ...modifications.taskCliOverrides };
-    }
-
     let phases = [...recommendation.phases];
     if (modifications.excludedTasks && modifications.excludedTasks.length > 0) {
       phases = phases.map(phase => ({
@@ -9085,6 +9095,10 @@ app.post('/api/mvp5/execution-plans', (req, res) => {
         taskIds: phase.taskIds.filter(id => !modifications.excludedTasks.includes(id)),
       })).filter(phase => phase.taskIds.length > 0);
     }
+
+    // MVP5 编排阶段不再区分 Codex/Claude：执行阶段统一使用 Codex（CLI 选择留给终端面板）
+    const planTaskIds = Array.from(new Set(phases.flatMap((p) => p.taskIds)));
+    const cliAllocation = Object.fromEntries(planTaskIds.map((taskId) => [taskId, 'codex']));
 
     // 创建执行计划
     const planId = nanoid(10);
@@ -9123,6 +9137,341 @@ app.get('/api/mvp5/execution-plans/:id', (req, res) => {
 
   res.json(plan);
 });
+
+function quoteCmdArgument(value) {
+  const raw = String(value ?? '');
+  if (!raw) return '""';
+  if (/[\s&|<>^"]/.test(raw)) {
+    return `"${raw.replace(/"/g, '\\"')}"`;
+  }
+  return raw;
+}
+
+function buildMvp5TaskRunDoc(specName, task, options = {}) {
+  const runsDir = path.join(resolveSpecDir(specName), '.runlogs', 'mvp5-runs');
+  fs.mkdirSync(runsDir, { recursive: true });
+
+  const taskId = String(task?.id || 'unknown').trim() || 'unknown';
+  const safeTaskId = taskId
+    .replace(/[^A-Za-z0-9._-]/g, '_')
+    .replace(/_+/g, '_')
+    .slice(0, 60);
+  const stamp = new Date().toISOString().replace(/[:.]/g, '').replace('Z', 'Z');
+  const runDocPath = path.join(runsDir, `task-${safeTaskId}-${stamp}.md`);
+
+  const rel = (absPath) => normalizePathForPrompt(path.relative(REPO_DIR, absPath));
+  const artifacts = {
+    requirements: resolveSpecFile(specName, 'requirements'),
+    design: resolveSpecFile(specName, 'design'),
+    tasks: resolveSpecFile(specName, 'tasks'),
+  };
+
+  const lines = [];
+  lines.push('# Codex 任务执行文档（MVP5）');
+  lines.push('');
+  lines.push(`- Spec: ${specName}`);
+  lines.push(`- Task: ${taskId}`);
+  if (task?.title) lines.push(`- Title: ${String(task.title).trim()}`);
+  if (options.executionId) lines.push(`- Execution: ${options.executionId}`);
+  if (options.planId) lines.push(`- Plan: ${options.planId}`);
+  if (Number.isFinite(options.phaseIndex)) lines.push(`- PhaseIndex: ${options.phaseIndex}`);
+  lines.push(`- StartedAt: ${new Date().toISOString()}`);
+  if (options.model) lines.push(`- Model: ${options.model}`);
+  if (options.sandbox) lines.push(`- Sandbox: ${options.sandbox}`);
+  if (options.projectDir) lines.push(`- ProjectDir: ${normalizePathForPrompt(options.projectDir)}`);
+  lines.push('');
+  lines.push('## Spec 入口');
+  lines.push(`- requirements: \`${normalizePathForPrompt(artifacts.requirements)}\``);
+  lines.push(`- design: \`${normalizePathForPrompt(artifacts.design)}\``);
+  lines.push(`- tasks: \`${normalizePathForPrompt(artifacts.tasks)}\``);
+  lines.push('');
+  lines.push('## 本次任务（来自 tasks.md 的 TASKS_JSON）');
+  lines.push(`- title: ${String(task?.title || '').trim()}`);
+  lines.push(`- description: ${String(task?.description || '').trim()}`);
+  const deps = Array.isArray(task?.dependencies) ? task.dependencies.map((v) => String(v || '').trim()).filter(Boolean) : [];
+  const scope = Array.isArray(task?.scope) ? task.scope.map((v) => String(v || '').trim()).filter(Boolean) : [];
+  if (deps.length) lines.push(`- dependencies: ${deps.join(', ')}`);
+  if (scope.length) lines.push(`- scope: ${scope.join(', ')}`);
+  if (task?.estimated_complexity) lines.push(`- estimated_complexity: ${String(task.estimated_complexity).trim()}`);
+  lines.push('');
+  lines.push('## 执行要求');
+  lines.push('- 以本任务为“闭环交付物”，不要做微观步骤拆解。');
+  lines.push('- 按仓库既有约束实现与自测；必要时补充最小可行验证步骤。');
+  lines.push('- 完成后将关键变更、验证方式与结果回写到 tasks.md（建议追加到对应任务条目下）。');
+  lines.push('');
+
+  fs.writeFileSync(runDocPath, lines.join('\n'), 'utf8');
+  return { runDocPath, runDocPathRel: rel(runDocPath), artifacts };
+}
+
+function inferMvp5MaxCliConcurrency(plan, analysis) {
+  const raw = Number(analysis?.maxCliConcurrency ?? analysis?.summary?.maxCliConcurrency);
+  if (Number.isFinite(raw)) return Math.min(8, Math.max(1, Math.floor(raw)));
+  const phases = Array.isArray(plan?.phases) ? plan.phases : [];
+  const fromPhases = phases.reduce((acc, phase) => {
+    const candidate = Number(phase?.maxConcurrency ?? (Array.isArray(phase?.taskIds) ? phase.taskIds.length : 1));
+    return Number.isFinite(candidate) ? Math.max(acc, candidate) : acc;
+  }, 1);
+  return Math.min(8, Math.max(1, Math.floor(fromPhases || 1)));
+}
+
+function loadDagTasksForSpec(specName) {
+  const tasksPath = resolveSpecFile(specName, 'tasks');
+  if (!fs.existsSync(tasksPath)) return null;
+  const content = fs.readFileSync(tasksPath, 'utf8');
+  return parseDagTasksFromTasksContent(content);
+}
+
+function scheduleMvp5Execution(runner) {
+  if (!runner || runner.stopped) return;
+  const state = executionStates.get(runner.executionId);
+  const plan = executionPlans.get(runner.planId);
+  if (!state || !plan) return;
+  if (state.status !== 'running') return;
+
+  const phases = Array.isArray(plan.phases) ? plan.phases : [];
+  const phaseIndex = Number(state.currentPhase ?? 0);
+  const phase = phases[phaseIndex];
+
+  if (!phase) {
+    state.status = 'completed';
+    state.updatedAt = new Date().toISOString();
+    plan.status = 'completed';
+    return;
+  }
+
+  const phaseTaskIds = Array.isArray(phase.taskIds) ? phase.taskIds : [];
+  const hasFailed = phaseTaskIds.some((id) => state.tasks?.[id]?.status === 'failed');
+  if (hasFailed) {
+    state.status = 'failed';
+    state.updatedAt = new Date().toISOString();
+    plan.status = 'failed';
+    return;
+  }
+
+  const isPhaseDone = phaseTaskIds.length
+    ? phaseTaskIds.every((id) => ['completed', 'skipped'].includes(state.tasks?.[id]?.status))
+    : true;
+
+  if (isPhaseDone) {
+    state.currentPhase = phaseIndex + 1;
+    state.updatedAt = new Date().toISOString();
+    setTimeout(() => scheduleMvp5Execution(runner), 0);
+    return;
+  }
+
+  const runningCount = phaseTaskIds.filter((id) => state.tasks?.[id]?.status === 'running').length;
+  const maxConcurrency = phase.type === 'serial'
+    ? 1
+    : Math.min(
+        runner.maxCliConcurrency,
+        Number.isFinite(phase.maxConcurrency) ? Math.max(1, Math.floor(phase.maxConcurrency)) : runner.maxCliConcurrency,
+      );
+  const slots = Math.max(0, maxConcurrency - runningCount);
+  if (slots <= 0) return;
+
+  const pending = phaseTaskIds.filter((id) => state.tasks?.[id]?.status === 'pending');
+  if (!pending.length) return;
+
+  const freeWorkers = runner.workers.filter((w) => !w.busy);
+  const canStart = Math.min(slots, pending.length, freeWorkers.length);
+  for (let i = 0; i < canStart; i += 1) {
+    startMvp5TaskOnWorker(runner, freeWorkers[i], pending[i], phaseIndex);
+  }
+}
+
+function handleMvp5WorkerData(runner, worker, data) {
+  if (!runner || !worker?.current) return;
+  worker.tail = `${worker.tail}${data}`;
+  if (worker.tail.length > 12000) worker.tail = worker.tail.slice(worker.tail.length - 12000);
+
+  const marker = worker.current.marker;
+  const idx = worker.tail.indexOf(marker);
+  if (idx < 0) return;
+
+  const after = worker.tail.slice(idx + marker.length);
+  const match = /^(-?\d+)/.exec(after);
+  if (!match) return;
+
+  const exitCode = Number(match[1]);
+  const finishedAt = new Date().toISOString();
+  const state = executionStates.get(runner.executionId);
+  const plan = executionPlans.get(runner.planId);
+  if (!state || !plan) return;
+
+  const { taskId, phaseIndex, runDocPathRel } = worker.current;
+  const taskState = state.tasks?.[taskId];
+  if (taskState) {
+    taskState.completedAt = finishedAt;
+    taskState.status = exitCode === 0 ? 'completed' : 'failed';
+    if (runDocPathRel) taskState.runDocPath = runDocPathRel;
+    taskState.error = exitCode === 0 ? undefined : `CLI 退出码 ${exitCode}`;
+  }
+
+  if (exitCode !== 0) {
+    state.failures = Array.isArray(state.failures) ? state.failures : [];
+    state.failures.push({
+      taskId,
+      phaseId: plan.phases?.[phaseIndex]?.phaseId || String(phaseIndex),
+      error: `CLI 退出码 ${exitCode}`,
+      canRetry: true,
+      downstreamAffected: [],
+    });
+    state.status = 'failed';
+    plan.status = 'failed';
+  }
+
+  state.updatedAt = finishedAt;
+  worker.busy = false;
+  worker.current = null;
+  worker.tail = '';
+
+  setTimeout(() => scheduleMvp5Execution(runner), 0);
+}
+
+function startMvp5TaskOnWorker(runner, worker, taskId, phaseIndex) {
+  const state = executionStates.get(runner.executionId);
+  const plan = executionPlans.get(runner.planId);
+  if (!state || !plan) return;
+
+  const task = runner.tasksById.get(taskId) || { id: taskId, title: taskId, description: '' };
+  const sandbox = normalizeCodexSandbox(runner.sandbox);
+  const model = normalizeCodexModel(runner.model);
+
+  const doc = buildMvp5TaskRunDoc(runner.specName, task, {
+    sandbox,
+    model,
+    planId: runner.planId,
+    executionId: runner.executionId,
+    phaseIndex,
+    projectDir: runner.projectDir,
+  });
+  const runDocPathAbs = normalizePathForPrompt(doc.runDocPath);
+  const prompt = `请按任务文档（绝对路径）${runDocPathAbs} 实现该任务，完成后自检并用简短要点总结变更与验证结果。`;
+
+  const runId = nanoid(8);
+  const marker = `__MVP5_TASK_DONE__${runId}__`;
+
+  const codexExecutable = (process.env.CODEX_COMMAND || 'codex').trim() || 'codex';
+  const args = [
+    '-a',
+    'never',
+    '-s',
+    sandbox,
+    '--add-dir',
+    SPEC_ROOT,
+  ];
+  if (model) {
+    args.push('-m', model);
+  }
+  args.push('-C', runner.projectDir, prompt);
+
+  const cmdLine = [codexExecutable, ...args].map(quoteCmdArgument).join(' ');
+  const input = [
+    `cd /d ${quoteCmdArgument(runner.projectDir)}`,
+    cmdLine,
+    `echo ${marker}%ERRORLEVEL%`,
+    '',
+  ].join('\r\n');
+
+  const startedAt = new Date().toISOString();
+  const taskState = state.tasks?.[taskId];
+  if (taskState) {
+    taskState.status = 'running';
+    taskState.startedAt = startedAt;
+    taskState.terminalId = worker.terminalId;
+    taskState.runDocPath = doc.runDocPathRel;
+    taskState.error = undefined;
+  }
+  state.updatedAt = startedAt;
+
+  worker.busy = true;
+  worker.current = { taskId, phaseIndex, marker, runDocPathRel: doc.runDocPathRel };
+
+  try {
+    writeTerminalInput(worker.session, input);
+  } catch (error) {
+    const failedAt = new Date().toISOString();
+    if (taskState) {
+      taskState.status = 'failed';
+      taskState.completedAt = failedAt;
+      taskState.error = error?.message ? String(error.message) : 'Failed to write terminal input';
+    }
+    state.failures = Array.isArray(state.failures) ? state.failures : [];
+    state.failures.push({
+      taskId,
+      phaseId: plan.phases?.[phaseIndex]?.phaseId || String(phaseIndex),
+      error: taskState?.error || 'Failed to write terminal input',
+      canRetry: true,
+      downstreamAffected: [],
+    });
+    state.status = 'failed';
+    plan.status = 'failed';
+    state.updatedAt = failedAt;
+    worker.busy = false;
+    worker.current = null;
+  }
+}
+
+function startMvp5ExecutionRunner({
+  executionId,
+  planId,
+  specName,
+  projectDir,
+  sandbox = 'workspace-write',
+  model = null,
+}) {
+  const state = executionStates.get(executionId);
+  const plan = executionPlans.get(planId);
+  const analysis = plan ? analysisResults.get(plan.analysisId) : null;
+  if (!state || !plan) return null;
+
+  const tasks = loadDagTasksForSpec(specName) || [];
+  const tasksById = new Map(tasks.map((t) => [t.id, t]));
+
+  const maxCliConcurrency = inferMvp5MaxCliConcurrency(plan, analysis);
+  const workers = [];
+
+  for (let i = 0; i < maxCliConcurrency; i += 1) {
+    const session = createTerminalSession({
+      title: `MVP5 · ${specName} · Worker ${i + 1}`,
+      command: 'cmd.exe',
+      args: [],
+      cwd: projectDir,
+    });
+
+    const worker = {
+      terminalId: session.id,
+      session,
+      busy: false,
+      current: null,
+      tail: '',
+      dispose: null,
+    };
+    workers.push(worker);
+  }
+
+  const runner = {
+    executionId,
+    planId,
+    specName,
+    projectDir,
+    sandbox,
+    model,
+    maxCliConcurrency,
+    workers,
+    tasksById,
+    stopped: false,
+  };
+
+  workers.forEach((worker) => {
+    worker.dispose = worker.session.proc.onData((data) => handleMvp5WorkerData(runner, worker, data));
+  });
+
+  mvp5ExecutionRunners.set(executionId, runner);
+  setTimeout(() => scheduleMvp5Execution(runner), 0);
+  return runner;
+}
 
 /**
  * POST /api/mvp5/execution-plans/:id/start
@@ -9171,8 +9520,36 @@ app.post('/api/mvp5/execution-plans/:id/start', (req, res) => {
     plan.status = 'running';
     plan.executionId = executionId;
 
-    // TODO: 启动第一阶段任务执行
-    // 这里需要集成实际的 CLI 执行逻辑
+    const specName = sanitizeSpecName(plan.specId);
+    if (!specName) {
+      return res.status(400).json({ error: 'specId 无效，无法启动执行' });
+    }
+
+    const sandbox = normalizeCodexSandbox(req.body?.sandbox ?? req.query?.sandbox);
+    const model = normalizeCodexModel(req.body?.model ?? req.query?.model);
+    const projectDir = normalizeTerminalCwd(
+      req.body?.cwd ??
+        req.body?.projectDir ??
+        (typeof req.query?.cwd === 'string' ? req.query.cwd : '') ??
+        (typeof req.query?.projectDir === 'string' ? req.query.projectDir : ''),
+    );
+
+    // 启动执行（默认：固定 worker 池复用终端，并发≤8；暂时统一使用 Codex）
+    const runner = startMvp5ExecutionRunner({
+      executionId,
+      planId: id,
+      specName,
+      projectDir,
+      sandbox,
+      model,
+    });
+
+    if (!runner) {
+      executionState.status = 'failed';
+      executionState.updatedAt = new Date().toISOString();
+      plan.status = 'failed';
+      return res.status(500).json({ error: '启动执行失败：runner 初始化失败' });
+    }
 
     res.json({
       executionId,
@@ -9228,7 +9605,40 @@ app.post('/api/mvp5/execution/:id/retry/:taskId', (req, res) => {
     task.error = undefined;
     state.updatedAt = new Date().toISOString();
 
-    // TODO: 重新执行任务
+    // 重新执行任务（复用既有 runner；如 runner 丢失则尝试重建）
+    const plan = executionPlans.get(state.planId);
+    if (plan) {
+      plan.status = 'running';
+    }
+    state.status = 'running';
+    state.failures = Array.isArray(state.failures)
+      ? state.failures.filter((f) => f?.taskId !== taskId)
+      : [];
+
+    let runner = mvp5ExecutionRunners.get(id) || null;
+    if (!runner && plan) {
+      const specName = sanitizeSpecName(plan.specId);
+      if (specName) {
+        runner = startMvp5ExecutionRunner({
+          executionId: id,
+          planId: state.planId,
+          specName,
+          projectDir: normalizeTerminalCwd(''),
+          sandbox: normalizeCodexSandbox(req.body?.sandbox ?? req.query?.sandbox),
+          model: normalizeCodexModel(req.body?.model ?? req.query?.model),
+        });
+      }
+    }
+
+    if (runner && plan) {
+      const phaseIndex = Array.isArray(plan.phases)
+        ? plan.phases.findIndex((p) => Array.isArray(p?.taskIds) && p.taskIds.includes(taskId))
+        : -1;
+      if (phaseIndex >= 0 && Number(state.currentPhase) > phaseIndex) {
+        state.currentPhase = phaseIndex;
+      }
+      setTimeout(() => scheduleMvp5Execution(runner), 0);
+    }
 
     res.json({
       taskId,

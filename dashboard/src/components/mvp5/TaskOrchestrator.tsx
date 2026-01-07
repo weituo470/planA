@@ -3,12 +3,13 @@
  * 整合依赖分析、推荐方案和执行控制
  */
 
-import { useState, useCallback } from 'react';
+import { useMemo, useState, useCallback, useEffect } from 'react';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 
 import { DependencyPanel } from './DependencyPanel';
 import { RecommendationPanel } from './RecommendationPanel';
 import { ExecutionConsole } from './ExecutionConsole';
+import { TaskDagGraph } from './TaskDagGraph';
 import type {
   AnalysisResult,
   ExecutionPlan,
@@ -51,6 +52,12 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
   const [expandedSections, setExpandedSections] = useState<Set<Section>>(
     new Set(['analysis', 'recommendation'])
   );
+
+  const taskTitleById = useMemo(() => {
+    const map = new Map<string, string>();
+    (analysis?.tasks ?? []).forEach((t) => map.set(t.id, t.title));
+    return map;
+  }, [analysis]);
 
   // 分析依赖
   const handleAnalyze = useCallback(async () => {
@@ -172,6 +179,30 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
     }
   }, [plan]);
 
+  // 轮询执行状态（后端异步推进）
+  useEffect(() => {
+    if (!executionState?.executionId) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const response = await fetch(`${BRIDGE_URL}/api/mvp5/execution/${executionState.executionId}/status`);
+        if (!response.ok) return;
+        const data: ExecutionState = await response.json();
+        if (cancelled) return;
+        setExecutionState(data);
+      } catch {
+        // ignore polling errors
+      }
+    };
+
+    void poll();
+    const timer = window.setInterval(poll, 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [executionState?.executionId]);
+
   // 重启任务
   const handleRetry = useCallback(async (taskId: string) => {
     if (!executionState) return;
@@ -259,6 +290,38 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
           error={analysisError}
           onAnalyze={handleAnalyze}
         />
+
+        {analysis ? (
+          <div className="mt-4 space-y-4">
+            <div>
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <div className="text-sm font-semibold text-gray-800">任务 DAG</div>
+                <div className="text-xs text-gray-500">拖拽/缩放查看依赖关系</div>
+              </div>
+              <TaskDagGraph graph={analysis.graph} />
+            </div>
+            <div>
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <div className="text-sm font-semibold text-gray-800">tasks.md（Markdown）</div>
+                <button
+                  className="text-xs text-blue-600 hover:text-blue-700"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(tasksContent ?? '');
+                    } catch {
+                      // ignore
+                    }
+                  }}
+                >
+                  复制
+                </button>
+              </div>
+              <pre className="max-h-72 overflow-auto rounded border border-gray-200 bg-gray-50 p-3 text-xs text-gray-800 whitespace-pre-wrap font-mono">
+                {tasksContent || ''}
+              </pre>
+            </div>
+          </div>
+        ) : null}
       </CollapsibleSection>
 
       {/* 推荐方案区域 */}
@@ -276,6 +339,15 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
             onCreatePlan={handleCreatePlan}
             createdPlan={plan}
           />
+          <div className="mt-4">
+            <div className="mb-2 text-sm font-semibold text-gray-800">执行计划预览（Markdown）</div>
+            <pre className="max-h-64 overflow-auto rounded border border-gray-200 bg-gray-50 p-3 text-xs text-gray-800 whitespace-pre-wrap font-mono">
+              {buildPhasesMarkdown(
+                analysis.recommendations[selectedRecommendation]?.phases ?? [],
+                taskTitleById
+              )}
+            </pre>
+          </div>
         </CollapsibleSection>
       )}
 
@@ -287,6 +359,12 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
           expanded={expandedSections.has('execution')}
           onToggle={toggleSection}
         >
+          <div className="mb-4">
+            <div className="mb-2 text-sm font-semibold text-gray-800">执行计划（Markdown）</div>
+            <pre className="max-h-64 overflow-auto rounded border border-gray-200 bg-gray-50 p-3 text-xs text-gray-800 whitespace-pre-wrap font-mono">
+              {buildPhasesMarkdown(plan.phases ?? [], taskTitleById)}
+            </pre>
+          </div>
           <ExecutionConsole
             plan={plan}
             executionState={executionState}
@@ -325,4 +403,30 @@ function CollapsibleSection({ title, section, expanded, onToggle, children }: Se
       {expanded && <div className="p-4">{children}</div>}
     </div>
   );
+}
+
+function buildPhasesMarkdown(
+  phases: Array<ExecutionPlan['phases'][number]>,
+  titleById: Map<string, string>,
+) {
+  if (!phases.length) return '（空）';
+
+  const lines: string[] = [];
+  lines.push('## 执行计划');
+  lines.push('');
+
+  phases.forEach((phase, idx) => {
+    const typeLabel = phase.type === 'parallel' ? '并发' : '串行';
+    const limit = Number.isFinite(phase.maxConcurrency as number)
+      ? `（并发上限 ${phase.maxConcurrency}）`
+      : '';
+    lines.push(`### Phase ${idx + 1}：${typeLabel}${limit}`);
+    (phase.taskIds ?? []).forEach((taskId) => {
+      const title = titleById.get(taskId) || '';
+      lines.push(`- ${taskId}${title ? `：${title}` : ''}`);
+    });
+    lines.push('');
+  });
+
+  return lines.join('\n').trimEnd();
 }

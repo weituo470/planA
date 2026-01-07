@@ -750,6 +750,14 @@ export function TerminalPanelInner(
       }
     });
 
+    socket.on('terminal:created', (payload: any) => {
+      const terminal = payload?.terminal;
+      if (!terminal) return;
+      const id = String(terminal?.id || '').trim();
+      if (!id) return;
+      mergeRemoteTerminals([terminal]);
+    });
+
     socket.on('terminal:data', (payload: any) => {
       const terminalId = String(payload?.terminalId || '').trim();
       if (!terminalId) return;

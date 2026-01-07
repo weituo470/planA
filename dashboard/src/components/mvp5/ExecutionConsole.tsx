@@ -88,7 +88,7 @@ export function ExecutionConsole({
                 ) : (
                   <Play className="w-4 h-4" />
                 )}
-                <span className="text-sm">{isPaused ? '继续' : '启动'}</span>
+                <span className="text-sm">{isPaused ? '继续执行' : '执行计划'}</span>
               </button>
             )
           )}
