@@ -4,7 +4,7 @@ import JSZip from 'jszip';
 import { Button } from './components/ui/button';
 import { ExplorerSidebar } from './ExplorerSidebar';
 import { TerminalPanel, type TerminalPanelHandle, type AssignableCliTerminal } from './TerminalPanel';
-import { ManualTaskRunner, TaskOrchestrator } from './components/mvp5';
+import { ManualTaskRunner } from './components/mvp5';
 import type {
   ClarificationQuestion,
   LlmInfo,
@@ -2795,7 +2795,8 @@ export default function App() {
 
         <main className="min-w-0 flex-1 overflow-auto">
           <div className="mx-auto grid max-w-[1400px] grid-cols-12 gap-4 px-6 py-6">
-        <section className="col-span-12 space-y-3 rounded-lg border border-slate-800 bg-panel p-4">
+            {activeArtifact === 'requirements' ? (
+              <section className="col-span-12 space-y-3 rounded-lg border border-slate-800 bg-panel p-4">
           <div className="text-sm font-semibold text-slate-200">原始需求</div>
           <textarea
             className="h-24 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-accent"
@@ -3138,7 +3139,8 @@ export default function App() {
               </div>
             </div>
           )}
-        </section>
+              </section>
+            ) : null}
 
         <section className="col-span-12">
           <div className="rounded-lg border border-slate-800 bg-panel p-4">
@@ -4042,7 +4044,7 @@ export default function App() {
             {activeArtifact === 'tasks' ? (
               <details className="mb-2 rounded-md border border-slate-800 bg-slate-950/20 p-2">
                 <summary className="cursor-pointer select-none text-xs font-semibold text-slate-200">
-                  其它功能（终端 / 编辑 / 编排）
+                  其它功能（终端 / 编辑）
                 </summary>
                 <div className="mt-2 space-y-2">
                   <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
@@ -4091,20 +4093,6 @@ export default function App() {
                       </Button>
                     </div>
                   </div>
-
-                  {selectedSpecName ? (
-                    <details className="rounded-md border border-slate-800 bg-slate-950/30 p-2">
-                      <summary className="cursor-pointer select-none text-xs font-semibold text-slate-200">
-                        编排 / DAG（高级）
-                      </summary>
-                      <div className="mt-2">
-                        <TaskOrchestrator
-                          specId={selectedSpecName}
-                          tasksContent={artifactContent.tasks ?? ''}
-                        />
-                      </div>
-                    </details>
-                  ) : null}
 
                   <div className="rounded-md border border-slate-800 bg-slate-950/30 p-2 text-xs text-slate-300">
                     <TerminalPanel ref={terminalPanelRef} onOpenCliConfig={openCliConfig} />

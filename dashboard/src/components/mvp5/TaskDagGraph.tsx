@@ -180,6 +180,7 @@ export function TaskDagGraph({
 }) {
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const flowRef = useRef<ReactFlowInstance | null>(null);
+  const boundsRef = useRef<TaskDagBounds | null>(null);
   const lastRecoverAtRef = useRef<number | null>(null);
   const [renderIssue, setRenderIssue] = useState<string | null>(null);
 
@@ -198,6 +199,29 @@ export function TaskDagGraph({
     if (!inst) return;
 
     try {
+      const root = wrapperRef.current;
+      const bounds = boundsRef.current;
+      if (root && bounds && typeof inst.setViewport === 'function') {
+        const rect = root.getBoundingClientRect();
+        const hasSize = rect.width > 12 && rect.height > 12;
+        const graphWidth = bounds.maxX - bounds.minX;
+        const graphHeight = bounds.maxY - bounds.minY;
+        if (hasSize && graphWidth > 1 && graphHeight > 1) {
+          const padding = 0.06;
+          const zoomX = (rect.width * (1 - padding * 2)) / graphWidth;
+          const zoomY = (rect.height * (1 - padding * 2)) / graphHeight;
+          let zoom = Math.min(zoomX, zoomY);
+          zoom = Math.max(0.25, Math.min(1.6, zoom));
+
+          const centerX = (bounds.minX + bounds.maxX) / 2;
+          const centerY = (bounds.minY + bounds.maxY) / 2;
+          const x = rect.width / 2 - centerX * zoom;
+          const y = rect.height / 2 - centerY * zoom;
+          inst.setViewport({ x, y, zoom }, { duration: 260 });
+          return;
+        }
+      }
+
       const viewport = typeof inst.getViewport === 'function' ? inst.getViewport() : null;
       const zoom = viewport && typeof viewport.zoom === 'number' ? viewport.zoom : 1;
       const viewportOk =
@@ -232,32 +256,33 @@ export function TaskDagGraph({
         position: { x: 0, y: 0 },
         data: {
           label: (
-            <div className="flex h-full w-full flex-col px-2 py-1.5">
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0 flex-1">
-                  <div
-                    className="text-sm font-semibold leading-5 text-slate-100"
-                    title={t.title}
-                    style={{
-                      display: '-webkit-box',
-                      WebkitLineClamp: 2,
-                      WebkitBoxOrient: 'vertical',
-                      overflow: 'hidden',
-                    }}
-                  >
-                    {t.title}
+              <div className="flex h-full w-full flex-col px-2 py-1.5">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0 flex-1">
+                    <div
+                      className="text-base font-medium leading-6 text-slate-100"
+                      title={t.title}
+                      style={{
+                        display: '-webkit-box',
+                        WebkitLineClamp: 2,
+                        WebkitBoxOrient: 'vertical',
+                        overflow: 'hidden',
+                      }}
+                    >
+                      {t.title}
+                    </div>
                   </div>
-                </div>
                 <span
-                  className={`rounded px-2 py-0.5 text-[11px] font-medium ${statusBadgeClass(
+                  className={`rounded px-2 py-0.5 text-xs font-normal ${statusBadgeClass(
                     visualStatus,
                   )}`}
                 >
                   {visualStatus === 'running' ? (
                     <span className="inline-flex items-center gap-1" title="进行中">
                       <Cog
-                        className="h-3.5 w-3.5 animate-spin text-blue-300 drop-shadow-[0_0_6px_rgba(59,130,246,0.55)]"
+                        className="h-4 w-4 animate-spin text-blue-300 drop-shadow-[0_0_6px_rgba(59,130,246,0.55)]"
                         style={{ animationDuration: '2s' }}
+                        strokeWidth={1.5}
                         aria-hidden="true"
                       />
                       <span>进行中</span>
@@ -273,7 +298,7 @@ export function TaskDagGraph({
                   {actions.start ? (
                     <button
                       type="button"
-                      className="pointer-events-auto inline-flex h-6 items-center justify-center gap-1 rounded border border-accent/30 bg-accent/15 px-2 text-[11px] font-medium text-slate-100 transition-colors hover:bg-accent/25 disabled:cursor-not-allowed disabled:opacity-40"
+                      className="pointer-events-auto inline-flex h-6 items-center justify-center gap-1 rounded border border-accent/30 bg-accent/15 px-2 text-xs font-normal text-slate-100 transition-colors hover:bg-accent/25 disabled:cursor-not-allowed disabled:opacity-40"
                       onClick={(e) => {
                         e.preventDefault();
                         e.stopPropagation();
@@ -289,7 +314,7 @@ export function TaskDagGraph({
                   {actions.running ? (
                     <button
                       type="button"
-                      className="pointer-events-auto inline-flex h-6 items-center justify-center gap-1 rounded border border-blue-500/30 bg-blue-500/10 px-2 text-[11px] font-medium text-blue-200 transition-colors hover:bg-blue-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                      className="pointer-events-auto inline-flex h-6 items-center justify-center gap-1 rounded border border-blue-500/30 bg-blue-500/10 px-2 text-xs font-normal text-blue-200 transition-colors hover:bg-blue-500/20 disabled:cursor-not-allowed disabled:opacity-40"
                       onClick={(e) => {
                         e.preventDefault();
                         e.stopPropagation();
@@ -299,7 +324,7 @@ export function TaskDagGraph({
                       title={actions.running.title}
                     >
                       <Cog
-                        className={`h-3.5 w-3.5 ${
+                        className={`h-4 w-4 ${
                           visualStatus === 'running'
                             ? 'animate-spin text-blue-300 drop-shadow-[0_0_6px_rgba(59,130,246,0.55)]'
                             : actions.running.disabled
@@ -307,6 +332,7 @@ export function TaskDagGraph({
                               : 'text-blue-300/80'
                         }`}
                         style={visualStatus === 'running' ? { animationDuration: '2s' } : undefined}
+                        strokeWidth={1.5}
                         aria-hidden="true"
                       />
                       {actions.running.label}
@@ -315,7 +341,11 @@ export function TaskDagGraph({
                   {actions.done ? (
                     <button
                       type="button"
-                      className="pointer-events-auto inline-flex h-6 items-center justify-center gap-1 rounded border border-green-500/30 bg-green-500/10 px-2 text-[11px] font-medium text-green-200 transition-colors hover:bg-green-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                      className={`pointer-events-auto inline-flex h-6 items-center justify-center gap-1 rounded border px-2 text-xs font-normal transition-colors disabled:cursor-not-allowed ${
+                        visualStatus === 'completed'
+                          ? 'border-green-500/30 bg-green-500/10 text-green-200 hover:bg-green-500/20 disabled:opacity-100'
+                          : 'border-slate-700 bg-slate-950/40 text-slate-300 hover:bg-slate-950/60 disabled:opacity-40'
+                      }`}
                       onClick={(e) => {
                         e.preventDefault();
                         e.stopPropagation();
@@ -340,6 +370,8 @@ export function TaskDagGraph({
           borderRadius: 10,
           background: nodeColorByRisk(t.riskLevel),
           padding: 0,
+          pointerEvents: 'auto',
+          visibility: 'visible',
         },
       };
     });
@@ -368,6 +400,8 @@ export function TaskDagGraph({
     const layouted = layoutDag(nodes, edges, { nodeWidth, nodeHeight, nodesep, ranksep });
     return { ...layouted, bounds: computeDagBounds(layouted.nodes) };
   }, [graph, statusKey, taskActionsById, taskStatusById]);
+
+  boundsRef.current = bounds;
 
   useEffect(() => {
     if (!nodes.length) {
@@ -468,10 +502,12 @@ export function TaskDagGraph({
         </div>
       ) : null}
       <ReactFlow
+        key={statusKey}
         nodes={nodes}
         edges={edges}
         fitView
         fitViewOptions={{ padding: 0.06 }}
+        onlyRenderVisibleElements={false}
         minZoom={0.25}
         maxZoom={1.6}
         nodesDraggable={false}

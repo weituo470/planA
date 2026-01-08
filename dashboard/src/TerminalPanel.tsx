@@ -744,10 +744,6 @@ export function TerminalPanelInner(
     socket.on('state:init', (payload: any) => {
       const remote = Array.isArray(payload?.terminals) ? payload.terminals : [];
       mergeRemoteTerminals(remote);
-      if (remote.length) {
-        const first = String(remote[0]?.id || '').trim();
-        if (first) setActiveId((prev) => prev || first);
-      }
     });
 
     socket.on('terminal:created', (payload: any) => {
@@ -799,8 +795,13 @@ export function TerminalPanelInner(
   }, [mergeRemoteTerminals]);
 
   useEffect(() => {
-    if (activeId && tabs.some((t) => t.id === activeId)) return;
-    setActiveId(tabs.length ? tabs[0]?.id ?? null : null);
+    if (!tabs.length) {
+      if (activeId !== null) setActiveId(null);
+      return;
+    }
+    if (!activeId) return;
+    if (tabs.some((t) => t.id === activeId)) return;
+    setActiveId(tabs[0]?.id ?? null);
   }, [activeId, tabs]);
 
   useEffect(() => {
@@ -1143,6 +1144,10 @@ export function TerminalPanelInner(
 
       {!hasTabs ? (
         <div className="mt-2 text-xs text-slate-500">未创建终端（点击“＋ 新建终端”后显示终端区域）</div>
+      ) : null}
+
+      {hasTabs && !activeId ? (
+        <div className="mt-2 text-xs text-slate-500">已检测到历史终端：点击下方 Tab 继续，或关闭不需要的终端。</div>
       ) : null}
 
       {hasTabs ? (
