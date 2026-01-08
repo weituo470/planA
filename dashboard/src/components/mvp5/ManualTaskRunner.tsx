@@ -672,6 +672,7 @@ export function ManualTaskRunner({
           const status = statusById.get(task.id) ?? (done ? 'completed' : 'pending');
           const missingDeps = (task.dependencies || []).filter((depId) => !doneById.get(depId));
           const blocked = missingDeps.length > 0;
+          const ready = !blocked && status === 'pending';
           const showPrompt = promptForTask?.taskId === task.id;
 
           return (
@@ -691,7 +692,9 @@ export function ManualTaskRunner({
                           ? 'bg-blue-300'
                           : blocked
                             ? 'bg-amber-300'
-                            : 'bg-slate-600'
+                            : ready
+                              ? 'bg-purple-400'
+                              : 'bg-slate-600'
                     }`}
                     aria-hidden="true"
                   />
@@ -703,7 +706,9 @@ export function ManualTaskRunner({
                           ? 'text-blue-300'
                           : blocked
                             ? 'text-amber-300'
-                            : 'text-slate-500'
+                            : ready
+                              ? 'text-purple-300'
+                              : 'text-slate-500'
                     }`}
                   >
                     {status === 'completed'
@@ -712,7 +717,9 @@ export function ManualTaskRunner({
                         ? '进行中'
                         : blocked
                           ? '被前置任务阻塞'
-                          : '未开始'}
+                          : ready
+                            ? '可开始'
+                            : '未开始'}
                   </span>
                 </div>
                 <div className="ml-auto flex flex-wrap items-center gap-2">

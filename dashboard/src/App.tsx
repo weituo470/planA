@@ -3843,65 +3843,72 @@ export default function App() {
                   </div>
                 </details>
 
-                <div className="mt-3 rounded-md border border-slate-800 bg-slate-950/40 p-2">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <div className="text-xs font-semibold text-slate-200">任务迭代优化</div>
-                    <div className="ml-auto text-xs text-slate-400">模型：Claude 4.5 Opus</div>
-                  </div>
-                  <div className="mt-1 text-xs text-slate-400">
-                    点击后会收集上方多模型评价、用户评分记录，以及本次 runId 的 requirements/design/tasks，提交给 Opus 4.5 生成新的 tasks.md，并创建新的流程报告。
-                  </div>
-                  <textarea
-                    className="mt-2 h-24 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100"
-                    value={iterateUserNoteText}
-                    onChange={(e) => setIterateUserNoteText(e.target.value)}
-                    placeholder="可选：补充修改意见（例如：必须补齐缺失边界、禁止占位符路径、description 必须写清输入/输出/验收点等）"
-                  />
-                  <div className="mt-2 flex flex-wrap items-center justify-end gap-2">
-                    <Button
-                      size="sm"
-                      onClick={() => void startIterateTasks()}
-                      disabled={!activeReportRunId || Boolean(tasksIterateStatus?.running)}
-                    >
-                      {tasksIterateStatus?.running ? '迭代中…' : '提交迭代'}
-                    </Button>
-                  </div>
+                <details className="mt-3 rounded-md border border-slate-800 bg-slate-950/40 p-2">
+                  <summary className="cursor-pointer select-none text-xs font-semibold text-slate-200">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div>任务迭代优化</div>
+                      <div className="ml-auto text-xs font-normal text-slate-400">
+                        模型：Claude 4.5 Opus
+                        {tasksIterateStatus?.running ? ' · 迭代中…' : ''}
+                      </div>
+                    </div>
+                  </summary>
+                  <div className="mt-2">
+                    <div className="text-xs text-slate-400">
+                      点击后会收集上方多模型评价、用户评分记录，以及本次 runId 的 requirements/design/tasks，提交给 Opus 4.5 生成新的 tasks.md，并创建新的流程报告。
+                    </div>
+                    <textarea
+                      className="mt-2 h-24 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100"
+                      value={iterateUserNoteText}
+                      onChange={(e) => setIterateUserNoteText(e.target.value)}
+                      placeholder="可选：补充修改意见（例如：必须补齐缺失边界、禁止占位符路径、description 必须写清输入/输出/验收点等）"
+                    />
+                    <div className="mt-2 flex flex-wrap items-center justify-end gap-2">
+                      <Button
+                        size="sm"
+                        onClick={() => void startIterateTasks()}
+                        disabled={!activeReportRunId || Boolean(tasksIterateStatus?.running)}
+                      >
+                        {tasksIterateStatus?.running ? '迭代中…' : '提交迭代'}
+                      </Button>
+                    </div>
 
-                  {tasksIterateStatus &&
-                    (tasksIterateStatus.running ||
-                      tasksIterateStatus.logs?.length ||
-                      tasksIterateStatus.error) && (
-                      <div className="mt-2 rounded-md border border-slate-800 bg-slate-950/30 p-2">
-                        <div className="text-xs text-slate-400">
-                          进度：{tasksIterateStatus.completed}/{tasksIterateStatus.total || 1}
-                        </div>
-                        <div className="mt-2 h-24 overflow-auto rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-300">
-                          {tasksIterateStatus.logs?.length ? (
-                            tasksIterateStatus.logs.map((entry, idx) => (
-                              <div key={`${entry.at}-${idx}`}>{entry.message}</div>
-                            ))
-                          ) : (
-                            <div className="text-slate-400">暂无日志</div>
+                    {tasksIterateStatus &&
+                      (tasksIterateStatus.running ||
+                        tasksIterateStatus.logs?.length ||
+                        tasksIterateStatus.error) && (
+                        <div className="mt-2 rounded-md border border-slate-800 bg-slate-950/30 p-2">
+                          <div className="text-xs text-slate-400">
+                            进度：{tasksIterateStatus.completed}/{tasksIterateStatus.total || 1}
+                          </div>
+                          <div className="mt-2 h-24 overflow-auto rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-xs text-slate-300">
+                            {tasksIterateStatus.logs?.length ? (
+                              tasksIterateStatus.logs.map((entry, idx) => (
+                                <div key={`${entry.at}-${idx}`}>{entry.message}</div>
+                              ))
+                            ) : (
+                              <div className="text-slate-400">暂无日志</div>
+                            )}
+                          </div>
+                          {tasksIterateStatus.error && (
+                            <div className="mt-2 text-xs text-red-300">
+                              失败：{tasksIterateStatus.error}
+                            </div>
+                          )}
+                          {tasksIterateStatus.outputRunId && (
+                            <div className="mt-2 text-xs text-slate-400 break-all">
+                              新 runId：{tasksIterateStatus.outputRunId}
+                            </div>
+                          )}
+                          {tasksIterateStatus.outputReportPath && (
+                            <div className="mt-1 text-xs text-slate-500 break-all">
+                              新报告：{tasksIterateStatus.outputReportPath}
+                            </div>
                           )}
                         </div>
-                        {tasksIterateStatus.error && (
-                          <div className="mt-2 text-xs text-red-300">
-                            失败：{tasksIterateStatus.error}
-                          </div>
-                        )}
-                        {tasksIterateStatus.outputRunId && (
-                          <div className="mt-2 text-xs text-slate-400 break-all">
-                            新 runId：{tasksIterateStatus.outputRunId}
-                          </div>
-                        )}
-                        {tasksIterateStatus.outputReportPath && (
-                          <div className="mt-1 text-xs text-slate-500 break-all">
-                            新报告：{tasksIterateStatus.outputReportPath}
-                          </div>
-                        )}
-                      </div>
-                    )}
-                </div>
+                      )}
+                  </div>
+                </details>
 
                 {ATOMIZE_ENABLED ? (
                   <div className="mt-3 rounded-md border border-slate-800 bg-slate-950/40 p-2">
@@ -3935,51 +3942,69 @@ export default function App() {
                 </div>
                 ) : null}
 
-                <div className="mt-3 flex flex-wrap items-end gap-2">
-                  <label className="flex items-center gap-2 text-xs text-slate-300">
-                    <span className="text-slate-400">用户评分</span>
-                    <input
-                      className="h-8 w-20 rounded-md border border-slate-700 bg-slate-950 px-2 text-xs text-slate-100"
-                      value={userReportScoreText}
-                      onChange={(e) =>
-                        setUserReportScoreText(
-                          e.target.value.replace(/[^\d]/g, '').slice(0, 3),
-                        )
-                      }
-                      placeholder="0-100"
-                      inputMode="numeric"
-                    />
-                  </label>
-                  <input
-                    className="h-8 min-w-[220px] flex-1 rounded-md border border-slate-700 bg-slate-950 px-2 text-xs text-slate-100"
-                    value={userReportCommentText}
-                    onChange={(e) => setUserReportCommentText(e.target.value)}
-                    placeholder="可选：备注"
-                  />
-                  <Button
-                    size="sm"
-                    onClick={() => void submitUserReportRating()}
-                    disabled={!activeReportRunId || !userReportScoreText.trim()}
-                  >
-                    提交
-                  </Button>
-                </div>
-
-                {activeReport?.userRatings?.length ? (
-                  <div className="mt-2 text-xs text-slate-300">
-                    <div className="text-slate-400">历史用户评分（最近 5 条）：</div>
-                    <div className="mt-1 space-y-1">
-                      {activeReport.userRatings.slice(-5).map((r, idx) => (
-                        <div key={`${r.createdAt}-${idx}`}>
-                          {new Date(r.createdAt).toLocaleString()}：{r.score}/100
-                          {r.comment ? `｜${r.comment}` : ''}
-                        </div>
-                      ))}
+                <details className="mt-3 rounded-md border border-slate-800 bg-slate-950/40 p-2">
+                  <summary className="cursor-pointer select-none text-xs font-semibold text-slate-200">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div>用户评分</div>
+                      <div className="ml-auto text-xs font-normal text-slate-400">
+                        {activeReport?.userRatings?.length
+                          ? `已有 ${activeReport.userRatings.length} 条`
+                          : '暂无历史评分'}
+                      </div>
                     </div>
+                  </summary>
+                  <div className="mt-2">
+                    <div className="flex flex-wrap items-end gap-2">
+                      <label className="flex items-center gap-2 text-xs text-slate-300">
+                        <span className="text-slate-400">评分</span>
+                        <input
+                          className="h-8 w-20 rounded-md border border-slate-700 bg-slate-950 px-2 text-xs text-slate-100"
+                          value={userReportScoreText}
+                          onChange={(e) =>
+                            setUserReportScoreText(
+                              e.target.value.replace(/[^\d]/g, '').slice(0, 3),
+                            )
+                          }
+                          placeholder="0-100"
+                          inputMode="numeric"
+                        />
+                      </label>
+                      <input
+                        className="h-8 min-w-[220px] flex-1 rounded-md border border-slate-700 bg-slate-950 px-2 text-xs text-slate-100"
+                        value={userReportCommentText}
+                        onChange={(e) => setUserReportCommentText(e.target.value)}
+                        placeholder="可选：备注"
+                      />
+                      <Button
+                        size="sm"
+                        onClick={() => void submitUserReportRating()}
+                        disabled={!activeReportRunId || !userReportScoreText.trim()}
+                      >
+                        提交
+                      </Button>
+                    </div>
+
+                    {activeReport?.userRatings?.length ? (
+                      <div className="mt-2 text-xs text-slate-300">
+                        <div className="text-slate-400">
+                          历史用户评分（最近 5 条）：
+                        </div>
+                        <div className="mt-1 space-y-1">
+                          {activeReport.userRatings.slice(-5).map((r, idx) => (
+                            <div key={`${r.createdAt}-${idx}`}>
+                              {new Date(r.createdAt).toLocaleString()}：{r.score}/100
+                              {r.comment ? `｜${r.comment}` : ''}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="mt-2 text-xs text-slate-400">
+                        历史用户评分：暂无
+                      </div>
+                    )}
                   </div>
-                ) : (
-                  <div className="mt-2 text-xs text-slate-400">历史用户评分：暂无</div>
-                )}
+                </details>
 
                 <details className="mt-3 rounded-md border border-slate-800 bg-slate-950/30 p-2">
                   <summary className="cursor-pointer select-none text-xs font-semibold text-slate-200">
