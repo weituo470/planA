@@ -353,12 +353,16 @@ export function ManualTaskRunner({
   disabled,
   onSaveTasksContent,
   onToast,
+  onRunPromptInClaudeAutoTerminal,
 }: {
   specId: string;
   tasksContent: string;
   disabled?: boolean;
   onSaveTasksContent: (next: string) => Promise<void>;
   onToast: (message: string, type?: ToastType) => void;
+  onRunPromptInClaudeAutoTerminal?: (
+    prompt: string,
+  ) => Promise<{ terminalId: string; title: string }>;
 }) {
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [promptForTask, setPromptForTask] = useState<{
@@ -417,52 +421,59 @@ export function ManualTaskRunner({
     return map;
   }, [tasks]);
 
+  const fetchPromptForTask = useCallback(
+    async (task: DagTask) => {
+      const deps = task.dependencies ?? [];
+      const missing = deps.filter((depId) => !doneById.get(depId));
+      if (missing.length) {
+        throw new Error(`前置任务未完成：${missing.join(', ')}`);
+      }
+
+      const body = {
+        specId,
+        taskId: task.id,
+        tasksContent,
+        projectDir: workspace?.effectiveCwd ?? undefined,
+      };
+      const res = await fetch(`${BRIDGE_URL}/api/mvp5/task-prompt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = (await res.json()) as PromptResponse;
+      if (!res.ok) throw new Error(data?.error || '生成提示词失败');
+      const prompt = String(data?.prompt || '').trim();
+      if (!prompt) throw new Error('生成提示词失败：prompt 为空');
+      return { prompt, runDocPathAbs: data.runDocPathAbs };
+    },
+    [doneById, specId, tasksContent, workspace?.effectiveCwd],
+  );
+
   const handleGeneratePrompt = useCallback(
     async (
       task: DagTask,
       options?: { autoCopy?: boolean; showPanel?: boolean },
     ) => {
-      const deps = task.dependencies ?? [];
-      const missing = deps.filter((depId) => !doneById.get(depId));
-      if (missing.length) {
-        onToast(`前置任务未完成：${missing.join(', ')}`, 'error');
-        return;
-      }
-
       const autoCopy = options?.autoCopy === true;
       const showPanel = options?.showPanel !== false;
 
       setPromptLoadingTaskId(task.id);
       try {
-        const body = {
-          specId,
-          taskId: task.id,
-          tasksContent,
-          projectDir: workspace?.effectiveCwd ?? undefined,
-        };
-        const res = await fetch(`${BRIDGE_URL}/api/mvp5/task-prompt`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        });
-        const data = (await res.json()) as PromptResponse;
-        if (!res.ok) throw new Error(data?.error || '生成提示词失败');
-        const prompt = String(data?.prompt || '').trim();
-        if (!prompt) throw new Error('生成提示词失败：prompt 为空');
+        const { prompt, runDocPathAbs } = await fetchPromptForTask(task);
 
         if (autoCopy) {
           const ok = await copyTextToClipboard(prompt);
           if (ok) {
             onToast('已自动复制任务提示词', 'info');
           } else {
-            setPromptForTask({ taskId: task.id, prompt, runDocPathAbs: data.runDocPathAbs });
+            setPromptForTask({ taskId: task.id, prompt, runDocPathAbs });
             onToast('自动复制失败：已生成提示词，可手动复制', 'error');
           }
           return;
         }
 
         if (showPanel) {
-          setPromptForTask({ taskId: task.id, prompt, runDocPathAbs: data.runDocPathAbs });
+          setPromptForTask({ taskId: task.id, prompt, runDocPathAbs });
         }
         onToast('已生成提示词（可复制发给 CLI）', 'info');
       } catch (e: any) {
@@ -471,7 +482,31 @@ export function ManualTaskRunner({
         setPromptLoadingTaskId(null);
       }
     },
-    [doneById, onToast, specId, tasksContent, workspace?.effectiveCwd],
+    [fetchPromptForTask, onToast],
+  );
+
+  const handleStartClaudeAuto = useCallback(
+    async (task: DagTask) => {
+      if (!onRunPromptInClaudeAutoTerminal) {
+        onToast('终端面板未就绪', 'error');
+        return;
+      }
+
+      setPromptLoadingTaskId(task.id);
+      try {
+        const { prompt } = await fetchPromptForTask(task);
+        const created = await onRunPromptInClaudeAutoTerminal(prompt);
+        onToast(
+          `已启动：${created.title || 'Claude Code'} · ${created.terminalId}`,
+          'info',
+        );
+      } catch (e: any) {
+        onToast(String(e?.message || e || '启动失败'), 'error');
+      } finally {
+        setPromptLoadingTaskId(null);
+      }
+    },
+    [fetchPromptForTask, onRunPromptInClaudeAutoTerminal, onToast],
   );
 
   const handleMarkDone = useCallback(
@@ -567,9 +602,9 @@ export function ManualTaskRunner({
       map[task.id] = {
         start: {
           label: promptLoading ? '生成中…' : '开始',
-          title: '开始并自动复制提示词',
+          title: '启动 Claude Code（全自动）并执行任务',
           disabled: Boolean(disabled) || done || promptLoading,
-          onClick: () => void handleGeneratePrompt(task, { autoCopy: true, showPanel: false }),
+          onClick: () => void handleStartClaudeAuto(task),
         },
         running: {
           label: '进行中',
@@ -593,6 +628,7 @@ export function ManualTaskRunner({
     handleGeneratePrompt,
     handleMarkDone,
     handleMarkRunning,
+    handleStartClaudeAuto,
     promptLoadingTaskId,
     statusById,
     tasks,
@@ -725,10 +761,12 @@ export function ManualTaskRunner({
                 <div className="ml-auto flex flex-wrap items-center gap-2">
                   <Button
                     size="sm"
-                    onClick={() => void handleGeneratePrompt(task)}
+                    onClick={() =>
+                      void handleGeneratePrompt(task, { autoCopy: true, showPanel: false })
+                    }
                     disabled={disabled || done || promptLoadingTaskId === task.id}
                   >
-                    {promptLoadingTaskId === task.id ? '生成中…' : '开始'}
+                    {promptLoadingTaskId === task.id ? '生成中…' : '复制任务提示词'}
                   </Button>
                   <div className="flex items-center gap-3">
                     <button
@@ -800,20 +838,6 @@ export function ManualTaskRunner({
                   <div className="mb-2 flex items-center justify-between gap-2">
                     <div className="text-xs font-semibold text-slate-200">任务提示词</div>
                     <div className="flex items-center gap-2">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={async () => {
-                          try {
-                            await navigator.clipboard.writeText(promptForTask.prompt);
-                            onToast('已复制到剪贴板', 'info');
-                          } catch {
-                            onToast('复制失败', 'error');
-                          }
-                        }}
-                      >
-                        一键复制
-                      </Button>
                       <Button size="sm" variant="ghost" onClick={() => setPromptForTask(null)}>
                         收起
                       </Button>

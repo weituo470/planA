@@ -229,9 +229,10 @@ const DEFAULT_PROMPT_CONFIG = {
 	      user:
 	        `设计内容如下：\n{{design}}\n\n补充描述：{{prompt}}\n\n` +
 	        '请按 docs/任务编排.md 生成任务清单，严格只输出 JSON：\n' +
-	        '{"tasks":[{"id":"TASK_ID","title":"动宾结构","description":"任务目标契约（输入/输出/验收点）","dependencies":["PREV_TASK_ID"],"scope":["/path"],"estimated_complexity":"Low|Medium|High"}]}\n\n' +
+	        '{"tasks":[{"id":"task_1","title":"动宾结构","description":"任务目标契约（输入/输出/验收点）","dependencies":[],"scope":["/path"],"estimated_complexity":"Low|Medium|High"}]}\n\n' +
 	        '要求：\n' +
 	        '- 任务粒度：模块级/交付物级；严禁原子级/指令级拆解；总数 ≤ {{maxTasks}} 且必须 ≤ 25；建议 ≥ {{minTasks}}。\n' +
+	        '- id 必须严格为 task_1, task_2, ... task_n（从 1 开始连续编号，禁止跳号/重复/其他格式）。\n' +
 	        '- dependencies 必须仅引用本次输出中的 id；无依赖填 []。\n' +
 	        '- scope：建议主要修改的文件范围（仓库相对路径或目录前缀），尽量减少重叠以降低冲突。\n' +
 	        '- estimated_complexity 只能是 Low/Medium/High。\n' +
@@ -2456,11 +2457,11 @@ async function runTasksIterateJob(specName, runId, job, options = {}) {
         feedbackBlock +
         '\n请按 docs/任务编排.md 迭代优化任务清单，要求：\n' +
         '1) 任务必须是模块级/交付物级，总数 <= 25；禁止原子级/步骤级拆解。\n' +
-        '2) 尽量保持现有任务 id 不变；若必须新增/合并/拆分，也要保持 id 唯一且语义清晰。\n' +
+        '2) id 必须严格为 task_1, task_2, ... task_n（从 1 开始连续编号）；尽量保持现有任务语义与顺序稳定。\n' +
         '3) title：动宾结构；description：写清输入/输出/验收点，避免空泛；严禁 TBD/待定/[path]/占位符。\n' +
         '4) dependencies：仅引用任务 id，形成无环 DAG；文件写入冲突/接口依赖必须串行化。\n' +
         '5) scope：尽量精确到主要目录/文件集合，用于冲突预警；estimated_complexity 只能是 Low/Medium/High。\n\n' +
-        '请严格只输出 JSON：{"tasks":[{"id":"T1_INFRA","title":"...","description":"...","dependencies":[],"scope":["/path"],"estimated_complexity":"Medium"}]}。',
+        '请严格只输出 JSON：{"tasks":[{"id":"task_1","title":"...","description":"...","dependencies":[],"scope":["/path"],"estimated_complexity":"Medium"}]}。',
     };
 
     const promptRendered = {
@@ -2518,8 +2519,9 @@ async function runTasksIterateJob(specName, runId, job, options = {}) {
     }
 
     const trimmed = normalized.slice(0, 25);
-    const idSet = new Set(trimmed.map((t) => t.id));
-    const finalTasks = trimmed.map((t) => {
+    const renumbered = renumberDagTasksToTaskSequence(trimmed, { prefix: 'task_' });
+    const idSet = new Set(renumbered.map((t) => t.id));
+    const finalTasks = renumbered.map((t) => {
       const deps = Array.isArray(t.dependencies) ? t.dependencies : [];
       const dependencies = Array.from(
         new Set(
@@ -3981,7 +3983,7 @@ function generateTasksContent(design, prompt) {
   );
   const tasks = [
     {
-      id: 'T1_SCOPE',
+      id: 'task_1',
       title: '明确范围与验收口径',
       description:
         '基于 requirements/design 明确范围边界、优先级与验收方式，补齐缺失信息，并在 tasks.md 固定可执行的 DAG 输入（TASKS_JSON）。',
@@ -3990,47 +3992,47 @@ function generateTasksContent(design, prompt) {
       estimated_complexity: 'Medium',
     },
     {
-      id: 'T2_SETUP',
+      id: 'task_2',
       title: '项目基建与运行链路打通',
       description:
         '完成依赖安装、本地运行/构建链路与基础健康检查，确保后续任务能在可复现环境中推进。',
-      dependencies: ['T1_SCOPE'],
+      dependencies: ['task_1'],
       scope: [],
       estimated_complexity: 'Medium',
     },
     {
-      id: 'T3_CONTRACT',
+      id: 'task_3',
       title: '数据模型与接口契约确定',
       description:
         '确定核心数据结构与接口契约（含错误处理/权限边界/边界条件）；必要时先补齐 schema/DTO/类型定义再进入功能实现。',
-      dependencies: ['T1_SCOPE'],
+      dependencies: ['task_1'],
       scope: [],
       estimated_complexity: 'Medium',
     },
     {
-      id: 'T4_CORE',
+      id: 'task_4',
       title: summary ? `实现核心功能模块（${summary}）` : '实现核心功能模块',
       description:
         '按 design 的关键流程实现核心功能闭环（包含必要的 API/业务逻辑/页面/交互），并将关键变更与验证方式回写到 tasks.md。',
-      dependencies: ['T2_SETUP', 'T3_CONTRACT'],
+      dependencies: ['task_2', 'task_3'],
       scope: [],
       estimated_complexity: 'High',
     },
     {
-      id: 'T5_INTEGRATION',
+      id: 'task_5',
       title: '联调与回归验证',
       description:
         '按验收标准进行联调，补齐异常分支与边界处理，形成可复现验证步骤（命令/接口/页面路径/可观察结果）。',
-      dependencies: ['T4_CORE'],
+      dependencies: ['task_4'],
       scope: [],
       estimated_complexity: 'Medium',
     },
     {
-      id: 'T6_RELEASE',
+      id: 'task_6',
       title: '构建与交付物整理',
       description:
         '完成构建/测试/打包并整理运行说明；在回写记录中记录最终验证结果与注意事项。',
-      dependencies: ['T5_INTEGRATION'],
+      dependencies: ['task_5'],
       scope: [],
       estimated_complexity: 'Low',
     },
@@ -4583,7 +4585,7 @@ function normalizeStringList(value) {
 function normalizeDagTaskId(value, index) {
   const raw = String(value ?? '').trim();
   if (raw && /^[A-Za-z0-9_-]+$/.test(raw)) return raw;
-  return `T${index + 1}`;
+  return `task_${index + 1}`;
 }
 
 function normalizeDagTaskObject(task, index) {
@@ -4620,7 +4622,7 @@ function ensureUniqueDagTaskIds(tasks) {
   const list = Array.isArray(tasks) ? tasks : [];
   const seen = new Set();
   return list.map((t, idx) => {
-    const base = String(t?.id || `T${idx + 1}`).trim() || `T${idx + 1}`;
+    const base = String(t?.id || `task_${idx + 1}`).trim() || `task_${idx + 1}`;
     let id = base;
     let suffix = 2;
     while (seen.has(id)) {
@@ -4628,6 +4630,23 @@ function ensureUniqueDagTaskIds(tasks) {
     }
     seen.add(id);
     return id === t.id ? t : { ...t, id };
+  });
+}
+
+function renumberDagTasksToTaskSequence(tasks, options = {}) {
+  const list = Array.isArray(tasks) ? tasks : [];
+  const prefix =
+    typeof options?.prefix === 'string' && options.prefix.trim() ? options.prefix.trim() : 'task_';
+  const idMap = new Map(list.map((t, idx) => [String(t?.id || '').trim(), `${prefix}${idx + 1}`]));
+  return list.map((t, idx) => {
+    const id = `${prefix}${idx + 1}`;
+    const deps = Array.isArray(t?.dependencies) ? t.dependencies : [];
+    const dependencies = deps
+      .map((d) => String(d ?? '').trim())
+      .filter(Boolean)
+      .map((d) => idMap.get(d))
+      .filter(Boolean);
+    return { ...t, id, dependencies };
   });
 }
 
@@ -5624,8 +5643,9 @@ async function generateTasksWithModel(design, prompt, options = {}) {
     }
 
     const trimmed = normalized.slice(0, Math.min(maxTasks, 25));
-    const idSet = new Set(trimmed.map((t) => t.id));
-    const finalTasks = trimmed.map((t) => {
+    const renumbered = renumberDagTasksToTaskSequence(trimmed, { prefix: 'task_' });
+    const idSet = new Set(renumbered.map((t) => t.id));
+    const finalTasks = renumbered.map((t) => {
       const deps = Array.isArray(t.dependencies) ? t.dependencies : [];
       const dependencies = Array.from(
         new Set(
@@ -8554,7 +8574,7 @@ app.post('/specs/:name/confirm', async (req, res) => {
           content = buildTasksDagMarkdown({
             tasks: [
               {
-                id: 'T1_BRIEF',
+                id: 'task_1',
                 title: '明确交付目标与范围边界',
                 description:
                   '定义受众、交付物形态（Markdown/PDF/Slides）、范围/不做事项清单；产出 docs/brief.md（或写入 requirements/design）。',
@@ -8563,47 +8583,47 @@ app.post('/specs/:name/confirm', async (req, res) => {
                 estimated_complexity: 'Medium',
               },
               {
-                id: 'T2_OUTLINE',
+                id: 'task_2',
                 title: '输出目录与提纲结构',
                 description:
-                  '基于 T1 输出目录结构与每章要点；产出 docs/outline.md（或写入 design）。',
-                dependencies: ['T1_BRIEF'],
+                  '基于 task_1 输出目录结构与每章要点；产出 docs/outline.md（或写入 design）。',
+                dependencies: ['task_1'],
                 scope: ['docs/'],
                 estimated_complexity: 'Medium',
               },
               {
-                id: 'T3_CONTENT',
+                id: 'task_3',
                 title: '补齐核心内容与素材',
                 description:
                   '填充各章节内容，包含时间线/预算/分工/资源清单（按需求选择）；产出 docs/draft.md。',
-                dependencies: ['T2_OUTLINE'],
+                dependencies: ['task_2'],
                 scope: ['docs/'],
                 estimated_complexity: 'High',
               },
               {
-                id: 'T4_RISK',
+                id: 'task_4',
                 title: '整理风险清单与预案',
                 description:
                   '列出触发条件/影响/应对措施；产出 docs/risk.md。',
-                dependencies: ['T2_OUTLINE'],
+                dependencies: ['task_2'],
                 scope: ['docs/'],
                 estimated_complexity: 'Medium',
               },
               {
-                id: 'T5_REVIEW',
+                id: 'task_5',
                 title: '一致性校对与终稿修订',
                 description:
                   '统一术语、数字、口径并修订；产出 docs/final.md。',
-                dependencies: ['T3_CONTENT', 'T4_RISK'],
+                dependencies: ['task_3', 'task_4'],
                 scope: ['docs/'],
                 estimated_complexity: 'Medium',
               },
               {
-                id: 'T6_EXPORT',
+                id: 'task_6',
                 title: '导出可交付版本与版本说明',
                 description:
                   '按交付形态导出 Markdown/PDF/Slides，并给出版本说明与获取方式。',
-                dependencies: ['T5_REVIEW'],
+                dependencies: ['task_5'],
                 scope: ['docs/'],
                 estimated_complexity: 'Low',
               },

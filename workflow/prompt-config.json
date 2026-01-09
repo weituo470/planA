@@ -53,7 +53,7 @@
         "maxTasks"
       ],
       "system": "你是项目任务拆解助手。按 docs/任务编排.md 输出模块级任务清单与依赖拓扑。只输出 JSON，不要解释，不要包含分析或思考过程。",
-      "user": "设计内容如下：\n{{design}}\n\n补充描述：{{prompt}}\n\n请按 docs/任务编排.md 生成任务清单，严格只输出 JSON：\n{\"tasks\":[{\"id\":\"TASK_ID\",\"title\":\"动宾结构\",\"description\":\"任务目标契约（输入/输出/验收点）\",\"dependencies\":[\"PREV_TASK_ID\"],\"scope\":[\"/path\"],\"estimated_complexity\":\"Low|Medium|High\"}]}\n\n要求：\n- 任务粒度：模块级/交付物级；严禁原子级/指令级拆解；总数 ≤ {{maxTasks}} 且必须 ≤ 25；建议 ≥ {{minTasks}}。\n- dependencies 必须仅引用本次输出中的 id；无依赖填 []。\n- scope：建议主要修改的文件范围（仓库相对路径或目录前缀），尽量减少重叠以降低冲突。\n- estimated_complexity 只能是 Low/Medium/High。\n- 只输出 JSON。"
+      "user": "设计内容如下：\n{{design}}\n\n补充描述：{{prompt}}\n\n请按 docs/任务编排.md 生成任务清单，严格只输出 JSON：\n{\"tasks\":[{\"id\":\"task_1\",\"title\":\"动宾结构\",\"description\":\"任务目标契约（输入/输出/验收点）\",\"dependencies\":[],\"scope\":[\"/path\"],\"estimated_complexity\":\"Low|Medium|High\"}]}\n\n要求：\n- 任务粒度：模块级/交付物级；严禁原子级/指令级拆解；总数 ≤ {{maxTasks}} 且必须 ≤ 25；建议 ≥ {{minTasks}}。\n- id 必须严格为 task_1, task_2, ... task_n（从 1 开始连续编号，禁止跳号/重复/其他格式）。\n- dependencies 必须仅引用本次输出中的 id；无依赖填 []。\n- scope：建议主要修改的文件范围（仓库相对路径或目录前缀），尽量减少重叠以降低冲突。\n- estimated_complexity 只能是 Low/Medium/High。\n- 只输出 JSON。"
     },
     "atomize": {
       "label": "任务原子化",

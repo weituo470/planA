@@ -217,8 +217,7 @@ export function TaskDagGraph({
           const centerY = (bounds.minY + bounds.maxY) / 2;
           const x = rect.width / 2 - centerX * zoom;
           const y = rect.height / 2 - centerY * zoom;
-          inst.setViewport({ x, y, zoom }, { duration: 260 });
-          return;
+          inst.setViewport({ x, y, zoom }, { duration: 0 });
         }
       }
 
@@ -233,7 +232,13 @@ export function TaskDagGraph({
       if (!viewportOk && typeof inst.setViewport === 'function') {
         inst.setViewport({ x: 0, y: 0, zoom: 1 }, { duration: 0 });
       }
-      inst.fitView({ padding: 0.06, duration: 260 });
+      window.requestAnimationFrame(() => {
+        try {
+          inst.fitView({ padding: 0.06, duration: 0 });
+        } catch (e) {
+          console.error('[TaskDagGraph] fitView failed', { reason, error: e });
+        }
+      });
     } catch (e) {
       console.error('[TaskDagGraph] recover failed', { reason, error: e });
     }
@@ -242,11 +247,11 @@ export function TaskDagGraph({
   const { nodes, edges, bounds } = useMemo(() => {
     const actionsEnabled = Boolean(taskActionsById);
     const nodeWidth = actionsEnabled ? 300 : 260;
-    const nodeHeight = actionsEnabled ? 112 : 90;
+    const nodeHeight = actionsEnabled ? 120 : 90;
     const nodesep = actionsEnabled ? 18 : 16;
     const ranksep = actionsEnabled ? 44 : 40;
 
-    const nodes: Node[] = (graph?.tasks ?? []).map((t) => {
+    const nodes: Node[] = (graph?.tasks ?? []).map((t, idx) => {
       const status = taskStatusById?.[t.id] ?? 'pending';
       const visualStatus = deriveTaskVisualStatus(t.id, status, graph, taskStatusById);
       const actions = taskActionsById?.[t.id];
@@ -259,30 +264,38 @@ export function TaskDagGraph({
               <div className="flex h-full w-full flex-col px-2 py-1.5">
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0 flex-1">
-                    <div
-                      className="text-base font-medium leading-6 text-slate-100"
-                      title={t.title}
-                      style={{
-                        display: '-webkit-box',
-                        WebkitLineClamp: 2,
-                        WebkitBoxOrient: 'vertical',
-                        overflow: 'hidden',
-                      }}
-                    >
-                      {t.title}
+                    <div className="flex min-w-0 items-start gap-2">
+                      <span
+                        className="mt-0.5 shrink-0 rounded bg-slate-950/40 px-1.5 py-0.5 text-xs font-normal text-slate-300 ring-1 ring-slate-700/70"
+                        title={`序号 #${idx + 1}`}
+                      >
+                        #{idx + 1}
+                      </span>
+                      <div
+                        className="min-w-0 text-base font-medium leading-6 text-slate-100"
+                        title={t.title}
+                        style={{
+                          display: '-webkit-box',
+                          WebkitLineClamp: 2,
+                          WebkitBoxOrient: 'vertical',
+                          overflow: 'hidden',
+                        }}
+                      >
+                        {t.title}
+                      </div>
                     </div>
                   </div>
                 <span
-                  className={`rounded px-2 py-0.5 text-xs font-normal ${statusBadgeClass(
+                  className={`rounded px-2 py-0.5 text-[13px] font-light ${statusBadgeClass(
                     visualStatus,
                   )}`}
                 >
                   {visualStatus === 'running' ? (
                     <span className="inline-flex items-center gap-1" title="进行中">
                       <Cog
-                        className="h-4 w-4 animate-spin text-blue-300 drop-shadow-[0_0_6px_rgba(59,130,246,0.55)]"
+                        className="h-[18px] w-[18px] animate-spin text-blue-300 drop-shadow-[0_0_6px_rgba(59,130,246,0.55)]"
                         style={{ animationDuration: '2s' }}
-                        strokeWidth={1.5}
+                        strokeWidth={1.25}
                         aria-hidden="true"
                       />
                       <span>进行中</span>
@@ -298,7 +311,7 @@ export function TaskDagGraph({
                   {actions.start ? (
                     <button
                       type="button"
-                      className="pointer-events-auto inline-flex h-6 items-center justify-center gap-1 rounded border border-accent/30 bg-accent/15 px-2 text-xs font-normal text-slate-100 transition-colors hover:bg-accent/25 disabled:cursor-not-allowed disabled:opacity-40"
+                      className="pointer-events-auto inline-flex h-7 items-center justify-center gap-1 rounded border border-accent/30 bg-accent/15 px-2.5 text-[13px] font-light text-slate-100 transition-colors hover:bg-accent/25 disabled:cursor-not-allowed disabled:opacity-40"
                       onClick={(e) => {
                         e.preventDefault();
                         e.stopPropagation();
@@ -314,7 +327,11 @@ export function TaskDagGraph({
                   {actions.running ? (
                     <button
                       type="button"
-                      className="pointer-events-auto inline-flex h-6 items-center justify-center gap-1 rounded border border-blue-500/30 bg-blue-500/10 px-2 text-xs font-normal text-blue-200 transition-colors hover:bg-blue-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                      className={`pointer-events-auto inline-flex h-7 items-center justify-center gap-1 rounded border px-2.5 text-[13px] font-light transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                        visualStatus === 'running'
+                          ? 'border-blue-500/30 bg-blue-500/10 text-blue-200 hover:bg-blue-500/20'
+                          : 'border-slate-700 bg-slate-950/40 text-slate-300 hover:bg-slate-950/60'
+                      }`}
                       onClick={(e) => {
                         e.preventDefault();
                         e.stopPropagation();
@@ -324,15 +341,15 @@ export function TaskDagGraph({
                       title={actions.running.title}
                     >
                       <Cog
-                        className={`h-4 w-4 ${
+                        className={`h-[18px] w-[18px] ${
                           visualStatus === 'running'
                             ? 'animate-spin text-blue-300 drop-shadow-[0_0_6px_rgba(59,130,246,0.55)]'
                             : actions.running.disabled
                               ? 'text-slate-500'
-                              : 'text-blue-300/80'
+                              : 'text-slate-400'
                         }`}
                         style={visualStatus === 'running' ? { animationDuration: '2s' } : undefined}
-                        strokeWidth={1.5}
+                        strokeWidth={1.25}
                         aria-hidden="true"
                       />
                       {actions.running.label}
@@ -341,10 +358,10 @@ export function TaskDagGraph({
                   {actions.done ? (
                     <button
                       type="button"
-                      className={`pointer-events-auto inline-flex h-6 items-center justify-center gap-1 rounded border px-2 text-xs font-normal transition-colors disabled:cursor-not-allowed ${
+                      className={`pointer-events-auto inline-flex h-7 items-center justify-center gap-1 rounded border px-2.5 text-[13px] font-light transition-colors disabled:cursor-not-allowed ${
                         visualStatus === 'completed'
                           ? 'border-green-500/30 bg-green-500/10 text-green-200 hover:bg-green-500/20 disabled:opacity-100'
-                          : 'border-slate-700 bg-slate-950/40 text-slate-300 hover:bg-slate-950/60 disabled:opacity-40'
+                          : 'border-slate-700 bg-slate-950/40 text-slate-400 hover:bg-slate-950/60 disabled:opacity-40'
                       }`}
                       onClick={(e) => {
                         e.preventDefault();
@@ -502,7 +519,6 @@ export function TaskDagGraph({
         </div>
       ) : null}
       <ReactFlow
-        key={statusKey}
         nodes={nodes}
         edges={edges}
         fitView

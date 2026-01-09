@@ -84,6 +84,7 @@ async function apiJson<T>(
   try {
     const res = await fetch(`${BRIDGE_URL}${path}`, {
       ...init,
+      cache: 'no-store',
       headers: {
         'content-type': 'application/json',
         ...(init?.headers ?? {}),
@@ -128,7 +129,7 @@ function pickClaudeAutoTemplate() {
   return {
     title: 'Claude Code · Auto',
     command: 'cmd.exe',
-    args: ['/d', '/s', '/c', 'claude', '--dangerously-skip-permissions'],
+    args: ['/d', '/s', '/c', 'claude', '--permission-mode', 'bypassPermissions'],
   };
 }
 
@@ -743,7 +744,35 @@ export function TerminalPanelInner(
 
     socket.on('state:init', (payload: any) => {
       const remote = Array.isArray(payload?.terminals) ? payload.terminals : [];
-      mergeRemoteTerminals(remote);
+      if (!remote.length) return;
+      // 任务页默认不恢复历史终端：仅同步“本次会话已打开”的终端状态
+      setTabs((prev) => {
+        if (!prev.length) return prev;
+        const knownIds = new Set(prev.map((t) => t.id));
+        const filtered = remote.filter((t: any) => {
+          const id = String(t?.id || '').trim();
+          return Boolean(id) && knownIds.has(id);
+        });
+        if (!filtered.length) return prev;
+
+        const map = new Map(prev.map((t) => [t.id, t]));
+        for (const t of filtered) {
+          const existing = map.get(t.id);
+          map.set(
+            t.id,
+            existing
+              ? {
+                  ...t,
+                  kind: existing.kind,
+                  specName: existing.specName,
+                  taskId: existing.taskId,
+                  runDocPath: existing.runDocPath,
+                }
+              : (t as TerminalTab),
+          );
+        }
+        return Array.from(map.values());
+      });
     });
 
     socket.on('terminal:created', (payload: any) => {

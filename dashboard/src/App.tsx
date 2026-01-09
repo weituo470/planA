@@ -375,6 +375,7 @@ async function apiJson<T>(path: string, init?: RequestInit, timeoutMsOverride?: 
   try {
     res = await fetch(`${BRIDGE_URL}${path}`, {
       ...init,
+      cache: 'no-store',
       headers: {
         'Content-Type': 'application/json',
         ...(init?.headers ?? {}),
@@ -453,6 +454,7 @@ async function apiNdjsonStream<T>(
   try {
     res = await fetch(`${BRIDGE_URL}${path}`, {
       ...init,
+      cache: 'no-store',
       headers: {
         'Content-Type': 'application/json',
         ...(init?.headers ?? {}),
@@ -2105,7 +2107,7 @@ export default function App() {
 
       if (!terminalId) throw new Error('请选择一个已开启的 CLI');
 
-      await panel.sendTerminalInput(terminalId, `${prompt}\n`);
+      await panel.sendTerminalInput(terminalId, `${prompt}\r`);
       panel.focusTerminal(terminalId);
 
       showToast(
@@ -2538,6 +2540,25 @@ export default function App() {
     [tasksAtomicContent],
   );
   const terminalPanelRef = useRef<TerminalPanelHandle | null>(null);
+  const tasksToolsDetailsRef = useRef<HTMLDetailsElement | null>(null);
+  const [tasksToolsOpen, setTasksToolsOpen] = useState(false);
+
+  useEffect(() => {
+    if (activeArtifact === 'tasks') setTasksToolsOpen(false);
+  }, [activeArtifact]);
+  const runPromptInClaudeAutoTerminal = useCallback(async (prompt: string) => {
+    setTasksToolsOpen(true);
+    window.requestAnimationFrame(() => {
+      tasksToolsDetailsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+
+    const panel = terminalPanelRef.current;
+    if (!panel) throw new Error('终端面板未就绪');
+    const created = await panel.createClaudeAutoTerminal();
+    await panel.sendTerminalInput(created.terminalId, `${prompt}\r`);
+    panel.focusTerminal(created.terminalId);
+    return created;
+  }, []);
 
   const outputScrollRef = useRef<OutputScrollEl | null>(null);
   const outputLastScrollTopRef = useRef(0);
@@ -2924,7 +2945,7 @@ export default function App() {
                 <li>切到“需求”，完成“提问确认”，点“生成 requirements.md（并生成设计）”。</li>
                 <li>切到“设计”，完成“技术栈确认”，点“确认技术栈并生成任务”。</li>
                 <li>
-                  切到“任务”，维护 tasks.md 的 TASKS_JSON（模块级任务 + dependencies），并按任务列表逐条执行（支持生成提示词一键复制）。
+                  切到“任务”，维护 tasks.md 的 TASKS_JSON（模块级任务 + dependencies），并按任务列表逐条执行（支持生成提示词并复制到剪贴板）。
                 </li>
                 <li>
                   需要交付给 AI IDE 时，点“一键下载（ZIP）”，按 tasks.md 的任务逐条开发，并在 tasks.md 回写关键变更与验证结果。
@@ -3560,12 +3581,20 @@ export default function App() {
             )}
 
             {activeArtifact === 'tasks' && selectedSpecName && (
-              <div className="mb-3 rounded-md border border-slate-800 bg-slate-950/40 p-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <div className="text-sm font-semibold text-slate-200">流程报告</div>
-                  <div className="text-xs text-slate-400">
-                    {reports.length ? `共 ${reports.length} 份` : '暂无'}
+              <details className="mb-3 rounded-md border border-slate-800 bg-slate-950/40 p-3">
+                <summary className="cursor-pointer select-none">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="text-sm font-semibold text-slate-200">流程报告</div>
+                    <div className="text-xs font-normal text-slate-400">
+                      {reports.length ? `共 ${reports.length} 份` : '暂无'}
+                    </div>
+                    <div className="ml-auto text-xs font-normal text-slate-500">
+                      {activeReportRunId ? `当前 runId：${activeReportRunId}` : '未选择 runId'}
+                    </div>
                   </div>
+                </summary>
+
+                <div className="mt-2 flex flex-wrap items-center gap-2">
                   <div className="ml-auto flex flex-wrap items-center gap-2">
                     <Button
                       variant="outline"
@@ -4038,11 +4067,16 @@ export default function App() {
                     </div>
                   </div>
                 </details>
-              </div>
+              </details>
             )}
 
             {activeArtifact === 'tasks' ? (
-              <details className="mb-2 rounded-md border border-slate-800 bg-slate-950/20 p-2">
+              <details
+                ref={tasksToolsDetailsRef}
+                open={tasksToolsOpen}
+                onToggle={(e) => setTasksToolsOpen(e.currentTarget.open)}
+                className="mb-2 rounded-md border border-slate-800 bg-slate-950/20 p-2"
+              >
                 <summary className="cursor-pointer select-none text-xs font-semibold text-slate-200">
                   其它功能（终端 / 编辑）
                 </summary>
@@ -4254,6 +4288,7 @@ export default function App() {
                               await saveArtifact('tasks', next);
                             }}
                             onToast={(message, tone = 'error') => showToast(message, tone)}
+                            onRunPromptInClaudeAutoTerminal={runPromptInClaudeAutoTerminal}
                           />
                         ) : (
                           <textarea
