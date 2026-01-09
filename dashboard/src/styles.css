@@ -18,3 +18,12 @@ body {
   background: #2b3242;
   border-radius: 999px;
 }
+
+@keyframes dag-edge-flow {
+  from {
+    stroke-dashoffset: 0;
+  }
+  to {
+    stroke-dashoffset: -48;
+  }
+}

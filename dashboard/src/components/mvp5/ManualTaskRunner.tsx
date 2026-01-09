@@ -379,6 +379,7 @@ export function ManualTaskRunner({
   } | null>(null);
   const [promptLoadingTaskId, setPromptLoadingTaskId] = useState<string | null>(null);
   const [dagExpanded, setDagExpanded] = useState(true);
+  const [dagResetKey, setDagResetKey] = useState(0);
   const [autoContinueEnabled, setAutoContinueEnabled] = useState<boolean>(() => {
     try {
       return localStorage.getItem('mvp5AutoContinueEnabled') === '1';
@@ -400,6 +401,12 @@ export function ManualTaskRunner({
   const [taskDocById, setTaskDocById] = useState<
     Record<string, { loading: boolean; error: string | null; runDocPathAbs?: string; content?: string }>
   >({});
+
+  const handleResetTaskListView = useCallback(() => {
+    setPromptForTask(null);
+    setTaskDetailsOpenById({});
+    setTaskDocById({});
+  }, []);
 
   const autoContinueInitializedRef = useRef(false);
   const prevCompletedRef = useRef<Set<string>>(new Set());
@@ -860,6 +867,11 @@ export function ManualTaskRunner({
             'CLI 根目录：未加载'
           )}
         </div>
+        <div className="ml-auto flex items-center gap-2">
+          <Button size="sm" variant="ghost" onClick={handleResetTaskListView}>
+            回到初始
+          </Button>
+        </div>
       </div>
 
       <div className="mb-3 rounded-md border border-slate-800 bg-slate-950/40 px-2 py-2">
@@ -877,6 +889,16 @@ export function ManualTaskRunner({
             </label>
             <button
               type="button"
+              onClick={() => {
+                setDagExpanded(true);
+                setDagResetKey((prev) => prev + 1);
+              }}
+              className="text-xs text-slate-400 transition-colors hover:text-slate-200"
+            >
+              回到初始
+            </button>
+            <button
+              type="button"
               onClick={() => setDagExpanded((prev) => !prev)}
               className="text-xs text-slate-400 transition-colors hover:text-slate-200"
             >
@@ -890,6 +912,7 @@ export function ManualTaskRunner({
               graph={taskGraph}
               taskStatusById={taskStatusByIdForDag}
               taskActionsById={taskActionsByIdForDag}
+              resetKey={dagResetKey}
               height={420}
             />
           </div>
@@ -1071,12 +1094,6 @@ export function ManualTaskRunner({
                       </div>
                     </div>
 
-                    {docState?.runDocPathAbs ? (
-                      <div className="mb-2 text-xs text-slate-500 break-all">
-                        路径：<span className="font-mono">{docState.runDocPathAbs}</span>
-                      </div>
-                    ) : null}
-
                     {docState?.error ? (
                       <div className="mb-2 rounded border border-red-900/40 bg-red-950/20 px-2 py-1 text-xs text-red-200">
                         读取失败：{docState.error}
@@ -1104,11 +1121,6 @@ export function ManualTaskRunner({
                           </Button>
                         </div>
                       </div>
-                      {promptForTask.runDocPathAbs ? (
-                        <div className="mb-2 text-xs text-slate-500 break-all">
-                          任务文档：<span className="font-mono">{promptForTask.runDocPathAbs}</span>
-                        </div>
-                      ) : null}
                       <pre className="whitespace-pre-wrap break-words rounded border border-slate-800 bg-slate-950 px-2 py-2 text-xs text-slate-100">
                         {promptForTask.prompt}
                       </pre>

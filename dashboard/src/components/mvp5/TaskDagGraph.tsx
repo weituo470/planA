@@ -169,12 +169,14 @@ export function TaskDagGraph({
   graph,
   taskStatusById,
   taskActionsById,
+  resetKey,
   className = '',
   height = 460,
 }: {
   graph: TaskGraph;
   taskStatusById?: Record<string, TaskStatus | undefined>;
   taskActionsById?: TaskActionsById;
+  resetKey?: number;
   className?: string;
   height?: number;
 }) {
@@ -254,6 +256,12 @@ export function TaskDagGraph({
       console.error('[TaskDagGraph] recover failed', { reason, error: e });
     }
   }, []);
+
+  useEffect(() => {
+    if (resetKey == null) return;
+    setRenderIssue(null);
+    recoverView('reset');
+  }, [recoverView, resetKey]);
 
   const { nodes, edges, bounds } = useMemo(() => {
     const actionsEnabled = Boolean(taskActionsById);
@@ -412,22 +420,38 @@ export function TaskDagGraph({
         const isConflict = e.type === 'conflict';
         const sourceStatus = taskStatusById?.[from] ?? 'pending';
         const targetStatus = taskStatusById?.[to] ?? 'pending';
+        const targetVisualStatus = deriveTaskVisualStatus(to, targetStatus, graph, taskStatusById);
         const isBlocking = !isConflict && targetStatus === 'pending' && sourceStatus !== 'completed';
         const isSatisfied = !isConflict && sourceStatus === 'completed';
+        const isFlowing =
+          !isConflict &&
+          sourceStatus === 'completed' &&
+          (targetVisualStatus === 'ready' || targetVisualStatus === 'running');
 
         const stroke = isConflict ? '#f59e0b' : isBlocking ? '#fbbf24' : '#ffffff';
-        const opacity = isConflict ? 0.95 : isBlocking ? 0.95 : isSatisfied ? 0.35 : 0.6;
-        const strokeWidth = isBlocking ? 2.5 : 2;
+        const opacity = isConflict ? 0.95 : isBlocking ? 0.95 : isSatisfied ? 0.55 : 0.72;
+        const strokeWidth = isBlocking ? 2.5 : isFlowing ? 2.75 : 2;
         return {
           id: `${from}->${to}:${idx}`,
           source: from,
           target: to,
           type: 'smoothstep',
           animated: false,
-          markerEnd: { type: MarkerType.ArrowClosed, color: stroke, width: 18, height: 18 },
+          markerEnd: { type: MarkerType.ArrowClosed, color: isFlowing ? '#ffffff' : stroke, width: 18, height: 18 },
           style: isConflict
             ? { stroke, strokeDasharray: '6 4', strokeWidth, opacity }
-            : { stroke, strokeWidth, opacity },
+            : isFlowing
+              ? {
+                  stroke: '#ffffff',
+                  strokeWidth,
+                  opacity: 0.95,
+                  strokeDasharray: '10 14',
+                  strokeDashoffset: 0,
+                  strokeLinecap: 'round',
+                  animation: 'dag-edge-flow 1.6s linear infinite',
+                  filter: 'drop-shadow(0 0 6px rgba(255,255,255,0.55))',
+                }
+              : { stroke, strokeWidth, opacity },
         };
       })
       .filter(Boolean) as Edge[];

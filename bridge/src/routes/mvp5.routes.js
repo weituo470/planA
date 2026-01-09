@@ -389,6 +389,11 @@ function registerMvp5Routes(app, ctx) {
           return res.status(400).json({ error: 'tasksContent is required' });
         }
     
+        const includeDoc =
+          String(req.query?.includeDoc || '').trim() === '1' ||
+          String(req.query?.includeDoc || '').trim().toLowerCase() === 'true' ||
+          req.body?.includeDoc === true;
+    
         const dagTasks = parseDagTasksFromTasksContent(tasksContent);
         if (!dagTasks || dagTasks.length === 0) {
           return res.status(400).json({
@@ -418,6 +423,22 @@ function registerMvp5Routes(app, ctx) {
         });
         const runDocPathAbs = normalizePathForPrompt(doc.runDocPath);
         const projectDirForPrompt = normalizePathForPrompt(projectDir);
+    
+        let runDocContent = '';
+        if (includeDoc) {
+          try {
+            if (doc?.runDocPath && fs.existsSync(doc.runDocPath)) {
+              runDocContent = fs.readFileSync(doc.runDocPath, 'utf8');
+            }
+          } catch {
+            runDocContent = '';
+          }
+          try {
+            runDocContent = runDocContent ? truncateText(runDocContent, 18000).trimEnd() : '';
+          } catch {
+            runDocContent = runDocContent ? String(runDocContent).slice(0, 18000).trimEnd() : '';
+          }
+        }
         const prompt = [
           `请按任务文档（绝对路径）${runDocPathAbs} 实现该任务，完成后自检并用简短要点总结变更与验证结果。`,
           projectDirForPrompt ? `建议工作目录：${projectDirForPrompt}` : null,
@@ -431,6 +452,7 @@ function registerMvp5Routes(app, ctx) {
           prompt,
           runDocPathAbs,
           runDocPath: doc.runDocPathRel,
+          runDocContent,
           projectDir: projectDirForPrompt,
           task: {
             id: task.id,
