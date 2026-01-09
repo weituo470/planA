@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { Button } from '../ui/button';
 import { TaskDagGraph } from './TaskDagGraph';
@@ -30,6 +30,7 @@ type PromptResponse = {
   ok?: boolean;
   prompt?: string;
   runDocPathAbs?: string;
+  runDocContent?: string;
   runDocPath?: string;
   projectDir?: string;
   error?: string;
@@ -378,6 +379,32 @@ export function ManualTaskRunner({
   } | null>(null);
   const [promptLoadingTaskId, setPromptLoadingTaskId] = useState<string | null>(null);
   const [dagExpanded, setDagExpanded] = useState(true);
+  const [autoContinueEnabled, setAutoContinueEnabled] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('mvp5AutoContinueEnabled') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const autoContinueEnabledRef = useRef(autoContinueEnabled);
+  useEffect(() => {
+    autoContinueEnabledRef.current = autoContinueEnabled;
+    try {
+      localStorage.setItem('mvp5AutoContinueEnabled', autoContinueEnabled ? '1' : '0');
+    } catch {
+      // ignore
+    }
+  }, [autoContinueEnabled]);
+
+  const [taskDetailsOpenById, setTaskDetailsOpenById] = useState<Record<string, boolean>>({});
+  const [taskDocById, setTaskDocById] = useState<
+    Record<string, { loading: boolean; error: string | null; runDocPathAbs?: string; content?: string }>
+  >({});
+
+  const autoContinueInitializedRef = useRef(false);
+  const prevCompletedRef = useRef<Set<string>>(new Set());
+  const autoContinueInFlightRef = useRef(false);
+  const autoContinueQueuedRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -455,6 +482,139 @@ export function ManualTaskRunner({
     [doneById, specId, tasksContent, workspace?.effectiveCwd],
   );
 
+  const fetchRunDocForTask = useCallback(
+    async (task: DagTask) => {
+      const body = {
+        specId,
+        taskId: task.id,
+        tasksContent,
+        projectDir: workspace?.effectiveCwd ?? undefined,
+        includeDoc: true,
+      };
+      const res = await fetch(`${BRIDGE_URL}/api/mvp5/task-prompt?includeDoc=1`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = (await res.json()) as PromptResponse;
+      if (!res.ok) throw new Error(data?.error || '读取任务文档失败');
+      return {
+        runDocPathAbs: typeof data?.runDocPathAbs === 'string' ? data.runDocPathAbs : undefined,
+        runDocContent: typeof data?.runDocContent === 'string' ? data.runDocContent : '',
+      };
+    },
+    [specId, tasksContent, workspace?.effectiveCwd],
+  );
+
+  const buildClaudePromptWithMarkers = useCallback((prompt: string, taskId: string) => {
+    const doneMarker = `[[TASK_DONE ${taskId}]]`;
+    const failedMarker = `[[TASK_FAILED ${taskId}]]`;
+    const promptWithMarkers = [
+      prompt,
+      '',
+      `TASK_ID=${taskId}`,
+      '当你确认任务完成后，请在回复最后单独输出一行：[[TASK_DONE <TASK_ID>]]（将 <TASK_ID> 替换为上面的 TASK_ID 值，不要输出尖括号）',
+      '如果无法完成，请在回复最后单独输出一行：[[TASK_FAILED <TASK_ID>]]（将 <TASK_ID> 替换为上面的 TASK_ID 值，不要输出尖括号）',
+    ].join('\n');
+    return { promptWithMarkers, doneMarker, failedMarker };
+  }, []);
+
+  const startTaskInClaudeAuto = useCallback(
+    async (task: DagTask, reason: string) => {
+      if (!onRunPromptInClaudeAutoTerminal) throw new Error('终端面板未就绪');
+      const { prompt } = await fetchPromptForTask(task);
+      const { promptWithMarkers, doneMarker, failedMarker } = buildClaudePromptWithMarkers(
+        prompt,
+        task.id,
+      );
+      const created = await onRunPromptInClaudeAutoTerminal(promptWithMarkers, {
+        specId,
+        taskId: task.id,
+        doneMarker,
+        failedMarker,
+      });
+      onToast(`已启动：${task.id} · ${created.title || 'Claude Code'} · ${reason}`, 'info');
+      return created;
+    },
+    [buildClaudePromptWithMarkers, fetchPromptForTask, onRunPromptInClaudeAutoTerminal, onToast, specId],
+  );
+
+  const autoStartAllReadyTasks = useCallback(
+    async (reason: string) => {
+      if (!autoContinueEnabledRef.current) return;
+      if (!onRunPromptInClaudeAutoTerminal) return;
+      if (disabled) return;
+
+      if (autoContinueInFlightRef.current) {
+        autoContinueQueuedRef.current = true;
+        return;
+      }
+      autoContinueInFlightRef.current = true;
+      autoContinueQueuedRef.current = false;
+
+      try {
+        const readyTasks = tasks.filter((task) => {
+          const done = doneById.get(task.id) === true;
+          if (done) return false;
+          const status = statusById.get(task.id) ?? 'pending';
+          if (status !== 'pending') return false;
+          const missingDeps = (task.dependencies || []).filter((depId) => !doneById.get(depId));
+          return missingDeps.length === 0;
+        });
+        if (!readyTasks.length) return;
+
+        onToast(`自动继续：启动 ${readyTasks.map((t) => t.id).join(', ')}`, 'info');
+        for (const task of readyTasks) {
+          try {
+            await startTaskInClaudeAuto(task, `自动继续(${reason})`);
+          } catch (e: any) {
+            onToast(
+              `自动继续启动失败：${task.id} · ${String(e?.message || e || '未知错误')}`,
+              'error',
+            );
+          }
+        }
+      } finally {
+        autoContinueInFlightRef.current = false;
+        if (autoContinueQueuedRef.current) {
+          autoContinueQueuedRef.current = false;
+          window.setTimeout(() => {
+            void autoStartAllReadyTasks('queued');
+          }, 50);
+        }
+      }
+    },
+    [
+      disabled,
+      doneById,
+      onRunPromptInClaudeAutoTerminal,
+      onToast,
+      startTaskInClaudeAuto,
+      statusById,
+      tasks,
+    ],
+  );
+
+  useEffect(() => {
+    const completed = new Set<string>();
+    for (const task of tasks) {
+      if (doneById.get(task.id) === true) completed.add(task.id);
+    }
+
+    if (!autoContinueInitializedRef.current) {
+      autoContinueInitializedRef.current = true;
+      prevCompletedRef.current = completed;
+      return;
+    }
+
+    const prev = prevCompletedRef.current;
+    const newlyCompleted = Array.from(completed).filter((id) => !prev.has(id));
+    prevCompletedRef.current = completed;
+    if (!newlyCompleted.length) return;
+    if (!autoContinueEnabledRef.current) return;
+    void autoStartAllReadyTasks(`completed:${newlyCompleted.join(',')}`);
+  }, [autoStartAllReadyTasks, doneById, tasks]);
+
   const handleGeneratePrompt = useCallback(
     async (
       task: DagTask,
@@ -491,42 +651,67 @@ export function ManualTaskRunner({
     [fetchPromptForTask, onToast],
   );
 
+  const loadTaskDoc = useCallback(
+    async (task: DagTask, options?: { force?: boolean }) => {
+      const taskId = String(task?.id || '').trim();
+      if (!taskId) return;
+
+      const existing = taskDocById[taskId];
+      const hasContent = Boolean(existing?.content && !existing?.error);
+      if (!options?.force && (existing?.loading || hasContent)) return;
+
+      setTaskDocById((prev) => ({
+        ...prev,
+        [taskId]: { loading: true, error: null, runDocPathAbs: existing?.runDocPathAbs, content: existing?.content },
+      }));
+
+      try {
+        const { runDocPathAbs, runDocContent } = await fetchRunDocForTask(task);
+        setTaskDocById((prev) => ({
+          ...prev,
+          [taskId]: { loading: false, error: null, runDocPathAbs, content: runDocContent },
+        }));
+      } catch (e: any) {
+        const message = String(e?.message || e || '读取任务文档失败');
+        setTaskDocById((prev) => ({
+          ...prev,
+          [taskId]: {
+            loading: false,
+            error: message,
+            runDocPathAbs: existing?.runDocPathAbs,
+            content: existing?.content,
+          },
+        }));
+      }
+    },
+    [fetchRunDocForTask, taskDocById],
+  );
+
+  const handleToggleTaskDetails = useCallback(
+    (task: DagTask) => {
+      const taskId = String(task?.id || '').trim();
+      if (!taskId) return;
+      const nextOpen = !(taskDetailsOpenById[taskId] === true);
+      setTaskDetailsOpenById((prev) => ({ ...prev, [taskId]: nextOpen }));
+      if (nextOpen) {
+        void loadTaskDoc(task);
+      }
+    },
+    [loadTaskDoc, taskDetailsOpenById],
+  );
+
   const handleStartClaudeAuto = useCallback(
     async (task: DagTask) => {
-      if (!onRunPromptInClaudeAutoTerminal) {
-        onToast('终端面板未就绪', 'error');
-        return;
-      }
-
       setPromptLoadingTaskId(task.id);
       try {
-        const { prompt } = await fetchPromptForTask(task);
-        const doneMarker = `[[TASK_DONE ${task.id}]]`;
-        const failedMarker = `[[TASK_FAILED ${task.id}]]`;
-        const promptWithMarkers = [
-          prompt,
-          '',
-          `TASK_ID=${task.id}`,
-          '当你确认任务完成后，请在回复最后单独输出一行：[[TASK_DONE <TASK_ID>]]（将 <TASK_ID> 替换为上面的 TASK_ID 值，不要输出尖括号）',
-          '如果无法完成，请在回复最后单独输出一行：[[TASK_FAILED <TASK_ID>]]（将 <TASK_ID> 替换为上面的 TASK_ID 值，不要输出尖括号）',
-        ].join('\n');
-        const created = await onRunPromptInClaudeAutoTerminal(promptWithMarkers, {
-          specId,
-          taskId: task.id,
-          doneMarker,
-          failedMarker,
-        });
-        onToast(
-          `已启动：${created.title || 'Claude Code'} · ${created.terminalId}`,
-          'info',
-        );
+        await startTaskInClaudeAuto(task, '手动开始');
       } catch (e: any) {
         onToast(String(e?.message || e || '启动失败'), 'error');
       } finally {
         setPromptLoadingTaskId(null);
       }
     },
-    [fetchPromptForTask, onRunPromptInClaudeAutoTerminal, onToast, specId],
+    [onToast, startTaskInClaudeAuto],
   );
 
   const handleMarkDone = useCallback(
@@ -680,13 +865,24 @@ export function ManualTaskRunner({
       <div className="mb-3 rounded-md border border-slate-800 bg-slate-950/40 px-2 py-2">
         <div className="flex items-center justify-between gap-2 px-1">
           <div className="text-xs font-semibold text-slate-200">DAG 图（依赖关系）</div>
-          <button
-            type="button"
-            onClick={() => setDagExpanded((prev) => !prev)}
-            className="text-xs text-slate-400 transition-colors hover:text-slate-200"
-          >
-            {dagExpanded ? '收起' : '展开'}
-          </button>
+          <div className="flex items-center gap-3">
+            <label className="flex items-center gap-2 text-xs text-slate-400">
+              <input
+                type="checkbox"
+                checked={autoContinueEnabled}
+                onChange={(e) => setAutoContinueEnabled(e.target.checked)}
+                className="h-3.5 w-3.5 accent-purple-500"
+              />
+              <span className="select-none">自动继续</span>
+            </label>
+            <button
+              type="button"
+              onClick={() => setDagExpanded((prev) => !prev)}
+              className="text-xs text-slate-400 transition-colors hover:text-slate-200"
+            >
+              {dagExpanded ? '收起' : '展开'}
+            </button>
+          </div>
         </div>
         {dagExpanded ? (
           <div className="mt-2">
@@ -726,16 +922,18 @@ export function ManualTaskRunner({
         {tasks.map((task) => {
           const done = doneById.get(task.id) === true;
           const status = statusById.get(task.id) ?? (done ? 'completed' : 'pending');
-          const missingDeps = (task.dependencies || []).filter((depId) => !doneById.get(depId));
-          const blocked = missingDeps.length > 0;
-          const ready = !blocked && status === 'pending';
-          const showPrompt = promptForTask?.taskId === task.id;
+           const missingDeps = (task.dependencies || []).filter((depId) => !doneById.get(depId));
+           const blocked = missingDeps.length > 0;
+           const ready = !blocked && status === 'pending';
+           const showPrompt = promptForTask?.taskId === task.id;
+           const detailsOpen = taskDetailsOpenById[task.id] === true;
+           const docState = taskDocById[task.id];
 
-          return (
-            <div
-              key={task.id}
-              className="rounded-md border border-slate-800 bg-slate-950/40 p-3"
-            >
+           return (
+             <div
+               key={task.id}
+               className="rounded-md border border-slate-800 bg-slate-950/40 p-3"
+             >
               <div className="flex flex-wrap items-start gap-2">
                 <div className="text-xs font-semibold text-slate-100">{task.id}</div>
                 <div className="text-xs text-slate-300">{task.title || ''}</div>
@@ -779,6 +977,9 @@ export function ManualTaskRunner({
                   </span>
                 </div>
                 <div className="ml-auto flex flex-wrap items-center gap-2">
+                  <Button size="sm" variant="ghost" onClick={() => handleToggleTaskDetails(task)}>
+                    {detailsOpen ? '收起详情' : '查看详情'}
+                  </Button>
                   <Button
                     size="sm"
                     onClick={() =>
@@ -833,45 +1034,87 @@ export function ManualTaskRunner({
                 </div>
               </div>
 
-              {blocked ? (
-                <div className="mt-2 rounded border border-amber-900/40 bg-amber-950/20 px-2 py-1 text-xs text-amber-300">
-                  前置任务未完成：{missingDeps.join(', ')}
-                </div>
-              ) : null}
-
-              <div className="mt-2 whitespace-pre-wrap text-xs text-slate-300">
-                {task.description || '（无描述）'}
-              </div>
-
-              {task.dependencies?.length ? (
-                <div className="mt-2 text-xs text-slate-400">
-                  前置：{task.dependencies.join(', ')}
-                </div>
-              ) : null}
-
-              {task.scope?.length ? (
-                <div className="mt-1 text-xs text-slate-500">scope：{task.scope.join(', ')}</div>
-              ) : null}
-
-              {showPrompt ? (
-                <div className="mt-3 rounded border border-slate-800 bg-slate-950 p-2">
-                  <div className="mb-2 flex items-center justify-between gap-2">
-                    <div className="text-xs font-semibold text-slate-200">任务提示词</div>
-                    <div className="flex items-center gap-2">
-                      <Button size="sm" variant="ghost" onClick={() => setPromptForTask(null)}>
-                        收起
-                      </Button>
-                    </div>
-                  </div>
-                  {promptForTask.runDocPathAbs ? (
-                    <div className="mb-2 text-xs text-slate-500 break-all">
-                      任务文档：<span className="font-mono">{promptForTask.runDocPathAbs}</span>
+              {detailsOpen ? (
+                <>
+                  {blocked ? (
+                    <div className="mt-2 rounded border border-amber-900/40 bg-amber-950/20 px-2 py-1 text-xs text-amber-300">
+                      前置任务未完成：{missingDeps.join(', ')}
                     </div>
                   ) : null}
-                  <pre className="whitespace-pre-wrap break-words rounded border border-slate-800 bg-slate-950 px-2 py-2 text-xs text-slate-100">
-                    {promptForTask.prompt}
-                  </pre>
-                </div>
+
+                  <div className="mt-2 whitespace-pre-wrap text-xs text-slate-300">
+                    {task.description || '（无描述）'}
+                  </div>
+
+                  {task.dependencies?.length ? (
+                    <div className="mt-2 text-xs text-slate-400">
+                      前置：{task.dependencies.join(', ')}
+                    </div>
+                  ) : null}
+
+                  {task.scope?.length ? (
+                    <div className="mt-1 text-xs text-slate-500">scope：{task.scope.join(', ')}</div>
+                  ) : null}
+
+                  <div className="mt-3 rounded border border-slate-800 bg-slate-950 p-2">
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <div className="text-xs font-semibold text-slate-200">任务文档</div>
+                      <div className="flex items-center gap-2">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => void loadTaskDoc(task, { force: true })}
+                          disabled={docState?.loading === true}
+                        >
+                          {docState?.loading ? '加载中…' : '刷新'}
+                        </Button>
+                      </div>
+                    </div>
+
+                    {docState?.runDocPathAbs ? (
+                      <div className="mb-2 text-xs text-slate-500 break-all">
+                        路径：<span className="font-mono">{docState.runDocPathAbs}</span>
+                      </div>
+                    ) : null}
+
+                    {docState?.error ? (
+                      <div className="mb-2 rounded border border-red-900/40 bg-red-950/20 px-2 py-1 text-xs text-red-200">
+                        读取失败：{docState.error}
+                      </div>
+                    ) : null}
+
+                    {docState?.loading ? (
+                      <div className="text-xs text-slate-500">加载中…</div>
+                    ) : docState?.content ? (
+                      <pre className="max-h-[320px] overflow-auto whitespace-pre-wrap break-words rounded border border-slate-800 bg-slate-950 px-2 py-2 text-xs text-slate-100">
+                        {docState.content}
+                      </pre>
+                    ) : (
+                      <div className="text-xs text-slate-500">暂无文档内容</div>
+                    )}
+                  </div>
+
+                  {showPrompt ? (
+                    <div className="mt-3 rounded border border-slate-800 bg-slate-950 p-2">
+                      <div className="mb-2 flex items-center justify-between gap-2">
+                        <div className="text-xs font-semibold text-slate-200">任务提示词</div>
+                        <div className="flex items-center gap-2">
+                          <Button size="sm" variant="ghost" onClick={() => setPromptForTask(null)}>
+                            收起
+                          </Button>
+                        </div>
+                      </div>
+                      {promptForTask.runDocPathAbs ? (
+                        <div className="mb-2 text-xs text-slate-500 break-all">
+                          任务文档：<span className="font-mono">{promptForTask.runDocPathAbs}</span>
+                        </div>
+                      ) : null}
+                      <pre className="whitespace-pre-wrap break-words rounded border border-slate-800 bg-slate-950 px-2 py-2 text-xs text-slate-100">
+                        {promptForTask.prompt}
+                      </pre>
+                    </div>
+                  ) : null}
+                </>
               ) : null}
             </div>
           );

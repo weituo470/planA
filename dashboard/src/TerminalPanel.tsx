@@ -607,12 +607,20 @@ export function TerminalPanelInner(
         const initialPrompt = String(prompt || '').trim();
         if (!initialPrompt) throw new Error('Prompt 不能为空');
         const base = pickClaudeAutoTemplate();
-        const template = { ...base, args: [...base.args, initialPrompt] };
+        const taskPrefix = meta?.taskId ? `${String(meta.taskId).trim()} · ` : '';
+        const template = { ...base, title: `${taskPrefix}${base.title}`, args: [...base.args, initialPrompt] };
         const terminalId = await createTerminal(template, {
           kind: 'claude',
           ...(meta?.specName ? { specName: meta.specName } : {}),
           ...(meta?.taskId ? { taskId: meta.taskId } : {}),
         });
+        // Claude Code 在 Windows 下会把 argv prompt 预填到输入框，但不会自动提交；补一个回车触发执行。
+        try {
+          await new Promise((resolve) => window.setTimeout(resolve, 150));
+          await sendTerminalInput(terminalId, '\r');
+        } catch {
+          // ignore
+        }
         return { terminalId, title: template.title };
       },
     }),
