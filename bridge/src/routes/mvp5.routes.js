@@ -1,0 +1,1074 @@
+const fs = require('fs');
+const path = require('path');
+const { normalizeCodexSandbox, normalizeCodexModel } = require('../lib/codex-options');
+
+function registerMvp5Routes(app, ctx) {
+  // NOTE: 临时用 with(ctx) 保持等价重构，后续可逐步迁移到 controllers/services。
+  with (ctx) {
+    // ========== MVP5: 智能任务编排 API ==========
+    
+    function normalizeCliAvailabilityForMvp5(value) {
+      const obj = value && typeof value === 'object' ? value : {};
+      return {
+        codex: obj.codex !== false,
+        claude: obj.claude !== false,
+      };
+    }
+    
+    function normalizeCliChoice(value) {
+      return value === 'codex' || value === 'claude' ? value : null;
+    }
+    
+    function normalizeMvp5PlanPayload(payload, taskIds, maxCliConcurrencyLimit) {
+      const obj = payload && typeof payload === 'object' ? payload : null;
+      if (!obj) return null;
+    
+      const rawMax =
+        obj.maxCliConcurrency ?? obj.maxConcurrency ?? obj.concurrency ?? obj.max_concurrency ?? obj.max_cli_concurrency;
+      const parsed = Number(rawMax);
+      const maxCliConcurrency = Number.isFinite(parsed)
+        ? Math.min(maxCliConcurrencyLimit, Math.max(1, Math.floor(parsed)))
+        : maxCliConcurrencyLimit;
+    
+      const defaultCli = normalizeCliChoice(obj.defaultCli ?? obj.default_cli) || null;
+    
+      const overridesRaw = obj.cliOverrides ?? obj.cli_overrides ?? obj.cliAllocation ?? obj.cli_allocation ?? null;
+      const overrides = overridesRaw && typeof overridesRaw === 'object' ? overridesRaw : {};
+    
+      const cliAllocation = {};
+      for (const taskId of taskIds) {
+        const overrideCli = normalizeCliChoice(overrides?.[taskId]);
+        const chosen = overrideCli || defaultCli;
+        if (chosen) cliAllocation[taskId] = chosen;
+      }
+    
+      const rationaleRaw = obj.rationale ?? obj.reason ?? '';
+      const rationale = typeof rationaleRaw === 'string' ? rationaleRaw.trim().slice(0, 800) : '';
+    
+      if (Object.keys(cliAllocation).length === 0) return null;
+    
+      return { maxCliConcurrency, cliAllocation, rationale };
+    }
+    
+    function formatMvp5CliAvailability(value) {
+      const availability = normalizeCliAvailabilityForMvp5(value);
+      return `codex:${availability.codex ? 'on' : 'off'}, claude:${availability.claude ? 'on' : 'off'}`;
+    }
+    
+    function formatMvp5TasksForPrompt(tasks) {
+      const list = Array.isArray(tasks) ? tasks : [];
+      return list
+        .map((t) => {
+          const id = String(t?.id || '').trim();
+          if (!id) return null;
+          const title = String(t?.title || '').trim().replace(/\s+/g, ' ').slice(0, 120);
+          const risk = String(t?.riskLevel || '').trim() || '-';
+          const interaction = t?.requiresInteraction ? 'yes' : 'no';
+          return `- ${id}｜${title || '（无标题）'}｜${risk}｜${interaction}`;
+        })
+        .filter(Boolean)
+        .join('\n');
+    }
+    
+    function formatMvp5DependenciesForPrompt(dag, limit = 240) {
+      const edges = Array.isArray(dag?.edges) ? dag.edges : [];
+      const lines = [];
+      for (const edge of edges) {
+        if (lines.length >= limit) break;
+        const from = String(edge?.from || '').trim();
+        const to = String(edge?.to || '').trim();
+        if (!from || !to) continue;
+        const type = String(edge?.type || '').trim() || '-';
+        const strength = String(edge?.strength || '').trim() || '-';
+        lines.push(`- ${from} -> ${to}｜${type}｜${strength}`);
+      }
+      if (edges.length > lines.length) {
+        lines.push(`- ...(共 ${edges.length} 条依赖，已截断显示前 ${lines.length} 条)`);
+      }
+      return lines.join('\n');
+    }
+    
+    async function generateMvp5PlanWithModel({
+      specId,
+      tasks,
+      dag,
+      maxCliConcurrencyLimit,
+      cliAvailability,
+      preferredModelId,
+    }) {
+      const normalizedModel = LLM_MODEL_ALIASES[preferredModelId] || preferredModelId;
+      const cfg = getLlmConfigForModel(normalizedModel);
+      if (!cfg?.baseUrl || !cfg?.apiKey || !cfg?.model) {
+        return { ok: false, skipped: true, error: { message: 'LLM config unavailable', context: describeLlmConfig(cfg) } };
+      }
+    
+      const promptConfig = loadPromptConfig();
+      const stage = promptConfig?.stages?.mvp5Plan;
+      if (!stage) {
+        return { ok: false, skipped: true, error: { message: 'Prompt stage mvp5Plan missing', context: null } };
+      }
+    
+      const variables = {
+        specId: String(specId || '').trim(),
+        maxCliConcurrency: String(maxCliConcurrencyLimit),
+        cliAvailability: formatMvp5CliAvailability(cliAvailability),
+        tasks: formatMvp5TasksForPrompt(tasks),
+        dependencies: formatMvp5DependenciesForPrompt(dag),
+        summary: `tasks=${Array.isArray(dag?.tasks) ? dag.tasks.length : 0}, edges=${Array.isArray(dag?.edges) ? dag.edges.length : 0}`,
+      };
+    
+      const promptRendered = {
+        system: applyPromptTemplate(stage.system, variables),
+        user: applyPromptTemplate(stage.user, variables),
+      };
+    
+      const messages = [
+        { role: 'system', content: promptRendered.system },
+        { role: 'user', content: promptRendered.user },
+      ];
+    
+      const timeoutMs = Math.min(
+        Math.max(8000, Number(process.env.LLM_MVP5_PLAN_TIMEOUT_MS || 60000)),
+        120000,
+      );
+    
+      const content = await callLlm(messages, { ...cfg, timeoutMs }, {});
+      const payload = tryParseJson(content);
+      const taskIds = Array.isArray(dag?.tasks) ? dag.tasks.map((t) => t.id) : [];
+      const normalized = normalizeMvp5PlanPayload(payload, taskIds, maxCliConcurrencyLimit);
+      if (!normalized) {
+        throw new Error(`LLM mvp5Plan output invalid: ${String(content).slice(0, 240)}`);
+      }
+    
+      return {
+        ok: true,
+        skipped: false,
+        result: normalized,
+        llmContext: describeLlmConfig(cfg),
+        prompt: { templates: { system: stage.system, user: stage.user }, rendered: promptRendered, variables },
+      };
+    }
+    
+    /**
+     * POST /api/mvp5/analyze-dependencies
+     * 分析任务依赖关系
+     */
+    app.post('/api/mvp5/analyze-dependencies', async (req, res) => {
+      try {
+        const { specId, tasksContent, tasks: tasksInput, atomicTasks, options = {} } = req.body;
+    
+        let dagTasks = null;
+        let usedLegacyAtomic = false;
+    
+        if (Array.isArray(tasksInput)) {
+          dagTasks = ensureUniqueDagTaskIds(
+            tasksInput.map((t, idx) => normalizeDagTaskObject(t, idx)).filter(Boolean),
+          );
+        } else if (typeof tasksContent === 'string') {
+          dagTasks = parseDagTasksFromTasksContent(tasksContent);
+        } else if (Array.isArray(atomicTasks)) {
+          // Legacy fallback: keep compatibility but prefer TASKS_JSON.
+          usedLegacyAtomic = true;
+          const parsed = typeof atomicTasks[0] === 'string'
+            ? dependencyAnalyzer.parseAtomicTasks(atomicTasks.join('\n'))
+            : atomicTasks;
+          dagTasks = ensureUniqueDagTaskIds(
+            parsed
+              .map((t, idx) => ({
+                id: String(t?.id || `T${idx + 1}`).trim() || `T${idx + 1}`,
+                title: String(t?.title || '').trim(),
+                description: String(t?.description || t?.details || '').trim(),
+                dependencies: [],
+                scope: [],
+                estimated_complexity: 'Medium',
+              }))
+              .filter((t) => t.title),
+          );
+        }
+    
+        if (!dagTasks || dagTasks.length === 0) {
+          return res.status(400).json({
+            error:
+              '没有有效的任务：请在 tasks.md 的 ## TASKS_JSON 块中提供 { "tasks": [...] }，或直接传 tasksContent。',
+          });
+        }
+    
+        const warnings = [];
+        if (usedLegacyAtomic) {
+          warnings.push('提示：当前分析使用 legacy atomicTasks 输入，建议改用 tasks.md 的 TASKS_JSON。');
+        }
+        if (dagTasks.length > 25) {
+          warnings.push(`任务数量为 ${dagTasks.length}，建议 ≤ 25（参照 docs/任务编排.md）。`);
+        }
+    
+        const taskIds = new Set(dagTasks.map((t) => t.id));
+        const dependencyEdges = [];
+        const unknownDeps = new Set();
+    
+        dagTasks.forEach((task) => {
+          const deps = Array.isArray(task?.dependencies) ? task.dependencies : [];
+          deps.forEach((depId) => {
+            const dep = String(depId ?? '').trim();
+            if (!dep || dep === task.id) return;
+            if (!taskIds.has(dep)) {
+              unknownDeps.add(`${task.id} -> ${dep}`);
+              return;
+            }
+            dependencyEdges.push({
+              from: dep,
+              to: task.id,
+              type: 'explicit',
+              strength: 'strong',
+              description: `显式依赖: ${task.id} 依赖 ${dep}`,
+            });
+          });
+        });
+    
+        if (unknownDeps.size) {
+          const items = Array.from(unknownDeps).slice(0, 12);
+          warnings.push(
+            `检测到无效 dependencies 引用（已忽略）：${items.join('；')}${unknownDeps.size > items.length ? '…' : ''}`,
+          );
+        }
+    
+        const scopeConflicts = detectDagScopeConflicts(dagTasks);
+        warnings.push(...scopeConflicts.warnings);
+    
+        const tasksForDag = dagTasks.map((t) => {
+          const meta = [];
+          if (Array.isArray(t.scope) && t.scope.length) meta.push(`scope: ${t.scope.join(', ')}`);
+          if (t.estimated_complexity) meta.push(`complexity: ${t.estimated_complexity}`);
+          const metaBlock = meta.length ? `\n\n${meta.join('\n')}` : '';
+          return {
+            id: t.id,
+            title: t.title,
+            description: `${t.description || ''}${metaBlock}`.trim(),
+          };
+        });
+    
+        // 构建 DAG（只使用 dependencies，scope 冲突只做提示，不影响拓扑）
+        const dag = dagBuilder.buildDAG(tasksForDag, dependencyEdges);
+        if (scopeConflicts.edges.length) {
+          dag.edges = [...dag.edges, ...scopeConflicts.edges];
+        }
+    
+        // 并发约束：最大 CLI 并发数（上限 8）
+        const rawMaxCliConcurrency = options.maxCliConcurrency ?? process.env.MVP5_MAX_CLI_CONCURRENCY;
+        const parsedMaxCliConcurrency = Number(rawMaxCliConcurrency);
+        const maxCliConcurrency = Number.isFinite(parsedMaxCliConcurrency)
+          ? Math.min(8, Math.max(1, Math.floor(parsedMaxCliConcurrency)))
+          : 8;
+    
+        const cliAvailability = normalizeCliAvailabilityForMvp5(options.cliAvailability);
+    
+        // 生成推荐方案（默认：规则引擎 + 可选 LLM 方案）
+        const recommendations = recommender.generateRecommendations(dag, {
+          cliAvailability,
+          maxCliConcurrency,
+        });
+    
+        const wantLlmPlan = options.useLlmPlan !== false;
+        const preferredPlanModelRaw =
+          typeof options.planModel === 'string' && options.planModel.trim()
+            ? options.planModel.trim()
+            : (process.env.MVP5_PLAN_LLM_MODEL || 'claude-opus-4-5-20251101');
+        const preferredPlanModel = LLM_MODEL_ALIASES[preferredPlanModelRaw] || preferredPlanModelRaw;
+    
+        if (wantLlmPlan) {
+          try {
+            const modelPlan = await generateMvp5PlanWithModel({
+              specId,
+              tasks: tasksForDag.map((t) => ({
+                id: t.id,
+                title: t.title,
+                description: t.description,
+                riskLevel: recommender.assessTaskRisk(t),
+                requiresInteraction: recommender.requiresInteraction(t),
+              })),
+              dag,
+              maxCliConcurrencyLimit: maxCliConcurrency,
+              cliAvailability,
+              preferredModelId: preferredPlanModel,
+            });
+    
+            if (modelPlan?.ok && modelPlan.result) {
+              const effectiveConcurrency = Math.min(maxCliConcurrency, modelPlan.result.maxCliConcurrency || maxCliConcurrency);
+              const llmRec = recommender.generateRecommendation(dag, {
+                cliAvailability,
+                maxCliConcurrency: effectiveConcurrency,
+                cliAllocationOverride: modelPlan.result.cliAllocation,
+              });
+              if (llmRec?.feasible) {
+                llmRec.label = `模型方案（${preferredPlanModel}）`;
+                llmRec.priority = 'high';
+                llmRec.generatedBy = 'llm';
+                llmRec.llm = { model: preferredPlanModel, providerId: modelPlan.llmContext?.providerId || null };
+                if (modelPlan.result.rationale) {
+                  llmRec.rationale = modelPlan.result.rationale;
+                }
+                recommendations.unshift(llmRec);
+              }
+            }
+          } catch (error) {
+            // LLM plan is best-effort; fall back to heuristic recommendations.
+            console.warn('[MVP5] LLM plan generation skipped:', error?.message || error);
+          }
+        }
+    
+        // 跨平台路径检查
+        const allPaths = dagTasks.flatMap((t) => (Array.isArray(t?.scope) ? t.scope : []));
+        const compatibility = pathAdapter.checkCompatibility(
+          allPaths,
+          options.devPlatform || 'windows',
+          options.targetPlatform || 'linux'
+        );
+    
+        // 生成分析结果
+        const analysisId = nanoid(10);
+        const result = {
+          analysisId,
+          specId,
+          maxCliConcurrency,
+          analyzedAt: new Date().toISOString(),
+          tasks: tasksForDag.map((t) => ({
+            id: t.id,
+            title: t.title,
+            description: t.description,
+            riskLevel: recommender.assessTaskRisk(t),
+            requiresInteraction: recommender.requiresInteraction(t),
+          })),
+          graph: dag,
+          recommendations,
+          warnings,
+          platformNotes: compatibility.issues.length > 0 ? compatibility : undefined,
+          summary: recommender.generateExecutionSummary({ graph: dag, warnings, maxCliConcurrency }),
+        };
+    
+        analysisResults.set(analysisId, result);
+    
+        res.json(result);
+      } catch (error) {
+        console.error('[MVP5] 依赖分析错误:', error);
+        res.status(500).json({ error: error.message });
+      }
+    });
+    
+    /**
+     * GET /api/mvp5/analyze-dependencies/:id
+     * 获取分析结果
+     */
+    app.get('/api/mvp5/analyze-dependencies/:id', (req, res) => {
+      const { id } = req.params;
+      const result = analysisResults.get(id);
+    
+      if (!result) {
+        return res.status(404).json({ error: '分析结果不存在' });
+      }
+    
+      res.json(result);
+    });
+    
+    /**
+     * POST /api/mvp5/task-prompt
+     * 从 tasks.md（TASKS_JSON）生成单任务提示词（用于手动发给 CLI 执行）
+     */
+    app.post('/api/mvp5/task-prompt', (req, res) => {
+      try {
+        const specName = sanitizeSpecName(req.body?.specId ?? req.body?.specName ?? req.query?.specId);
+        if (!specName) {
+          return res.status(400).json({ error: 'specId is required' });
+        }
+    
+        const taskId = String(req.body?.taskId ?? req.query?.taskId ?? '').trim();
+        if (!taskId) {
+          return res.status(400).json({ error: 'taskId is required' });
+        }
+    
+        const tasksContent = typeof req.body?.tasksContent === 'string' ? req.body.tasksContent : '';
+        if (!tasksContent.trim()) {
+          return res.status(400).json({ error: 'tasksContent is required' });
+        }
+    
+        const dagTasks = parseDagTasksFromTasksContent(tasksContent);
+        if (!dagTasks || dagTasks.length === 0) {
+          return res.status(400).json({
+            error:
+              '没有有效的任务：请在 tasks.md 的 ## TASKS_JSON 块中提供 { "tasks": [...] }。',
+          });
+        }
+    
+        const task = dagTasks.find((t) => String(t?.id || '').trim() === taskId) || null;
+        if (!task) {
+          return res.status(404).json({ error: `Task not found: ${taskId}` });
+        }
+    
+        const sandbox = normalizeCodexSandbox(req.body?.sandbox ?? req.query?.sandbox);
+        const model = normalizeCodexModel(req.body?.model ?? req.query?.model);
+        const projectDir = normalizeTerminalCwd(
+          req.body?.cwd ??
+            req.body?.projectDir ??
+            (typeof req.query?.cwd === 'string' ? req.query.cwd : '') ??
+            (typeof req.query?.projectDir === 'string' ? req.query.projectDir : ''),
+        );
+    
+        const doc = buildMvp5TaskRunDoc(specName, task, {
+          sandbox,
+          model,
+          projectDir,
+        });
+        const runDocPathAbs = normalizePathForPrompt(doc.runDocPath);
+        const projectDirForPrompt = normalizePathForPrompt(projectDir);
+        const prompt = [
+          `请按任务文档（绝对路径）${runDocPathAbs} 实现该任务，完成后自检并用简短要点总结变更与验证结果。`,
+          projectDirForPrompt ? `建议工作目录：${projectDirForPrompt}` : null,
+        ]
+          .filter(Boolean)
+          .join('\n');
+    
+        return res.json({
+          ok: true,
+          taskId,
+          prompt,
+          runDocPathAbs,
+          runDocPath: doc.runDocPathRel,
+          projectDir: projectDirForPrompt,
+          task: {
+            id: task.id,
+            title: task.title,
+            description: task.description,
+            dependencies: Array.isArray(task.dependencies) ? task.dependencies : [],
+            scope: Array.isArray(task.scope) ? task.scope : [],
+            estimated_complexity: task.estimated_complexity || null,
+          },
+        });
+      } catch (error) {
+        console.error('[MVP5] task-prompt error:', error);
+        return res.status(500).json({ error: error?.message || 'Failed to generate prompt' });
+      }
+    });
+    
+    /**
+     * POST /api/mvp5/execution-plans
+     * 创建执行计划
+     */
+    app.post('/api/mvp5/execution-plans', (req, res) => {
+      try {
+        const { specId, analysisId, selectedRecommendation, modifications = {} } = req.body;
+    
+        // 获取分析结果
+        const analysis = analysisResults.get(analysisId);
+        if (!analysis) {
+          return res.status(404).json({ error: '分析结果不存在' });
+        }
+    
+        // 获取选中的推荐方案
+        const recommendation = analysis.recommendations[selectedRecommendation] || analysis.recommendations[0];
+        if (!recommendation) {
+          return res.status(400).json({ error: '无效的推荐方案' });
+        }
+    
+        // 应用修改
+        let phases = [...recommendation.phases];
+        if (modifications.excludedTasks && modifications.excludedTasks.length > 0) {
+          phases = phases.map(phase => ({
+            ...phase,
+            taskIds: phase.taskIds.filter(id => !modifications.excludedTasks.includes(id)),
+          })).filter(phase => phase.taskIds.length > 0);
+        }
+    
+        // MVP5 编排阶段不再区分 Codex/Claude：执行阶段统一使用 Codex（CLI 选择留给终端面板）
+        const planTaskIds = Array.from(new Set(phases.flatMap((p) => p.taskIds)));
+        const cliAllocation = Object.fromEntries(planTaskIds.map((taskId) => [taskId, 'codex']));
+    
+        // 创建执行计划
+        const planId = nanoid(10);
+        const plan = {
+          planId,
+          specId,
+          analysisId,
+          createdAt: new Date().toISOString(),
+          status: 'pending',
+          phases,
+          cliAllocation,
+          modifications,
+          estimatedDuration: phases.reduce((sum, p) => sum + (p.estimatedDuration || 0), 0),
+        };
+    
+        executionPlans.set(planId, plan);
+    
+        res.json(plan);
+      } catch (error) {
+        console.error('[MVP5] 创建执行计划错误:', error);
+        res.status(500).json({ error: error.message });
+      }
+    });
+    
+    /**
+     * GET /api/mvp5/execution-plans/:id
+     * 获取执行计划
+     */
+    app.get('/api/mvp5/execution-plans/:id', (req, res) => {
+      const { id } = req.params;
+      const plan = executionPlans.get(id);
+    
+      if (!plan) {
+        return res.status(404).json({ error: '执行计划不存在' });
+      }
+    
+      res.json(plan);
+    });
+    
+    function quoteCmdArgument(value) {
+      const raw = String(value ?? '');
+      if (!raw) return '""';
+      if (/[\s&|<>^"]/.test(raw)) {
+        return `"${raw.replace(/"/g, '\\"')}"`;
+      }
+      return raw;
+    }
+    
+    function buildMvp5TaskRunDoc(specName, task, options = {}) {
+      const projectDir = typeof options?.projectDir === 'string' ? options.projectDir.trim() : '';
+      const baseDir = projectDir || REPO_DIR;
+      const runsDir = path.join(baseDir, '.runlogs', 'mvp5-runs', String(specName || 'spec'));
+      fs.mkdirSync(runsDir, { recursive: true });
+    
+      const taskId = String(task?.id || 'unknown').trim() || 'unknown';
+      const safeTaskId = taskId
+        .replace(/[^A-Za-z0-9._-]/g, '_')
+        .replace(/_+/g, '_')
+        .slice(0, 60);
+      const stamp = new Date().toISOString().replace(/[:.]/g, '').replace('Z', 'Z');
+      const runDocPath = path.join(runsDir, `task-${safeTaskId}-${stamp}.md`);
+    
+      const rel = (absPath) => normalizePathForPrompt(path.relative(REPO_DIR, absPath));
+      const artifacts = {
+        requirements: resolveSpecFile(specName, 'requirements'),
+        design: resolveSpecFile(specName, 'design'),
+        tasks: resolveSpecFile(specName, 'tasks'),
+      };
+      const readIfExists = (filePath) => {
+        try {
+          if (!filePath || !fs.existsSync(filePath)) return '';
+          return fs.readFileSync(filePath, 'utf8');
+        } catch {
+          return '';
+        }
+      };
+      const requirementsSnapshot = readIfExists(artifacts.requirements);
+      const designSnapshot = readIfExists(artifacts.design);
+      const tasksSnapshot = readIfExists(artifacts.tasks);
+    
+      const lines = [];
+      lines.push('# Codex 任务执行文档（MVP5）');
+      lines.push('');
+      lines.push(`- Spec: ${specName}`);
+      lines.push(`- Task: ${taskId}`);
+      if (task?.title) lines.push(`- Title: ${String(task.title).trim()}`);
+      if (options.executionId) lines.push(`- Execution: ${options.executionId}`);
+      if (options.planId) lines.push(`- Plan: ${options.planId}`);
+      if (Number.isFinite(options.phaseIndex)) lines.push(`- PhaseIndex: ${options.phaseIndex}`);
+      lines.push(`- StartedAt: ${new Date().toISOString()}`);
+      if (options.model) lines.push(`- Model: ${options.model}`);
+      if (options.sandbox) lines.push(`- Sandbox: ${options.sandbox}`);
+      if (options.projectDir) lines.push(`- ProjectDir: ${normalizePathForPrompt(options.projectDir)}`);
+      lines.push('');
+      lines.push('## Spec 快照（只读引用）');
+      lines.push(
+        '- 说明：出于 Codex CLI 沙箱限制，运行时可能无法访问外部 spec 目录；本次已将 requirements/design/tasks 快照内嵌，优先以快照为准。',
+      );
+      lines.push('');
+      lines.push('### 原始 spec 路径（仅供人工定位，CLI 可能不可访问）');
+      lines.push(`- requirements: \`${normalizePathForPrompt(artifacts.requirements)}\``);
+      lines.push(`- design: \`${normalizePathForPrompt(artifacts.design)}\``);
+      lines.push(`- tasks: \`${normalizePathForPrompt(artifacts.tasks)}\``);
+      if (requirementsSnapshot.trim()) {
+        lines.push('');
+        lines.push('### requirements.md（截断）');
+        lines.push('```markdown');
+        lines.push(truncateText(requirementsSnapshot, 6000).trimEnd());
+        lines.push('```');
+      }
+      if (designSnapshot.trim()) {
+        lines.push('');
+        lines.push('### design.md（截断）');
+        lines.push('```markdown');
+        lines.push(truncateText(designSnapshot, 6000).trimEnd());
+        lines.push('```');
+      }
+      if (tasksSnapshot.trim()) {
+        lines.push('');
+        lines.push('### tasks.md（截断）');
+        lines.push('```markdown');
+        lines.push(truncateText(tasksSnapshot, 8000).trimEnd());
+        lines.push('```');
+      }
+      lines.push('');
+      lines.push('## 本次任务（来自 tasks.md 的 TASKS_JSON）');
+      lines.push(`- title: ${String(task?.title || '').trim()}`);
+      lines.push(`- description: ${String(task?.description || '').trim()}`);
+      const deps = Array.isArray(task?.dependencies) ? task.dependencies.map((v) => String(v || '').trim()).filter(Boolean) : [];
+      const scope = Array.isArray(task?.scope) ? task.scope.map((v) => String(v || '').trim()).filter(Boolean) : [];
+      if (deps.length) lines.push(`- dependencies: ${deps.join(', ')}`);
+      if (scope.length) lines.push(`- scope: ${scope.join(', ')}`);
+      if (task?.estimated_complexity) lines.push(`- estimated_complexity: ${String(task.estimated_complexity).trim()}`);
+      lines.push('');
+      lines.push('## 执行要求');
+      lines.push('- 以本任务为“闭环交付物”，不要做微观步骤拆解。');
+      lines.push('- 按仓库既有约束实现与自测；必要时补充最小可行验证步骤。');
+      lines.push(
+        '- 完成后输出“关键变更/验证方式/验证结果”；如运行环境允许访问 spec 文件，再回写到 tasks.md（建议追加到对应任务条目下）。',
+      );
+      lines.push('');
+    
+      fs.writeFileSync(runDocPath, lines.join('\n'), 'utf8');
+      return { runDocPath, runDocPathRel: rel(runDocPath), artifacts };
+    }
+    
+    function inferMvp5MaxCliConcurrency(plan, analysis) {
+      const raw = Number(analysis?.maxCliConcurrency ?? analysis?.summary?.maxCliConcurrency);
+      if (Number.isFinite(raw)) return Math.min(8, Math.max(1, Math.floor(raw)));
+      const phases = Array.isArray(plan?.phases) ? plan.phases : [];
+      const fromPhases = phases.reduce((acc, phase) => {
+        const candidate = Number(phase?.maxConcurrency ?? (Array.isArray(phase?.taskIds) ? phase.taskIds.length : 1));
+        return Number.isFinite(candidate) ? Math.max(acc, candidate) : acc;
+      }, 1);
+      return Math.min(8, Math.max(1, Math.floor(fromPhases || 1)));
+    }
+    
+    function loadDagTasksForSpec(specName) {
+      const tasksPath = resolveSpecFile(specName, 'tasks');
+      if (!fs.existsSync(tasksPath)) return null;
+      const content = fs.readFileSync(tasksPath, 'utf8');
+      return parseDagTasksFromTasksContent(content);
+    }
+    
+    function scheduleMvp5Execution(runner) {
+      if (!runner || runner.stopped) return;
+      const state = executionStates.get(runner.executionId);
+      const plan = executionPlans.get(runner.planId);
+      if (!state || !plan) return;
+      if (state.status !== 'running') return;
+    
+      const phases = Array.isArray(plan.phases) ? plan.phases : [];
+      const phaseIndex = Number(state.currentPhase ?? 0);
+      const phase = phases[phaseIndex];
+    
+      if (!phase) {
+        state.status = 'completed';
+        state.updatedAt = new Date().toISOString();
+        plan.status = 'completed';
+        return;
+      }
+    
+      const phaseTaskIds = Array.isArray(phase.taskIds) ? phase.taskIds : [];
+      const hasFailed = phaseTaskIds.some((id) => state.tasks?.[id]?.status === 'failed');
+      if (hasFailed) {
+        state.status = 'failed';
+        state.updatedAt = new Date().toISOString();
+        plan.status = 'failed';
+        return;
+      }
+    
+      const isPhaseDone = phaseTaskIds.length
+        ? phaseTaskIds.every((id) => ['completed', 'skipped'].includes(state.tasks?.[id]?.status))
+        : true;
+    
+      if (isPhaseDone) {
+        state.currentPhase = phaseIndex + 1;
+        state.updatedAt = new Date().toISOString();
+        setTimeout(() => scheduleMvp5Execution(runner), 0);
+        return;
+      }
+    
+      const runningCount = phaseTaskIds.filter((id) => state.tasks?.[id]?.status === 'running').length;
+      const maxConcurrency = phase.type === 'serial'
+        ? 1
+        : Math.min(
+            runner.maxCliConcurrency,
+            Number.isFinite(phase.maxConcurrency) ? Math.max(1, Math.floor(phase.maxConcurrency)) : runner.maxCliConcurrency,
+          );
+      const slots = Math.max(0, maxConcurrency - runningCount);
+      if (slots <= 0) return;
+    
+      const pending = phaseTaskIds.filter((id) => state.tasks?.[id]?.status === 'pending');
+      if (!pending.length) return;
+    
+      const freeWorkers = runner.workers.filter((w) => !w.busy);
+      const canStart = Math.min(slots, pending.length, freeWorkers.length);
+      for (let i = 0; i < canStart; i += 1) {
+        startMvp5TaskOnWorker(runner, freeWorkers[i], pending[i], phaseIndex);
+      }
+    }
+    
+    function handleMvp5WorkerData(runner, worker, data) {
+      if (!runner || !worker?.current) return;
+      worker.tail = `${worker.tail}${data}`;
+      if (worker.tail.length > 12000) worker.tail = worker.tail.slice(worker.tail.length - 12000);
+    
+      const marker = worker.current.marker;
+      const idx = worker.tail.indexOf(marker);
+      if (idx < 0) return;
+    
+      const after = worker.tail.slice(idx + marker.length);
+      const match = /^(-?\d+)/.exec(after);
+      if (!match) return;
+    
+      const exitCode = Number(match[1]);
+      const finishedAt = new Date().toISOString();
+      const state = executionStates.get(runner.executionId);
+      const plan = executionPlans.get(runner.planId);
+      if (!state || !plan) return;
+    
+      const { taskId, phaseIndex, runDocPathRel } = worker.current;
+      const taskState = state.tasks?.[taskId];
+      if (taskState) {
+        taskState.completedAt = finishedAt;
+        taskState.status = exitCode === 0 ? 'completed' : 'failed';
+        if (runDocPathRel) taskState.runDocPath = runDocPathRel;
+        taskState.error = exitCode === 0 ? undefined : `CLI 退出码 ${exitCode}`;
+      }
+    
+      if (exitCode !== 0) {
+        state.failures = Array.isArray(state.failures) ? state.failures : [];
+        state.failures.push({
+          taskId,
+          phaseId: plan.phases?.[phaseIndex]?.phaseId || String(phaseIndex),
+          error: `CLI 退出码 ${exitCode}`,
+          canRetry: true,
+          downstreamAffected: [],
+        });
+        state.status = 'failed';
+        plan.status = 'failed';
+      }
+    
+      state.updatedAt = finishedAt;
+      worker.busy = false;
+      worker.current = null;
+      worker.tail = '';
+    
+      setTimeout(() => scheduleMvp5Execution(runner), 0);
+    }
+    
+    function startMvp5TaskOnWorker(runner, worker, taskId, phaseIndex) {
+      const state = executionStates.get(runner.executionId);
+      const plan = executionPlans.get(runner.planId);
+      if (!state || !plan) return;
+    
+      const task = runner.tasksById.get(taskId) || { id: taskId, title: taskId, description: '' };
+      const sandbox = normalizeCodexSandbox(runner.sandbox);
+      const model = normalizeCodexModel(runner.model);
+    
+      const doc = buildMvp5TaskRunDoc(runner.specName, task, {
+        sandbox,
+        model,
+        planId: runner.planId,
+        executionId: runner.executionId,
+        phaseIndex,
+        projectDir: runner.projectDir,
+      });
+      const runDocPathAbs = normalizePathForPrompt(doc.runDocPath);
+      const prompt = `请按任务文档（绝对路径）${runDocPathAbs} 实现该任务，完成后自检并用简短要点总结变更与验证结果。`;
+    
+      const runId = nanoid(8);
+      const marker = `__MVP5_TASK_DONE__${runId}__`;
+    
+      const codexExecutable = (process.env.CODEX_COMMAND || 'codex').trim() || 'codex';
+      // 固定使用非交互 exec，并强制 approval_policy=never，避免 CLI 卡在确认提示。
+      const args = ['-a', 'never', 'exec', '-s', sandbox, '--skip-git-repo-check'];
+      if (model) {
+        args.push('-m', model);
+      }
+      args.push('-C', runner.projectDir, prompt);
+    
+      const cmdLine = [codexExecutable, ...args].map(quoteCmdArgument).join(' ');
+      const input = [
+        `cd /d ${quoteCmdArgument(runner.projectDir)}`,
+        cmdLine,
+        `echo ${marker}%ERRORLEVEL%`,
+        '',
+      ].join('\r\n');
+    
+      const startedAt = new Date().toISOString();
+      const taskState = state.tasks?.[taskId];
+      if (taskState) {
+        taskState.status = 'running';
+        taskState.startedAt = startedAt;
+        taskState.terminalId = worker.terminalId;
+        taskState.runDocPath = doc.runDocPathRel;
+        taskState.error = undefined;
+      }
+      state.updatedAt = startedAt;
+    
+      worker.busy = true;
+      worker.current = { taskId, phaseIndex, marker, runDocPathRel: doc.runDocPathRel };
+    
+      try {
+        writeTerminalInput(worker.session, input);
+      } catch (error) {
+        const failedAt = new Date().toISOString();
+        if (taskState) {
+          taskState.status = 'failed';
+          taskState.completedAt = failedAt;
+          taskState.error = error?.message ? String(error.message) : 'Failed to write terminal input';
+        }
+        state.failures = Array.isArray(state.failures) ? state.failures : [];
+        state.failures.push({
+          taskId,
+          phaseId: plan.phases?.[phaseIndex]?.phaseId || String(phaseIndex),
+          error: taskState?.error || 'Failed to write terminal input',
+          canRetry: true,
+          downstreamAffected: [],
+        });
+        state.status = 'failed';
+        plan.status = 'failed';
+        state.updatedAt = failedAt;
+        worker.busy = false;
+        worker.current = null;
+      }
+    }
+    
+    function startMvp5ExecutionRunner({
+      executionId,
+      planId,
+      specName,
+      projectDir,
+      sandbox = 'workspace-write',
+      model = null,
+    }) {
+      const state = executionStates.get(executionId);
+      const plan = executionPlans.get(planId);
+      const analysis = plan ? analysisResults.get(plan.analysisId) : null;
+      if (!state || !plan) return null;
+    
+      const tasks = loadDagTasksForSpec(specName) || [];
+      const tasksById = new Map(tasks.map((t) => [t.id, t]));
+    
+      const maxCliConcurrency = inferMvp5MaxCliConcurrency(plan, analysis);
+      const workers = [];
+    
+      for (let i = 0; i < maxCliConcurrency; i += 1) {
+        const session = createTerminalSession({
+          title: `MVP5 · ${specName} · Worker ${i + 1}`,
+          command: 'cmd.exe',
+          args: [],
+          cwd: projectDir,
+        });
+    
+        const worker = {
+          terminalId: session.id,
+          session,
+          busy: false,
+          current: null,
+          tail: '',
+          dispose: null,
+        };
+        workers.push(worker);
+      }
+    
+      const runner = {
+        executionId,
+        planId,
+        specName,
+        projectDir,
+        sandbox,
+        model,
+        maxCliConcurrency,
+        workers,
+        tasksById,
+        stopped: false,
+      };
+    
+      workers.forEach((worker) => {
+        worker.dispose = worker.session.proc.onData((data) => handleMvp5WorkerData(runner, worker, data));
+      });
+    
+      mvp5ExecutionRunners.set(executionId, runner);
+      setTimeout(() => scheduleMvp5Execution(runner), 0);
+      return runner;
+    }
+    
+    /**
+     * POST /api/mvp5/execution-plans/:id/start
+     * 启动执行
+     */
+    app.post('/api/mvp5/execution-plans/:id/start', (req, res) => {
+      try {
+        const { id } = req.params;
+        const plan = executionPlans.get(id);
+    
+        if (!plan) {
+          return res.status(404).json({ error: '执行计划不存在' });
+        }
+    
+        if (plan.status === 'running') {
+          return res.status(400).json({ error: '执行计划已在运行中' });
+        }
+    
+        // 创建执行状态
+        const executionId = nanoid(10);
+        const executionState = {
+          executionId,
+          planId: id,
+          specId: plan.specId,
+          status: 'running',
+          currentPhase: 0,
+          tasks: {},
+          failures: [],
+          startedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+    
+        // 初始化任务状态
+        plan.phases.forEach(phase => {
+          phase.taskIds.forEach(taskId => {
+            executionState.tasks[taskId] = {
+              taskId,
+              status: 'pending',
+              cli: plan.cliAllocation[taskId] || 'codex',
+              retryCount: 0,
+            };
+          });
+        });
+    
+        executionStates.set(executionId, executionState);
+        plan.status = 'running';
+        plan.executionId = executionId;
+    
+        const specName = sanitizeSpecName(plan.specId);
+        if (!specName) {
+          return res.status(400).json({ error: 'specId 无效，无法启动执行' });
+        }
+    
+        const sandbox = normalizeCodexSandbox(req.body?.sandbox ?? req.query?.sandbox);
+        const model = normalizeCodexModel(req.body?.model ?? req.query?.model);
+        const projectDir = normalizeTerminalCwd(
+          req.body?.cwd ??
+            req.body?.projectDir ??
+            (typeof req.query?.cwd === 'string' ? req.query.cwd : '') ??
+            (typeof req.query?.projectDir === 'string' ? req.query.projectDir : ''),
+        );
+    
+        // 启动执行（默认：固定 worker 池复用终端，并发≤8；暂时统一使用 Codex）
+        const runner = startMvp5ExecutionRunner({
+          executionId,
+          planId: id,
+          specName,
+          projectDir,
+          sandbox,
+          model,
+        });
+    
+        if (!runner) {
+          executionState.status = 'failed';
+          executionState.updatedAt = new Date().toISOString();
+          plan.status = 'failed';
+          return res.status(500).json({ error: '启动执行失败：runner 初始化失败' });
+        }
+    
+        res.json({
+          executionId,
+          status: 'started',
+          message: '执行已启动',
+        });
+      } catch (error) {
+        console.error('[MVP5] 启动执行错误:', error);
+        res.status(500).json({ error: error.message });
+      }
+    });
+    
+    /**
+     * GET /api/mvp5/execution/:id/status
+     * 获取执行状态
+     */
+    app.get('/api/mvp5/execution/:id/status', (req, res) => {
+      const { id } = req.params;
+      const state = executionStates.get(id);
+    
+      if (!state) {
+        return res.status(404).json({ error: '执行状态不存在' });
+      }
+    
+      res.json(state);
+    });
+    
+    /**
+     * POST /api/mvp5/execution/:id/retry/:taskId
+     * 重启失败的任务
+     */
+    app.post('/api/mvp5/execution/:id/retry/:taskId', (req, res) => {
+      try {
+        const { id, taskId } = req.params;
+        const state = executionStates.get(id);
+    
+        if (!state) {
+          return res.status(404).json({ error: '执行状态不存在' });
+        }
+    
+        const task = state.tasks[taskId];
+        if (!task) {
+          return res.status(404).json({ error: '任务不存在' });
+        }
+    
+        if (task.status !== 'failed') {
+          return res.status(400).json({ error: '只能重启失败的任务' });
+        }
+    
+        // 重置任务状态
+        task.status = 'pending';
+        task.retryCount += 1;
+        task.error = undefined;
+        state.updatedAt = new Date().toISOString();
+    
+        // 重新执行任务（复用既有 runner；如 runner 丢失则尝试重建）
+        const plan = executionPlans.get(state.planId);
+        if (plan) {
+          plan.status = 'running';
+        }
+        state.status = 'running';
+        state.failures = Array.isArray(state.failures)
+          ? state.failures.filter((f) => f?.taskId !== taskId)
+          : [];
+    
+        let runner = mvp5ExecutionRunners.get(id) || null;
+        if (!runner && plan) {
+          const specName = sanitizeSpecName(plan.specId);
+          if (specName) {
+            runner = startMvp5ExecutionRunner({
+              executionId: id,
+              planId: state.planId,
+              specName,
+              projectDir: normalizeTerminalCwd(''),
+              sandbox: normalizeCodexSandbox(req.body?.sandbox ?? req.query?.sandbox),
+              model: normalizeCodexModel(req.body?.model ?? req.query?.model),
+            });
+          }
+        }
+    
+        if (runner && plan) {
+          const phaseIndex = Array.isArray(plan.phases)
+            ? plan.phases.findIndex((p) => Array.isArray(p?.taskIds) && p.taskIds.includes(taskId))
+            : -1;
+          if (phaseIndex >= 0 && Number(state.currentPhase) > phaseIndex) {
+            state.currentPhase = phaseIndex;
+          }
+          setTimeout(() => scheduleMvp5Execution(runner), 0);
+        }
+    
+        res.json({
+          taskId,
+          status: 'pending',
+          retryCount: task.retryCount,
+          message: '任务已重新加入队列',
+        });
+      } catch (error) {
+        console.error('[MVP5] 重启任务错误:', error);
+        res.status(500).json({ error: error.message });
+      }
+    });
+    
+    // ========== MVP5: API 结束 ==========
+  }
+}
+
+module.exports = { registerMvp5Routes };
