@@ -2717,7 +2717,7 @@ export default function App() {
 
     panel.focusTerminal(created.terminalId);
     return created;
-  }, []);
+  }, [saveMvp5TaskStatus, showToast]);
 
   const outputScrollRef = useRef<OutputScrollEl | null>(null);
   const outputLastScrollTopRef = useRef(0);

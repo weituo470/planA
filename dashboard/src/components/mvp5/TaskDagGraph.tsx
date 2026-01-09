@@ -183,6 +183,17 @@ export function TaskDagGraph({
   const boundsRef = useRef<TaskDagBounds | null>(null);
   const lastRecoverAtRef = useRef<number | null>(null);
   const [renderIssue, setRenderIssue] = useState<string | null>(null);
+  const [flowKey, setFlowKey] = useState(0);
+  const lastHardResetAtRef = useRef<number>(0);
+
+  const hardReset = useCallback((reason: string) => {
+    const now = Date.now();
+    const last = lastHardResetAtRef.current ?? 0;
+    if (now - last < 2500) return;
+    lastHardResetAtRef.current = now;
+    console.warn('[TaskDagGraph] force remount', { reason });
+    setFlowKey((prev) => prev + 1);
+  }, []);
 
   const statusKey = useMemo(() => {
     const list = (graph?.tasks ?? []).map((t) => `${t.id}:${taskStatusById?.[t.id] ?? 'pending'}`);
@@ -207,7 +218,7 @@ export function TaskDagGraph({
         const graphWidth = bounds.maxX - bounds.minX;
         const graphHeight = bounds.maxY - bounds.minY;
         if (hasSize && graphWidth > 1 && graphHeight > 1) {
-          const padding = 0.06;
+          const padding = 0.12;
           const zoomX = (rect.width * (1 - padding * 2)) / graphWidth;
           const zoomY = (rect.height * (1 - padding * 2)) / graphHeight;
           let zoom = Math.min(zoomX, zoomY);
@@ -234,7 +245,7 @@ export function TaskDagGraph({
       }
       window.requestAnimationFrame(() => {
         try {
-          inst.fitView({ padding: 0.06, duration: 0 });
+          inst.fitView({ padding: 0.12, duration: 0 });
         } catch (e) {
           console.error('[TaskDagGraph] fitView failed', { reason, error: e });
         }
@@ -399,17 +410,24 @@ export function TaskDagGraph({
         const to = String(e?.to || '').trim();
         if (!from || !to) return null;
         const isConflict = e.type === 'conflict';
-        const stroke = isConflict ? '#f59e0b' : '#ffffff';
+        const sourceStatus = taskStatusById?.[from] ?? 'pending';
+        const targetStatus = taskStatusById?.[to] ?? 'pending';
+        const isBlocking = !isConflict && targetStatus === 'pending' && sourceStatus !== 'completed';
+        const isSatisfied = !isConflict && sourceStatus === 'completed';
+
+        const stroke = isConflict ? '#f59e0b' : isBlocking ? '#fbbf24' : '#ffffff';
+        const opacity = isConflict ? 0.95 : isBlocking ? 0.95 : isSatisfied ? 0.35 : 0.6;
+        const strokeWidth = isBlocking ? 2.5 : 2;
         return {
           id: `${from}->${to}:${idx}`,
           source: from,
           target: to,
           type: 'smoothstep',
           animated: false,
-          markerEnd: { type: MarkerType.ArrowClosed, color: stroke },
+          markerEnd: { type: MarkerType.ArrowClosed, color: stroke, width: 18, height: 18 },
           style: isConflict
-            ? { stroke, strokeDasharray: '6 4', strokeWidth: 2 }
-            : { stroke, strokeWidth: 2 },
+            ? { stroke, strokeDasharray: '6 4', strokeWidth, opacity }
+            : { stroke, strokeWidth, opacity },
         };
       })
       .filter(Boolean) as Edge[];
@@ -443,6 +461,8 @@ export function TaskDagGraph({
 
       const expectedCount = nodes.length;
       const domCount = root.querySelectorAll('.react-flow__node').length;
+      const expectedEdgeCount = edges.length;
+      const edgeDomCount = root.querySelectorAll('.react-flow__edge-path').length;
 
       const viewport = typeof flow.getViewport === 'function' ? flow.getViewport() : null;
       const zoom = viewport && typeof viewport.zoom === 'number' ? viewport.zoom : null;
@@ -471,34 +491,39 @@ export function TaskDagGraph({
       const issue =
         expectedCount > 0 && domCount === 0
           ? '节点未渲染'
-          : !viewportOk
-            ? '视图参数异常'
-            : offscreen
-              ? '节点全部在视口外'
-              : null;
+          : expectedEdgeCount > 0 && edgeDomCount === 0
+            ? '连线未渲染'
+            : !viewportOk
+              ? '视图参数异常'
+              : offscreen
+                ? '节点全部在视口外'
+                : null;
 
       if (issue) {
         console.error('[TaskDagGraph] render anomaly', {
           issue,
           expectedCount,
           domCount,
+          expectedEdgeCount,
+          edgeDomCount,
           viewport,
           bounds,
           rect: { width: rect.width, height: rect.height },
         });
         setRenderIssue((prev) => prev ?? issue);
         recoverView(issue);
+        if (issue === '节点未渲染' || issue === '连线未渲染') hardReset(issue);
         return;
       }
 
       setRenderIssue(null);
-    }, 120);
+    }, 220);
 
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [bounds, nodes, recoverView]);
+  }, [bounds, edges, hardReset, nodes, recoverView]);
 
   return (
     <div
@@ -519,10 +544,11 @@ export function TaskDagGraph({
         </div>
       ) : null}
       <ReactFlow
+        key={flowKey}
         nodes={nodes}
         edges={edges}
         fitView
-        fitViewOptions={{ padding: 0.06 }}
+        fitViewOptions={{ padding: 0.12 }}
         onlyRenderVisibleElements={false}
         minZoom={0.25}
         maxZoom={1.6}
