@@ -399,7 +399,7 @@ export function TaskDagGraph({
         const to = String(e?.to || '').trim();
         if (!from || !to) return null;
         const isConflict = e.type === 'conflict';
-        const stroke = isConflict ? '#f59e0b' : '#475569';
+        const stroke = isConflict ? '#f59e0b' : '#ffffff';
         return {
           id: `${from}->${to}:${idx}`,
           source: from,
@@ -408,8 +408,8 @@ export function TaskDagGraph({
           animated: false,
           markerEnd: { type: MarkerType.ArrowClosed, color: stroke },
           style: isConflict
-            ? { stroke, strokeDasharray: '6 4', strokeWidth: 1.5 }
-            : { stroke, strokeWidth: 1.5 },
+            ? { stroke, strokeDasharray: '6 4', strokeWidth: 2 }
+            : { stroke, strokeWidth: 2 },
         };
       })
       .filter(Boolean) as Edge[];

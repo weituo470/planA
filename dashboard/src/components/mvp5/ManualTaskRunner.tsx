@@ -107,7 +107,7 @@ function extractTasksJsonBlockFromMarkdown(markdown: string) {
   };
 }
 
-function parseDagTasksFromTasksContent(tasksContent: string) {
+export function parseDagTasksFromTasksContent(tasksContent: string) {
   const raw = String(tasksContent ?? '').trim();
   if (!raw) return null;
 
@@ -130,7 +130,7 @@ function parseDagTasksFromTasksContent(tasksContent: string) {
   return { mode: 'markdown' as const, payload: payload as any, block, tasks };
 }
 
-function replaceTasksJsonInContent(tasksContent: string, nextPayload: any) {
+export function replaceTasksJsonInContent(tasksContent: string, nextPayload: any) {
   const parsed = parseDagTasksFromTasksContent(tasksContent);
   if (!parsed) return null;
 
@@ -362,6 +362,12 @@ export function ManualTaskRunner({
   onToast: (message: string, type?: ToastType) => void;
   onRunPromptInClaudeAutoTerminal?: (
     prompt: string,
+    context: {
+      specId: string;
+      taskId: string;
+      doneMarker: string;
+      failedMarker: string;
+    },
   ) => Promise<{ terminalId: string; title: string }>;
 }) {
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
@@ -495,7 +501,21 @@ export function ManualTaskRunner({
       setPromptLoadingTaskId(task.id);
       try {
         const { prompt } = await fetchPromptForTask(task);
-        const created = await onRunPromptInClaudeAutoTerminal(prompt);
+        const doneMarker = `[[TASK_DONE ${task.id}]]`;
+        const failedMarker = `[[TASK_FAILED ${task.id}]]`;
+        const promptWithMarkers = [
+          prompt,
+          '',
+          `TASK_ID=${task.id}`,
+          '当你确认任务完成后，请在回复最后单独输出一行：[[TASK_DONE <TASK_ID>]]（将 <TASK_ID> 替换为上面的 TASK_ID 值，不要输出尖括号）',
+          '如果无法完成，请在回复最后单独输出一行：[[TASK_FAILED <TASK_ID>]]（将 <TASK_ID> 替换为上面的 TASK_ID 值，不要输出尖括号）',
+        ].join('\n');
+        const created = await onRunPromptInClaudeAutoTerminal(promptWithMarkers, {
+          specId,
+          taskId: task.id,
+          doneMarker,
+          failedMarker,
+        });
         onToast(
           `已启动：${created.title || 'Claude Code'} · ${created.terminalId}`,
           'info',
@@ -506,7 +526,7 @@ export function ManualTaskRunner({
         setPromptLoadingTaskId(null);
       }
     },
-    [fetchPromptForTask, onRunPromptInClaudeAutoTerminal, onToast],
+    [fetchPromptForTask, onRunPromptInClaudeAutoTerminal, onToast, specId],
   );
 
   const handleMarkDone = useCallback(

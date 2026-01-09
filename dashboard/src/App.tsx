@@ -4,7 +4,7 @@ import JSZip from 'jszip';
 import { Button } from './components/ui/button';
 import { ExplorerSidebar } from './ExplorerSidebar';
 import { TerminalPanel, type TerminalPanelHandle, type AssignableCliTerminal } from './TerminalPanel';
-import { ManualTaskRunner } from './components/mvp5';
+import { ManualTaskRunner, parseDagTasksFromTasksContent, replaceTasksJsonInContent } from './components/mvp5';
 import type {
   ClarificationQuestion,
   LlmInfo,
@@ -2097,17 +2097,24 @@ export default function App() {
       const prompt = String(promptData?.prompt || '').trim();
       if (!prompt) throw new Error('获取任务提示失败');
 
+      const normalizedPrompt = prompt.replace(/\r?\n/g, ' ').replace(/\s+/g, ' ').trim();
+
       let terminalId = atomicTaskStartDialog.selectedTerminalId;
       let title = '';
       if (atomicTaskStartDialog.mode === 'new-claude') {
-        const created = await panel.createClaudeAutoTerminal();
+        const created = await panel.createClaudeAutoTerminalWithPrompt(normalizedPrompt, {
+          specName: selectedSpecName,
+          taskId,
+        });
         terminalId = created.terminalId;
         title = created.title;
       }
 
       if (!terminalId) throw new Error('请选择一个已开启的 CLI');
 
-      await panel.sendTerminalInput(terminalId, `${prompt}\r`);
+      if (atomicTaskStartDialog.mode !== 'new-claude') {
+        await panel.sendTerminalInput(terminalId, `${prompt}\r`);
+      }
       panel.focusTerminal(terminalId);
 
       showToast(
@@ -2546,7 +2553,138 @@ export default function App() {
   useEffect(() => {
     if (activeArtifact === 'tasks') setTasksToolsOpen(false);
   }, [activeArtifact]);
-  const runPromptInClaudeAutoTerminal = useCallback(async (prompt: string) => {
+
+  type ClaudeAutoRunContext = {
+    specId: string;
+    taskId: string;
+    doneMarker: string;
+    failedMarker: string;
+  };
+
+  const claudeAutoRunsRef = useRef<Map<string, ClaudeAutoRunContext>>(new Map());
+  const claudeAutoTerminalTailRef = useRef<Map<string, string>>(new Map());
+
+  const patchMvp5TasksContent = useCallback(
+    (content: string, taskId: string, status: 'pending' | 'running' | 'completed') => {
+      const parsedDoc = parseDagTasksFromTasksContent(content);
+      if (!parsedDoc) return null;
+      const payload = parsedDoc.payload;
+      const list = Array.isArray(payload?.tasks) ? payload.tasks : [];
+      const idx = list.findIndex((t: any) => String(t?.id || '').trim() === taskId);
+      if (idx < 0) return null;
+
+      const nextTask = { ...(list[idx] || {}) };
+      if (status === 'running') {
+        nextTask.status = 'running';
+        nextTask.done = false;
+        delete nextTask.doneAt;
+      } else if (status === 'completed') {
+        nextTask.status = 'completed';
+        nextTask.done = true;
+        nextTask.doneAt = new Date().toISOString();
+      } else {
+        nextTask.status = 'pending';
+        nextTask.done = false;
+        delete nextTask.doneAt;
+      }
+      list[idx] = nextTask;
+
+      const nextPayload = { ...payload, tasks: list };
+      return replaceTasksJsonInContent(content, nextPayload);
+    },
+    [],
+  );
+
+  const saveMvp5TaskStatus = useCallback(
+    async (specId: string, taskId: string, status: 'pending' | 'running' | 'completed') => {
+      const normalizedSpecId = String(specId || '').trim();
+      const normalizedTaskId = String(taskId || '').trim();
+      if (!normalizedSpecId || !normalizedTaskId) return;
+
+      const isCurrentSpec = normalizedSpecId === selectedSpecName;
+      let baseContent = isCurrentSpec ? String(artifactContent.tasks ?? '') : '';
+      if (!isCurrentSpec) {
+        const data = await apiJson<{ content?: string }>(
+          `/specs/${encodeURIComponent(normalizedSpecId)}/tasks`,
+          undefined,
+          12000,
+        );
+        baseContent = String(data?.content ?? '');
+      }
+
+      const nextContent = patchMvp5TasksContent(baseContent, normalizedTaskId, status);
+      if (!nextContent) throw new Error(`tasks.md 更新失败：${normalizedTaskId}`);
+
+      if (isCurrentSpec) {
+        setArtifactContent((prev) => ({ ...prev, tasks: nextContent }));
+      }
+
+      await apiJson(
+        `/specs/${encodeURIComponent(normalizedSpecId)}/tasks`,
+        { method: 'POST', body: JSON.stringify({ content: nextContent }) },
+        12000,
+      );
+    },
+    [artifactContent.tasks, patchMvp5TasksContent, selectedSpecName],
+  );
+
+  const handleClaudeAutoTerminalData = useCallback(
+    (event: { terminalId: string; seq: number | null; data: string }) => {
+      const terminalId = String(event?.terminalId || '').trim();
+      if (!terminalId) return;
+
+      const run = claudeAutoRunsRef.current.get(terminalId);
+      if (!run) return;
+
+      const prevTail = claudeAutoTerminalTailRef.current.get(terminalId) ?? '';
+      const nextTail = `${prevTail}${String(event?.data ?? '')}`.slice(-8000);
+      claudeAutoTerminalTailRef.current.set(terminalId, nextTail);
+
+      if (run.doneMarker && nextTail.includes(run.doneMarker)) {
+        claudeAutoRunsRef.current.delete(terminalId);
+        claudeAutoTerminalTailRef.current.delete(terminalId);
+        void saveMvp5TaskStatus(run.specId, run.taskId, 'completed')
+          .then(() => showToast(`已自动标记完成：${run.taskId}`, 'info'))
+          .catch((e: any) => showToast(humanizeError(e)));
+        return;
+      }
+
+      if (run.failedMarker && nextTail.includes(run.failedMarker)) {
+        claudeAutoRunsRef.current.delete(terminalId);
+        claudeAutoTerminalTailRef.current.delete(terminalId);
+        void saveMvp5TaskStatus(run.specId, run.taskId, 'pending')
+          .then(() => showToast(`任务执行失败：${run.taskId}`))
+          .catch((e: any) => showToast(humanizeError(e)));
+      }
+    },
+    [saveMvp5TaskStatus, showToast],
+  );
+
+  const handleClaudeAutoTerminalExit = useCallback(
+    (event: { terminalId: string; exitCode: number }) => {
+      const terminalId = String(event?.terminalId || '').trim();
+      if (!terminalId) return;
+
+      const run = claudeAutoRunsRef.current.get(terminalId);
+      if (!run) return;
+
+      claudeAutoRunsRef.current.delete(terminalId);
+      claudeAutoTerminalTailRef.current.delete(terminalId);
+
+      void saveMvp5TaskStatus(run.specId, run.taskId, 'pending')
+        .then(() =>
+          showToast(`终端已退出（exitCode=${event.exitCode}），未检测到完成标记：${run.taskId}`),
+        )
+        .catch((e: any) => showToast(humanizeError(e)));
+    },
+    [saveMvp5TaskStatus, showToast],
+  );
+  const runPromptInClaudeAutoTerminal = useCallback(async (prompt: string, context: ClaudeAutoRunContext) => {
+    const normalizedPrompt = String(prompt || '')
+      .replace(/\r?\n/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
     setTasksToolsOpen(true);
     window.requestAnimationFrame(() => {
       tasksToolsDetailsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -2554,8 +2692,29 @@ export default function App() {
 
     const panel = terminalPanelRef.current;
     if (!panel) throw new Error('终端面板未就绪');
-    const created = await panel.createClaudeAutoTerminal();
-    await panel.sendTerminalInput(created.terminalId, `${prompt}\r`);
+    const specId = String(context?.specId || '').trim();
+    const taskId = String(context?.taskId || '').trim();
+    if (!specId || !taskId) throw new Error('任务上下文缺失');
+
+    const created = await panel.createClaudeAutoTerminalWithPrompt(normalizedPrompt, {
+      specName: specId,
+      taskId,
+    });
+
+    claudeAutoRunsRef.current.set(created.terminalId, {
+      specId,
+      taskId,
+      doneMarker: context.doneMarker,
+      failedMarker: context.failedMarker,
+    });
+    claudeAutoTerminalTailRef.current.set(created.terminalId, '');
+
+    try {
+      await saveMvp5TaskStatus(specId, taskId, 'running');
+    } catch (e: any) {
+      showToast(humanizeError(e));
+    }
+
     panel.focusTerminal(created.terminalId);
     return created;
   }, []);
@@ -4129,7 +4288,12 @@ export default function App() {
                   </div>
 
                   <div className="rounded-md border border-slate-800 bg-slate-950/30 p-2 text-xs text-slate-300">
-                    <TerminalPanel ref={terminalPanelRef} onOpenCliConfig={openCliConfig} />
+                    <TerminalPanel
+                      ref={terminalPanelRef}
+                      onOpenCliConfig={openCliConfig}
+                      onTerminalData={handleClaudeAutoTerminalData}
+                      onTerminalExit={handleClaudeAutoTerminalExit}
+                    />
                   </div>
                 </div>
               </details>

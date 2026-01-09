@@ -148,6 +148,10 @@ export type TerminalPanelHandle = {
   focusTerminal: (terminalId: string) => void;
   sendTerminalInput: (terminalId: string, input: string) => Promise<void>;
   createClaudeAutoTerminal: () => Promise<{ terminalId: string; title: string }>;
+  createClaudeAutoTerminalWithPrompt: (
+    prompt: string,
+    meta?: { specName?: string; taskId?: string },
+  ) => Promise<{ terminalId: string; title: string }>;
 };
 
 export function TerminalPanelInner(
@@ -155,7 +159,15 @@ export function TerminalPanelInner(
     className,
     heightClass = 'h-[520px]',
     onOpenCliConfig,
-  }: { className?: string; heightClass?: string; onOpenCliConfig?: () => void },
+    onTerminalExit,
+    onTerminalData,
+  }: {
+    className?: string;
+    heightClass?: string;
+    onOpenCliConfig?: () => void;
+    onTerminalExit?: (event: { terminalId: string; exitCode: number }) => void;
+    onTerminalData?: (event: { terminalId: string; seq: number | null; data: string }) => void;
+  },
   ref: ForwardedRef<TerminalPanelHandle>,
 ) {
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
@@ -591,6 +603,18 @@ export function TerminalPanelInner(
         const terminalId = await createTerminal(template, { kind: 'claude' });
         return { terminalId, title: template.title };
       },
+      createClaudeAutoTerminalWithPrompt: async (prompt: string, meta) => {
+        const initialPrompt = String(prompt || '').trim();
+        if (!initialPrompt) throw new Error('Prompt 不能为空');
+        const base = pickClaudeAutoTemplate();
+        const template = { ...base, args: [...base.args, initialPrompt] };
+        const terminalId = await createTerminal(template, {
+          kind: 'claude',
+          ...(meta?.specName ? { specName: meta.specName } : {}),
+          ...(meta?.taskId ? { taskId: meta.taskId } : {}),
+        });
+        return { terminalId, title: template.title };
+      },
     }),
     [createTerminal, listAssignableCliTerminals, sendTerminalInput, startCodexAtomicTask],
   );
@@ -786,14 +810,22 @@ export function TerminalPanelInner(
     socket.on('terminal:data', (payload: any) => {
       const terminalId = String(payload?.terminalId || '').trim();
       if (!terminalId) return;
-      const controller = controllersRef.current.get(terminalId);
-      if (!controller) return;
       const seq = Number(payload?.seq ?? 0);
+      const rawSeq = Number.isFinite(seq) && seq > 0 ? seq : null;
       if (Number.isFinite(seq) && seq > 0) {
+        onTerminalData?.({ terminalId, seq: rawSeq, data: String(payload?.data ?? '') });
+
+        const controller = controllersRef.current.get(terminalId);
+        if (!controller) return;
         if (seq <= controller.lastSeq) return;
         controller.lastSeq = seq;
       }
       const data = String(payload?.data ?? '');
+      if (rawSeq === null) {
+        onTerminalData?.({ terminalId, seq: null, data });
+      }
+      const controller = controllersRef.current.get(terminalId);
+      if (!controller) return;
       controller.terminal.write(data);
     });
 
@@ -808,6 +840,7 @@ export function TerminalPanelInner(
             : t,
         ),
       );
+      onTerminalExit?.({ terminalId, exitCode: Number.isFinite(exitCode) ? exitCode : -1 });
     });
 
     socket.on('connect_error', () => setConnected(false));
@@ -821,7 +854,7 @@ export function TerminalPanelInner(
       socketRef.current = null;
       setConnected(false);
     };
-  }, [mergeRemoteTerminals]);
+  }, [mergeRemoteTerminals, onTerminalData, onTerminalExit]);
 
   useEffect(() => {
     if (!tabs.length) {
