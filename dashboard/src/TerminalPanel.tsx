@@ -635,12 +635,8 @@ export function TerminalPanelInner(
           ...(meta?.taskId ? { taskId: meta.taskId } : {}),
         });
         // Claude Code 在 Windows 下会把 argv prompt 预填到输入框，但不会自动提交；补一个回车触发执行。
-        try {
-          await new Promise((resolve) => window.setTimeout(resolve, 650));
-          await sendTerminalInput(terminalId, '\r\n');
-        } catch {
-          // ignore
-        }
+        await new Promise((resolve) => window.setTimeout(resolve, 900));
+        await sendTerminalInput(terminalId, '\r');
         return { terminalId, title: template.title };
       },
     }),

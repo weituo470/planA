@@ -1208,7 +1208,114 @@ function registerCoreRoutes(app, ctx) {
       }
       return res.json(getTasksIterateStatus(job));
     });
-    
+
+    const ensureTasksContentHasFinalSummaryTask = (markdown) => {
+      const raw = typeof markdown === 'string' ? markdown : '';
+      if (!raw.trim()) return raw;
+      const lines = raw.replace(/\r\n/g, '\n').split('\n');
+      const findMarker = (marker) =>
+        lines.findIndex((line) => String(line || '').trim().toUpperCase() === marker);
+
+      const start = findMarker('## TASKS_JSON');
+      if (start < 0) return raw;
+      const endIdx = lines.findIndex(
+        (line, idx) =>
+          idx > start && String(line || '').trim().toUpperCase() === '## END_TASKS_JSON',
+      );
+      const end = endIdx > start ? endIdx : lines.length;
+
+      const blockLines = lines.slice(start + 1, end);
+      if (!blockLines.length) return raw;
+
+      const first = String(blockLines[0] || '').trim();
+      const last = String(blockLines[blockLines.length - 1] || '').trim();
+      const hasOpenFence = first.startsWith('```');
+      const hasCloseFence = last.startsWith('```');
+      const begin = hasOpenFence ? 1 : 0;
+      const finish = hasCloseFence ? blockLines.length - 1 : blockLines.length;
+      const jsonText = blockLines.slice(begin, finish).join('\n').trim();
+      if (!jsonText) return raw;
+
+      let payload = null;
+      try {
+        payload = JSON.parse(jsonText);
+      } catch {
+        payload = null;
+      }
+      if (!payload || typeof payload !== 'object' || !Array.isArray(payload.tasks)) return raw;
+      const rawTasks = Array.isArray(payload.tasks) ? payload.tasks.slice() : [];
+      if (!rawTasks.length) return raw;
+
+      const looksLikeSummaryTask = (task) => {
+        const title = String(task?.title || '').trim();
+        const description = String(task?.description || '').trim();
+        const text = `${title} ${description}`.trim();
+        if (!text) return false;
+        // 避免把普通任务里的“验收点/验收标准”等误判为收尾任务。
+        return /(总结|收尾|回归(验证|测试)|最终(修复|调试|回归|验收|检查)|final(\s+(check|qa))?|post[-\s]?check|regression(\s+test)?)/i.test(
+          text,
+        );
+      };
+
+      let summary = null;
+      for (let i = rawTasks.length - 1; i >= 0; i -= 1) {
+        if (!looksLikeSummaryTask(rawTasks[i])) continue;
+        summary = rawTasks[i];
+        rawTasks.splice(i, 1);
+        break;
+      }
+
+      const baseTasks = rawTasks;
+      const baseIds = baseTasks
+        .map((t) => String(t?.id || '').trim())
+        .filter(Boolean);
+
+      const defaultTitle = '最终修复与调试（收尾）';
+      const defaultDescription =
+        '输入：已完成的各模块交付物；输出：最终回归验证、修复残留问题、补齐必要日志/说明；验收：关键构建/健康检查通过，主要链路无明显异常。';
+
+      const ensureUniqueTaskId = (preferred) => {
+        const baseId = String(preferred || '').trim() || `task_${baseIds.length + 1}`;
+        let id = baseId;
+        let suffix = 2;
+        while (baseIds.includes(id)) {
+          id = `${baseId}_${suffix++}`;
+        }
+        return id;
+      };
+
+      if (!summary) {
+        summary = {
+          id: ensureUniqueTaskId(`task_${baseIds.length + 1}`),
+          title: defaultTitle,
+          description: defaultDescription,
+          dependencies: baseIds,
+          scope: [],
+          estimated_complexity: 'Medium',
+        };
+      } else {
+        summary = {
+          ...summary,
+          id: ensureUniqueTaskId(summary.id),
+          title: String(summary?.title || '').trim() || defaultTitle,
+          description: String(summary?.description || '').trim() || defaultDescription,
+          dependencies: baseIds,
+        };
+      }
+
+      const nextPayload = { ...payload, tasks: [...baseTasks, summary] };
+      const jsonLines = JSON.stringify(nextPayload, null, 2).split('\n');
+
+      const nextLines = [];
+      nextLines.push(...lines.slice(0, start + 1));
+      if (hasOpenFence) nextLines.push(blockLines[0]);
+      nextLines.push(...jsonLines);
+      if (hasCloseFence) nextLines.push(blockLines[blockLines.length - 1]);
+      nextLines.push(...lines.slice(end));
+
+      return nextLines.join('\n');
+    };
+
     app.get('/specs/:name/:artifact', (req, res) => {
       const specName = sanitizeSpecName(req.params.name);
       const artifact = req.params.artifact;
@@ -1258,6 +1365,24 @@ function registerCoreRoutes(app, ctx) {
       if (artifact === 'design') {
         const status = readSpecStatus(specName);
         ensureTechStackClarificationsSeeded(specName, status, status.prompt, content);
+      }
+      if (artifact === 'tasks') {
+        try {
+          const next = ensureTasksContentHasFinalSummaryTask(content);
+          if (typeof next === 'string' && next !== content) {
+            content = next;
+            writeSpecFile(specName, 'tasks', content);
+            emitEvent('log:append', {
+              source: 'spec',
+              message: `[spec] injected final summary task into ${specName}/tasks`,
+            });
+          }
+        } catch (error) {
+          emitEvent('log:append', {
+            source: 'spec',
+            message: `[spec] tasks read post-process failed: ${error?.message || String(error)}`,
+          });
+        }
       }
       return res.json({ content });
     });
@@ -2082,7 +2207,18 @@ function registerCoreRoutes(app, ctx) {
         return res.status(409).json({ error: 'Design not confirmed' });
       }
       ensureSpecStatus(specName);
-      const content = typeof req.body?.content === 'string' ? req.body.content : '';
+
+      let content = typeof req.body?.content === 'string' ? req.body.content : '';
+      if (artifact === 'tasks') {
+        try {
+          content = ensureTasksContentHasFinalSummaryTask(content);
+        } catch (error) {
+          emitEvent('log:append', {
+            source: 'spec',
+            message: `[spec] tasks save post-process failed: ${error?.message || String(error)}`,
+          });
+        }
+      }
       const filePath = resolveSpecFile(specName, artifact);
       fs.mkdirSync(resolveSpecDir(specName), { recursive: true });
       fs.writeFileSync(filePath, content, 'utf8');

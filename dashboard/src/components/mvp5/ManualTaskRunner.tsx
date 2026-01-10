@@ -585,6 +585,12 @@ export function ManualTaskRunner({
     setSingleAgentPrompt((prev) => ({ ...prev, loading: true, error: null }));
     if (singleAgentPromptDetailsRef.current) {
       singleAgentPromptDetailsRef.current.open = true;
+      window.requestAnimationFrame(() => {
+        singleAgentPromptDetailsRef.current?.scrollIntoView({
+          behavior: 'smooth',
+          block: 'start',
+        });
+      });
     }
     try {
       const body = {
@@ -1155,7 +1161,7 @@ export function ManualTaskRunner({
               taskStatusById={taskStatusByIdForDag}
               taskActionsById={taskActionsByIdForDag}
               resetKey={dagResetKey}
-              height={420}
+              height={560}
             />
           </div>
         ) : (

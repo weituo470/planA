@@ -4653,7 +4653,10 @@ function looksLikeDagFinalSummaryTask(task) {
   const description = String(task?.description || '').trim();
   const text = `${title} ${description}`.trim();
   if (!text) return false;
-  return /(总结|收尾|回归|最终|验收|调试|修复|final|post[-\s]?check|qa|regression)/i.test(text);
+  // Avoid false positives like "验收点/验收标准" in normal task descriptions.
+  return /(总结|收尾|回归(验证|测试)|最终(修复|调试|回归|验收|检查)|final(\s+(check|qa))?|post[-\s]?check|regression(\s+test)?)/i.test(
+    text,
+  );
 }
 
 function ensureDagFinalSummaryTask(tasks, options = {}) {

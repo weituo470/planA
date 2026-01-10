@@ -394,7 +394,7 @@ function registerMvp5Routes(app, ctx) {
           String(req.query?.includeDoc || '').trim().toLowerCase() === 'true' ||
           req.body?.includeDoc === true;
     
-        const dagTasks = parseDagTasksFromTasksContent(tasksContent);
+        let dagTasks = parseDagTasksFromTasksContent(tasksContent);
         if (!dagTasks || dagTasks.length === 0) {
           return res.status(400).json({
             error:
@@ -494,13 +494,61 @@ function registerMvp5Routes(app, ctx) {
         );
         const projectDirForPrompt = normalizePathForPrompt(projectDir);
     
-        const dagTasks = parseDagTasksFromTasksContent(tasksContent);
+        let dagTasks = parseDagTasksFromTasksContent(tasksContent);
         if (!dagTasks || dagTasks.length === 0) {
           return res.status(400).json({
             error:
               '没有有效的任务：请在 tasks.md 的 ## TASKS_JSON 块中提供 { "tasks": [...] }。',
           });
         }
+    
+        // 确保存在“收尾”任务：避免仅在“任务迭代”后才出现。
+        const looksLikeSummaryTask = (task) => {
+          const title = String(task?.title || '').trim();
+          const description = String(task?.description || '').trim();
+          const text = `${title} ${description}`.trim();
+          if (!text) return false;
+          // 避免把普通任务里的“验收点/验收标准”等误判为收尾任务。
+          return /(总结|收尾|回归(验证|测试)|最终(修复|调试|回归|验收|检查)|final(\s+(check|qa))?|post[-\s]?check|regression(\s+test)?)/i.test(text);
+        };
+        const baseTasks = Array.isArray(dagTasks) ? dagTasks.slice() : [];
+        let summary = null;
+        for (let i = baseTasks.length - 1; i >= 0; i -= 1) {
+          if (!looksLikeSummaryTask(baseTasks[i])) continue;
+          summary = baseTasks[i];
+          baseTasks.splice(i, 1);
+          break;
+        }
+        const baseIds = baseTasks.map((t) => String(t?.id || '').trim()).filter(Boolean);
+        const defaultTitle = '最终修复与调试（收尾）';
+        const defaultDescription =
+          '输入：已完成的各模块交付物；输出：最终回归验证、修复残留问题、补齐必要日志/说明；验收：关键构建/健康检查通过，主要链路无明显异常。';
+        const ensureUniqueTaskId = (preferred) => {
+          const baseId = String(preferred || '').trim() || `task_${baseIds.length + 1}`;
+          let id = baseId;
+          let suffix = 2;
+          while (baseIds.includes(id)) id = `${baseId}_${suffix++}`;
+          return id;
+        };
+        if (!summary) {
+          summary = {
+            id: ensureUniqueTaskId(`task_${baseIds.length + 1}`),
+            title: defaultTitle,
+            description: defaultDescription,
+            dependencies: baseIds,
+            scope: [],
+            estimated_complexity: 'Medium',
+          };
+        } else {
+          summary = {
+            ...summary,
+            id: ensureUniqueTaskId(summary.id),
+            title: String(summary?.title || '').trim() || defaultTitle,
+            description: String(summary?.description || '').trim() || defaultDescription,
+            dependencies: baseIds,
+          };
+        }
+        dagTasks = [...baseTasks, summary];
     
         const taskIds = dagTasks.map((t) => String(t?.id || '').trim()).filter(Boolean);
         const idSet = new Set(taskIds);

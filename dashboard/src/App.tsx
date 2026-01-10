@@ -2611,6 +2611,12 @@ export default function App() {
     if (activeArtifact === 'tasks') setTasksToolsOpen(false);
   }, [activeArtifact]);
 
+  const mvp5TasksContentRef = useRef<string>('');
+  useEffect(() => {
+    mvp5TasksContentRef.current = String(artifactContent.tasks ?? '');
+  }, [artifactContent.tasks]);
+  const mvp5TaskStatusQueueRef = useRef<Promise<void>>(Promise.resolve());
+
   type ClaudeAutoRunContext = {
     specId: string;
     taskId: string;
@@ -2646,7 +2652,71 @@ export default function App() {
       }
       list[idx] = nextTask;
 
-      const nextPayload = { ...payload, tasks: list };
+      const ensureFinalSummaryTask = (rawTasks: any[]) => {
+        const tasks = Array.isArray(rawTasks) ? rawTasks.slice() : [];
+        if (!tasks.length) return tasks;
+
+        const looksLikeSummaryTask = (task: any) => {
+          const title = String(task?.title || '').trim();
+          const description = String(task?.description || '').trim();
+          const text = `${title} ${description}`.trim();
+          if (!text) return false;
+          // 避免把普通任务里的“验收点/验收标准”等误判为收尾任务。
+          return /(总结|收尾|回归(验证|测试)|最终(修复|调试|回归|验收|检查)|final(\s+(check|qa))?|post[-\s]?check|regression(\s+test)?)/i.test(
+            text,
+          );
+        };
+
+        let summary: any = null;
+        for (let i = tasks.length - 1; i >= 0; i -= 1) {
+          if (!looksLikeSummaryTask(tasks[i])) continue;
+          summary = tasks[i];
+          tasks.splice(i, 1);
+          break;
+        }
+
+        const baseTasks = tasks;
+        const baseIds = baseTasks
+          .map((t) => String(t?.id || '').trim())
+          .filter(Boolean);
+
+        const defaultTitle = '最终修复与调试（收尾）';
+        const defaultDescription =
+          '输入：已完成的各模块交付物；输出：最终回归验证、修复残留问题、补齐必要日志/说明；验收：关键构建/健康检查通过，主要链路无明显异常。';
+
+        const ensureUniqueTaskId = (preferred: string) => {
+          const baseId = String(preferred || '').trim() || `task_${baseIds.length + 1}`;
+          let id = baseId;
+          let suffix = 2;
+          while (baseIds.includes(id)) {
+            id = `${baseId}_${suffix++}`;
+          }
+          return id;
+        };
+
+        if (!summary) {
+          summary = {
+            id: ensureUniqueTaskId(`task_${baseIds.length + 1}`),
+            title: defaultTitle,
+            description: defaultDescription,
+            dependencies: baseIds,
+            scope: [],
+            estimated_complexity: 'Medium',
+          };
+        } else {
+          summary = {
+            ...summary,
+            id: ensureUniqueTaskId(summary.id),
+            title: String(summary?.title || '').trim() || defaultTitle,
+            description: String(summary?.description || '').trim() || defaultDescription,
+            dependencies: baseIds,
+          };
+        }
+
+        return [...baseTasks, summary];
+      };
+
+      const nextPayload = { ...payload, tasks: ensureFinalSummaryTask(list) };
       return replaceTasksJsonInContent(content, nextPayload);
     },
     [],
@@ -2658,31 +2728,38 @@ export default function App() {
       const normalizedTaskId = String(taskId || '').trim();
       if (!normalizedSpecId || !normalizedTaskId) return;
 
-      const isCurrentSpec = normalizedSpecId === selectedSpecName;
-      let baseContent = isCurrentSpec ? String(artifactContent.tasks ?? '') : '';
-      if (!isCurrentSpec) {
-        const data = await apiJson<{ content?: string }>(
+      const runOnce = async () => {
+        const isCurrentSpec = normalizedSpecId === selectedSpecName;
+        let baseContent = isCurrentSpec ? String(mvp5TasksContentRef.current ?? '') : '';
+        if (!isCurrentSpec) {
+          const data = await apiJson<{ content?: string }>(
+            `/specs/${encodeURIComponent(normalizedSpecId)}/tasks`,
+            undefined,
+            12000,
+          );
+          baseContent = String(data?.content ?? '');
+        }
+
+        const nextContent = patchMvp5TasksContent(baseContent, normalizedTaskId, status);
+        if (!nextContent) throw new Error(`tasks.md 更新失败：${normalizedTaskId}`);
+
+        if (isCurrentSpec) {
+          mvp5TasksContentRef.current = nextContent;
+          setArtifactContent((prev) => ({ ...prev, tasks: nextContent }));
+        }
+
+        await apiJson(
           `/specs/${encodeURIComponent(normalizedSpecId)}/tasks`,
-          undefined,
+          { method: 'POST', body: JSON.stringify({ content: nextContent }) },
           12000,
         );
-        baseContent = String(data?.content ?? '');
-      }
+      };
 
-      const nextContent = patchMvp5TasksContent(baseContent, normalizedTaskId, status);
-      if (!nextContent) throw new Error(`tasks.md 更新失败：${normalizedTaskId}`);
-
-      if (isCurrentSpec) {
-        setArtifactContent((prev) => ({ ...prev, tasks: nextContent }));
-      }
-
-      await apiJson(
-        `/specs/${encodeURIComponent(normalizedSpecId)}/tasks`,
-        { method: 'POST', body: JSON.stringify({ content: nextContent }) },
-        12000,
-      );
+      const queued = mvp5TaskStatusQueueRef.current.then(runOnce, runOnce);
+      mvp5TaskStatusQueueRef.current = queued;
+      await queued;
     },
-    [artifactContent.tasks, patchMvp5TasksContent, selectedSpecName],
+    [patchMvp5TasksContent, selectedSpecName],
   );
 
   const handleClaudeAutoTerminalData = useCallback(
@@ -2753,10 +2830,23 @@ export default function App() {
     const taskId = String(context?.taskId || '').trim();
     if (!specId || !taskId) throw new Error('任务上下文缺失');
 
-    const created = await panel.createClaudeAutoTerminalWithPrompt(normalizedPrompt, {
-      specName: specId,
-      taskId,
-    });
+    // 先写回任务状态，避免出现“终端已启动但任务仍显示可开始”的不一致。
+    await saveMvp5TaskStatus(specId, taskId, 'running');
+
+    let created: { terminalId: string; title: string };
+    try {
+      created = await panel.createClaudeAutoTerminalWithPrompt(normalizedPrompt, {
+        specName: specId,
+        taskId,
+      });
+    } catch (error) {
+      try {
+        await saveMvp5TaskStatus(specId, taskId, 'pending');
+      } catch (rollbackError: any) {
+        showToast(`启动失败且状态回滚失败：${humanizeError(rollbackError)}`);
+      }
+      throw error;
+    }
 
     claudeAutoRunsRef.current.set(created.terminalId, {
       specId,
@@ -2765,12 +2855,6 @@ export default function App() {
       failedMarker: context.failedMarker,
     });
     claudeAutoTerminalTailRef.current.set(created.terminalId, '');
-
-    try {
-      await saveMvp5TaskStatus(specId, taskId, 'running');
-    } catch (e: any) {
-      showToast(humanizeError(e));
-    }
 
     panel.focusTerminal(created.terminalId);
     return created;
