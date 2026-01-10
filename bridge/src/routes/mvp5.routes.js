@@ -441,6 +441,7 @@ function registerMvp5Routes(app, ctx) {
         }
         const prompt = [
           `请按任务文档（绝对路径）${runDocPathAbs} 实现该任务，完成后自检并用简短要点总结变更与验证结果。`,
+          '注意：修改已存在文件前先读取内容，再做最小化修改（避免 “Write 未 Read” 类工具冲突）。',
           projectDirForPrompt ? `建议工作目录：${projectDirForPrompt}` : null,
         ]
           .filter(Boolean)
@@ -466,6 +467,171 @@ function registerMvp5Routes(app, ctx) {
       } catch (error) {
         console.error('[MVP5] task-prompt error:', error);
         return res.status(500).json({ error: error?.message || 'Failed to generate prompt' });
+      }
+    });
+    
+    /**
+     * POST /api/mvp5/single-agent-prompt
+     * 从 tasks.md（TASKS_JSON）生成“单个 CLI agent 顺序执行整个 DAG”的提示词
+     */
+    app.post('/api/mvp5/single-agent-prompt', (req, res) => {
+      try {
+        const specName = sanitizeSpecName(req.body?.specId ?? req.body?.specName ?? req.query?.specId);
+        if (!specName) {
+          return res.status(400).json({ error: 'specId is required' });
+        }
+    
+        const tasksContent = typeof req.body?.tasksContent === 'string' ? req.body.tasksContent : '';
+        if (!tasksContent.trim()) {
+          return res.status(400).json({ error: 'tasksContent is required' });
+        }
+    
+        const projectDir = normalizeTerminalCwd(
+          req.body?.cwd ??
+            req.body?.projectDir ??
+            (typeof req.query?.cwd === 'string' ? req.query.cwd : '') ??
+            (typeof req.query?.projectDir === 'string' ? req.query.projectDir : ''),
+        );
+        const projectDirForPrompt = normalizePathForPrompt(projectDir);
+    
+        const dagTasks = parseDagTasksFromTasksContent(tasksContent);
+        if (!dagTasks || dagTasks.length === 0) {
+          return res.status(400).json({
+            error:
+              '没有有效的任务：请在 tasks.md 的 ## TASKS_JSON 块中提供 { "tasks": [...] }。',
+          });
+        }
+    
+        const taskIds = dagTasks.map((t) => String(t?.id || '').trim()).filter(Boolean);
+        const idSet = new Set(taskIds);
+        const byId = new Map(dagTasks.map((t) => [String(t?.id || '').trim(), t]));
+    
+        const out = new Map(taskIds.map((id) => [id, []]));
+        const inDegree = new Map(taskIds.map((id) => [id, 0]));
+        const unknownDeps = [];
+    
+        for (const task of dagTasks) {
+          const id = String(task?.id || '').trim();
+          if (!id) continue;
+          const deps = Array.isArray(task?.dependencies)
+            ? task.dependencies.map((v) => String(v || '').trim()).filter(Boolean)
+            : [];
+          for (const depId of deps) {
+            if (!idSet.has(depId)) {
+              unknownDeps.push({ taskId: id, depId });
+              continue;
+            }
+            const list = out.get(depId);
+            if (list) list.push(id);
+            inDegree.set(id, (inDegree.get(id) ?? 0) + 1);
+          }
+        }
+    
+        if (unknownDeps.length) {
+          return res.status(400).json({
+            error: 'DAG 依赖引用了不存在的任务 id',
+            details: unknownDeps.slice(0, 80),
+          });
+        }
+    
+        const suffixNumber = (id) => {
+          const match = /^task_(\d+)$/.exec(String(id || '').trim());
+          if (!match) return Number.POSITIVE_INFINITY;
+          const n = Number(match[1]);
+          return Number.isFinite(n) ? n : Number.POSITIVE_INFINITY;
+        };
+        const compareTaskId = (a, b) => {
+          const na = suffixNumber(a);
+          const nb = suffixNumber(b);
+          if (na !== nb) return na - nb;
+          return String(a || '').localeCompare(String(b || ''), 'en');
+        };
+    
+        const queue = taskIds.filter((id) => (inDegree.get(id) ?? 0) === 0).sort(compareTaskId);
+        const order = [];
+        while (queue.length) {
+          const id = queue.shift();
+          if (!id) continue;
+          order.push(id);
+          const outs = out.get(id) || [];
+          for (const to of outs) {
+            const next = (inDegree.get(to) ?? 0) - 1;
+            inDegree.set(to, next);
+            if (next === 0) {
+              queue.push(to);
+              queue.sort(compareTaskId);
+            }
+          }
+        }
+    
+        if (order.length !== taskIds.length) {
+          const cycleNodes = taskIds.filter((id) => (inDegree.get(id) ?? 0) > 0).sort(compareTaskId);
+          return res.status(400).json({
+            error: 'DAG 存在环（循环依赖），无法生成单AGENT执行顺序',
+            cycle: cycleNodes,
+          });
+        }
+    
+        const truncateInline = (value, maxLen = 900) => {
+          const text = String(value ?? '').trim().replace(/\s+/g, ' ');
+          if (text.length <= maxLen) return text;
+          return `${text.slice(0, Math.max(1, maxLen - 1)).trimEnd()}…`;
+        };
+    
+        const lines = [];
+        lines.push('你是一个单 Agent 的 CLI 开发助手。');
+        if (projectDirForPrompt) lines.push(`工作目录（建议）：${projectDirForPrompt}`);
+        lines.push('');
+        lines.push('目标：按 DAG 依赖顺序完成全部任务；最后执行“最终修复与调试（收尾）”。');
+        lines.push('');
+        lines.push('硬性约束（必须遵守）：');
+        lines.push('- 不要使用任何兜底/猜测/编造输出；有问题就明确报错并停止。');
+        lines.push('- 修改“已存在文件”前先读取内容，再做最小化 diff/patch；不要直接覆盖写入（避免 “Write 未 Read” 冲突）。');
+        lines.push('- 严格串行执行（单 Agent），不要并发。');
+        lines.push('- 优先只修改当前任务 scope 内文件/目录；若必须越界，先说明原因与影响。');
+        lines.push('');
+        lines.push('执行顺序（拓扑）：');
+        lines.push(order.map((id, idx) => `${idx + 1}. ${id}`).join('\n'));
+        lines.push('');
+        lines.push('任务清单（按顺序）：');
+        for (const id of order) {
+          const task = byId.get(id);
+          if (!task) continue;
+          const title = String(task?.title || '').trim();
+          const desc = truncateInline(task?.description || '', 1200);
+          const deps = Array.isArray(task?.dependencies)
+            ? task.dependencies.map((v) => String(v || '').trim()).filter(Boolean)
+            : [];
+          const scope = Array.isArray(task?.scope)
+            ? task.scope.map((v) => String(v || '').trim()).filter(Boolean)
+            : [];
+          const complexity = task?.estimated_complexity ? String(task.estimated_complexity).trim() : '';
+          lines.push(`- ${id}${title ? `｜${title}` : ''}`);
+          lines.push(`  - description: ${desc || '（无描述）'}`);
+          if (deps.length) lines.push(`  - dependencies: ${deps.join(', ')}`);
+          if (scope.length) lines.push(`  - scope: ${scope.join(', ')}`);
+          if (complexity) lines.push(`  - estimated_complexity: ${complexity}`);
+        }
+        lines.push('');
+        lines.push('每完成一个任务后：');
+        lines.push('- 做一次最小自测（按项目现有脚本/健康检查），记录结果。');
+        lines.push('- 如需写回进度：更新 tasks.md 的 TASKS_JSON（status/done/doneAt）。');
+        lines.push('- 在回复最后单独输出一行：[[TASK_DONE <TASK_ID>]]；失败则输出：[[TASK_FAILED <TASK_ID>]]。');
+        lines.push('');
+        lines.push('现在开始执行第 1 个任务。');
+    
+        const prompt = lines.join('\n').trim();
+        return res.json({
+          ok: true,
+          specId: specName,
+          projectDir: projectDirForPrompt,
+          tasksCount: dagTasks.length,
+          order,
+          prompt,
+        });
+      } catch (error) {
+        console.error('[MVP5] single-agent-prompt error:', error);
+        return res.status(500).json({ error: error?.message || 'Failed to generate single-agent prompt' });
       }
     });
     
@@ -638,6 +804,12 @@ function registerMvp5Routes(app, ctx) {
       lines.push('## 执行要求');
       lines.push('- 以本任务为“闭环交付物”，不要做微观步骤拆解。');
       lines.push('- 按仓库既有约束实现与自测；必要时补充最小可行验证步骤。');
+      lines.push(
+        '- 为避免开发冲突：优先只修改本任务 scope 列表内的文件/目录；若必须修改 scope 外内容，先停止并在终端说明原因与影响。',
+      );
+      lines.push(
+        '- 为避免工具冲突：修改“已存在文件”前先读取其内容，再做最小化修改（优先用 diff/patch）；不要直接覆盖写入（避免出现 “Write 未 Read” 类错误）。',
+      );
       lines.push(
         '- 完成后输出“关键变更/验证方式/验证结果”；如运行环境允许访问 spec 文件，再回写到 tasks.md（建议追加到对应任务条目下）。',
       );

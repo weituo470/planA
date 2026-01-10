@@ -2518,10 +2518,13 @@ async function runTasksIterateJob(specName, runId, job, options = {}) {
       throw new Error(`LLM tasks iterate output invalid: ${String(content).slice(0, 240)}`);
     }
 
-    const trimmed = normalized.slice(0, 25);
+    const maxTotalTasks = 25;
+    // Reserve 1 slot for the final summary/debug task.
+    const baseMaxTasks = Math.min(Math.max(1, maxTotalTasks - 1), 24);
+    const trimmed = normalized.slice(0, baseMaxTasks);
     const renumbered = renumberDagTasksToTaskSequence(trimmed, { prefix: 'task_' });
     const idSet = new Set(renumbered.map((t) => t.id));
-    const finalTasks = renumbered.map((t) => {
+    const baseTasks = renumbered.map((t) => {
       const deps = Array.isArray(t.dependencies) ? t.dependencies : [];
       const dependencies = Array.from(
         new Set(
@@ -2533,10 +2536,12 @@ async function runTasksIterateJob(specName, runId, job, options = {}) {
       const scope = Array.from(new Set(Array.isArray(t.scope) ? t.scope : [])).slice(0, 32);
       return { ...t, dependencies, scope };
     });
+    const finalTasks = ensureDagFinalSummaryTask(baseTasks, { maxTasks: maxTotalTasks });
 
     const notes = [
       `由 Claude 4.5 Opus 基于评分迭代生成（from runId: ${id}）`,
       userNote ? '包含用户补充修改意见' : null,
+      '已自动追加“最终修复与调试（收尾）”任务',
     ].filter(Boolean);
     const tasksMarkdown = buildTasksDagMarkdown({ tasks: finalTasks }, { notes });
     writeSpecFile(specName, 'tasks', tasksMarkdown);
@@ -4020,6 +4025,15 @@ function generateTasksContent(design, prompt) {
       scope: [],
       estimated_complexity: 'Low',
     },
+    {
+      id: 'task_7',
+      title: '最终修复与调试（收尾）',
+      description:
+        '在所有任务完成后进行最后的修复与调试，补齐必要的回归验证与问题记录，确保交付状态稳定。',
+      dependencies: ['task_1', 'task_2', 'task_3', 'task_4', 'task_5', 'task_6'],
+      scope: [],
+      estimated_complexity: 'Medium',
+    },
   ];
 
   const notes = [
@@ -4632,6 +4646,71 @@ function renumberDagTasksToTaskSequence(tasks, options = {}) {
       .filter(Boolean);
     return { ...t, id, dependencies };
   });
+}
+
+function looksLikeDagFinalSummaryTask(task) {
+  const title = String(task?.title || '').trim();
+  const description = String(task?.description || '').trim();
+  const text = `${title} ${description}`.trim();
+  if (!text) return false;
+  return /(总结|收尾|回归|最终|验收|调试|修复|final|post[-\s]?check|qa|regression)/i.test(text);
+}
+
+function ensureDagFinalSummaryTask(tasks, options = {}) {
+  const list = Array.isArray(tasks) ? tasks.slice() : [];
+  const maxTasks = Number.isFinite(options?.maxTasks) ? Math.max(1, Math.floor(options.maxTasks)) : 25;
+  if (!list.length) return list;
+
+  let summary = null;
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const task = list[i];
+    if (looksLikeDagFinalSummaryTask(task)) {
+      summary = task;
+      list.splice(i, 1);
+      break;
+    }
+  }
+
+  while (list.length >= maxTasks) {
+    list.pop();
+  }
+
+  const dependencies = list.map((t) => t.id);
+  const defaultDescription =
+    '输入：已完成的各模块交付物；输出：最终回归验证、修复残留问题、补齐必要日志/说明；验收：关键构建/健康检查通过，主要链路无明显异常。';
+
+  if (!summary) {
+    const baseId = `task_${dependencies.length + 1}`;
+    const seen = new Set(dependencies);
+    let id = baseId;
+    let suffix = 2;
+    while (seen.has(id)) id = `${baseId}_${suffix++}`;
+
+    summary = {
+      id,
+      title: '最终修复与调试（收尾）',
+      description: defaultDescription,
+      dependencies,
+      scope: [],
+      estimated_complexity: 'Medium',
+    };
+  } else {
+    const title = String(summary?.title || '').trim() || '最终修复与调试（收尾）';
+    const description = String(summary?.description || '').trim() || defaultDescription;
+    summary = {
+      ...summary,
+      title,
+      description,
+      dependencies,
+      scope: Array.isArray(summary?.scope) ? summary.scope : [],
+      estimated_complexity:
+        typeof summary?.estimated_complexity === 'string' && summary.estimated_complexity.trim()
+          ? summary.estimated_complexity.trim()
+          : 'Medium',
+    };
+  }
+
+  return [...list, summary];
 }
 
 function extractTasksJsonBlockFromMarkdown(markdown) {
@@ -5639,10 +5718,13 @@ async function generateTasksWithModel(design, prompt, options = {}) {
       throw err;
     }
 
-    const trimmed = normalized.slice(0, Math.min(maxTasks, 25));
+    const maxTotalTasks = Math.min(maxTasks, 25);
+    // Reserve 1 slot for the final summary/debug task.
+    const baseMaxTasks = Math.min(Math.max(1, maxTotalTasks - 1), 24);
+    const trimmed = normalized.slice(0, baseMaxTasks);
     const renumbered = renumberDagTasksToTaskSequence(trimmed, { prefix: 'task_' });
     const idSet = new Set(renumbered.map((t) => t.id));
-    const finalTasks = renumbered.map((t) => {
+    const baseTasks = renumbered.map((t) => {
       const deps = Array.isArray(t.dependencies) ? t.dependencies : [];
       const dependencies = Array.from(
         new Set(
@@ -5654,6 +5736,7 @@ async function generateTasksWithModel(design, prompt, options = {}) {
       const scope = Array.from(new Set(Array.isArray(t.scope) ? t.scope : [])).slice(0, 32);
       return { ...t, dependencies, scope };
     });
+    const finalTasks = ensureDagFinalSummaryTask(baseTasks, { maxTasks: maxTotalTasks });
 
     const notes = [];
     if (finalTasks.length < Math.min(minTasks, maxTasks)) {

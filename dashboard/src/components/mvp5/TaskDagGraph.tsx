@@ -100,6 +100,14 @@ function statusBadgeClass(status: TaskVisualStatus) {
   return 'bg-slate-800/80 text-slate-300 ring-1 ring-slate-700';
 }
 
+function formatTaskIdList(ids: string[], max = 3) {
+  const list = ids.map((v) => String(v || '').trim()).filter(Boolean);
+  const shown = list.slice(0, Math.max(1, Math.floor(max)));
+  const rest = Math.max(0, list.length - shown.length);
+  const text = rest > 0 ? `${shown.join(', ')} 等${rest}个` : shown.join(', ');
+  return { text, full: list.join(', ') };
+}
+
 function dependencyIdsForTask(graph: TaskGraph, taskId: string) {
   const fromAdj = (graph?.adjacency?.[taskId]?.in ?? [])
     .filter((edge) => String((edge as any)?.type ?? '').trim() !== 'conflict')
@@ -277,6 +285,9 @@ export function TaskDagGraph({
       const status = taskStatusById?.[t.id] ?? 'pending';
       const visualStatus = deriveTaskVisualStatus(t.id, status, graph, taskStatusById);
       const actions = taskActionsById?.[t.id];
+      const deps = dependencyIdsForTask(graph, t.id);
+      const missingDeps = deps.filter((depId) => (taskStatusById?.[depId] ?? 'pending') !== 'completed');
+      const blockedInfo = missingDeps.length ? formatTaskIdList(missingDeps, 3) : null;
       return {
         id: t.id,
         type: 'default',
@@ -311,26 +322,34 @@ export function TaskDagGraph({
                   className={`rounded px-2 py-0.5 text-[13px] font-light ${statusBadgeClass(
                     visualStatus,
                   )}`}
+                 >
+                   {visualStatus === 'running' ? (
+                     <span className="inline-flex items-center gap-1" title="进行中">
+                       <Cog
+                         className="h-[18px] w-[18px] animate-spin text-blue-300 drop-shadow-[0_0_6px_rgba(59,130,246,0.55)]"
+                         style={{ animationDuration: '2s' }}
+                         strokeWidth={1.25}
+                         aria-hidden="true"
+                       />
+                       <span>进行中</span>
+                     </span>
+                   ) : (
+                     statusLabel(visualStatus)
+                   )}
+                 </span>
+               </div>
+              {visualStatus === 'blocked' && blockedInfo ? (
+                <div
+                  className="mt-1 truncate text-[11px] font-light text-amber-200/90"
+                  title={`被阻塞：${blockedInfo.full}`}
                 >
-                  {visualStatus === 'running' ? (
-                    <span className="inline-flex items-center gap-1" title="进行中">
-                      <Cog
-                        className="h-[18px] w-[18px] animate-spin text-blue-300 drop-shadow-[0_0_6px_rgba(59,130,246,0.55)]"
-                        style={{ animationDuration: '2s' }}
-                        strokeWidth={1.25}
-                        aria-hidden="true"
-                      />
-                      <span>进行中</span>
-                    </span>
-                  ) : (
-                    statusLabel(visualStatus)
-                  )}
-                </span>
-              </div>
-              <div className="flex-1" />
-              {actionsEnabled && actions ? (
-                <div className="mt-1.5 flex items-center gap-2">
-                  {actions.start ? (
+                  被阻塞：{blockedInfo.text}
+                </div>
+              ) : null}
+               <div className="flex-1" />
+               {actionsEnabled && actions ? (
+                 <div className="mt-1.5 flex items-center gap-2">
+                   {actions.start ? (
                     <button
                       type="button"
                       className="pointer-events-auto inline-flex h-7 items-center justify-center gap-1 rounded border border-accent/30 bg-accent/15 px-2.5 text-[13px] font-light text-slate-100 transition-colors hover:bg-accent/25 disabled:cursor-not-allowed disabled:opacity-40"

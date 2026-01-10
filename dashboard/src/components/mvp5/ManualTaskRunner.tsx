@@ -36,6 +36,15 @@ type PromptResponse = {
   error?: string;
 };
 
+type SingleAgentPromptResponse = {
+  ok?: boolean;
+  prompt?: string;
+  order?: string[];
+  tasksCount?: number;
+  projectDir?: string;
+  error?: string;
+};
+
 function tryParseJson(text: string) {
   try {
     return JSON.parse(text);
@@ -70,6 +79,45 @@ function normalizeDagTask(input: any, index: number): DagTask | null {
   const done = obj.done === true || status === 'completed';
   const doneAt = typeof obj.doneAt === 'string' ? obj.doneAt.trim() : undefined;
   return { id, title, description, dependencies, scope, estimated_complexity, status: done ? 'completed' : status, done, doneAt };
+}
+
+function normalizeScopePathForConflict(value: string) {
+  return String(value ?? '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/\/+/g, '/')
+    .replace(/^\.\/+/, '')
+    .replace(/\/$/, '')
+    .toLowerCase();
+}
+
+function scopesMayConflict(a: string, b: string) {
+  const left = normalizeScopePathForConflict(a);
+  const right = normalizeScopePathForConflict(b);
+  if (!left || !right) return false;
+  if (left === right) return true;
+  if (left.startsWith(`${right}/`)) return true;
+  if (right.startsWith(`${left}/`)) return true;
+  return false;
+}
+
+function scopeListsMayConflict(a: string[], b: string[]) {
+  // scope 为空时无法判断，保守处理为“可能冲突”，避免并发改动导致冲突。
+  if (!a.length || !b.length) return true;
+  for (const sa of a) {
+    for (const sb of b) {
+      if (scopesMayConflict(sa, sb)) return true;
+    }
+  }
+  return false;
+}
+
+function formatTaskIdList(ids: string[], max = 3) {
+  const list = ids.map((v) => String(v || '').trim()).filter(Boolean);
+  const shown = list.slice(0, Math.max(1, Math.floor(max)));
+  const rest = Math.max(0, list.length - shown.length);
+  const text = rest > 0 ? `${shown.join(', ')} 等${rest}个` : shown.join(', ');
+  return { text, full: list.join(', ') };
 }
 
 function extractTasksJsonBlockFromMarkdown(markdown: string) {
@@ -391,6 +439,12 @@ export function ManualTaskRunner({
     runDocPathAbs?: string;
   } | null>(null);
   const [promptLoadingTaskId, setPromptLoadingTaskId] = useState<string | null>(null);
+  const [singleAgentPrompt, setSingleAgentPrompt] = useState<{
+    loading: boolean;
+    error: string | null;
+    prompt: string;
+  }>({ loading: false, error: null, prompt: '' });
+  const singleAgentPromptDetailsRef = useRef<HTMLDetailsElement | null>(null);
   const [dagExpanded, setDagExpanded] = useState(true);
   const [dagResetKey, setDagResetKey] = useState(0);
 
@@ -414,6 +468,10 @@ export function ManualTaskRunner({
 
   const handleResetTaskListView = useCallback(() => {
     setPromptForTask(null);
+    setSingleAgentPrompt({ loading: false, error: null, prompt: '' });
+    if (singleAgentPromptDetailsRef.current) {
+      singleAgentPromptDetailsRef.current.open = false;
+    }
     setTaskDetailsOpenById({});
     setTaskDocById({});
   }, []);
@@ -523,6 +581,44 @@ export function ManualTaskRunner({
     [specId, tasksContent, workspace?.effectiveCwd],
   );
 
+  const handleFetchSingleAgentPrompt = useCallback(async () => {
+    setSingleAgentPrompt((prev) => ({ ...prev, loading: true, error: null }));
+    if (singleAgentPromptDetailsRef.current) {
+      singleAgentPromptDetailsRef.current.open = true;
+    }
+    try {
+      const body = {
+        specId,
+        tasksContent,
+        projectDir: workspace?.effectiveCwd ?? undefined,
+      };
+      const res = await fetch(`${BRIDGE_URL}/api/mvp5/single-agent-prompt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = (await res.json()) as SingleAgentPromptResponse;
+      if (!res.ok) throw new Error(data?.error || '生成单AGENT提示词失败');
+      const prompt = String(data?.prompt || '').trim();
+      if (!prompt) throw new Error('生成单AGENT提示词失败：prompt 为空');
+      setSingleAgentPrompt({ loading: false, error: null, prompt });
+      onToast('已生成单AGENT提示词', 'info');
+    } catch (e: any) {
+      const message = String(e?.message || e || '生成单AGENT提示词失败');
+      setSingleAgentPrompt((prev) => ({ ...prev, loading: false, error: message }));
+      onToast(message, 'error');
+    } finally {
+      setSingleAgentPrompt((prev) => ({ ...prev, loading: false }));
+    }
+  }, [onToast, specId, tasksContent, workspace?.effectiveCwd]);
+
+  const handleCopySingleAgentPrompt = useCallback(async () => {
+    const prompt = String(singleAgentPrompt.prompt || '').trim();
+    if (!prompt) return;
+    const ok = await copyTextToClipboard(prompt);
+    onToast(ok ? '已复制单AGENT提示词' : '复制失败', ok ? 'info' : 'error');
+  }, [onToast, singleAgentPrompt.prompt]);
+
   const buildClaudePromptWithMarkers = useCallback((prompt: string, taskId: string) => {
     const doneMarker = `[[TASK_DONE ${taskId}]]`;
     const failedMarker = `[[TASK_FAILED ${taskId}]]`;
@@ -582,8 +678,30 @@ export function ManualTaskRunner({
         });
         if (!readyTasks.length) return;
 
-        onToast(`任务链：启动 ${readyTasks.map((t) => t.id).join(', ')}`, 'info');
+        const runningScopes = tasks
+          .filter((t) => (statusById.get(t.id) ?? 'pending') === 'running')
+          .map((t) => t.scope ?? []);
+        const selected: DagTask[] = [];
+        const selectedScopes: string[][] = [];
+        const skipped: DagTask[] = [];
         for (const task of readyTasks) {
+          const scope = task.scope ?? [];
+          const conflictsRunning = runningScopes.some((s) => scopeListsMayConflict(scope, s));
+          const conflictsSelected = selectedScopes.some((s) => scopeListsMayConflict(scope, s));
+          if (conflictsRunning || conflictsSelected) {
+            skipped.push(task);
+            continue;
+          }
+          selected.push(task);
+          selectedScopes.push(scope);
+        }
+        if (!selected.length) return;
+
+        const skippedText = skipped.length
+          ? `（跳过 scope 冲突：${skipped.map((t) => t.id).join(', ')}）`
+          : '';
+        onToast(`任务链：启动 ${selected.map((t) => t.id).join(', ')}${skippedText}`, 'info');
+        for (const task of selected) {
           if (pausedRef.current) break;
           try {
             await startTaskInClaudeAuto(task, `任务链(${reason})`);
@@ -882,6 +1000,14 @@ export function ManualTaskRunner({
           )}
         </div>
         <div className="ml-auto flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={Boolean(disabled) || singleAgentPrompt.loading}
+            onClick={() => void handleFetchSingleAgentPrompt()}
+          >
+            {singleAgentPrompt.loading ? '生成中…' : '获取单AGENT提示词'}
+          </Button>
           <Button size="sm" variant="ghost" onClick={handleResetTaskListView}>
             回到初始
           </Button>
@@ -896,6 +1022,54 @@ export function ManualTaskRunner({
           <pre className="max-h-[420px] overflow-auto whitespace-pre-wrap break-words rounded border border-slate-800 bg-slate-950 px-2 py-2 text-xs text-slate-100">
             {tasksContent || ''}
           </pre>
+        </div>
+      </details>
+
+      <details
+        ref={singleAgentPromptDetailsRef}
+        className="mb-3 rounded-md border border-slate-800 bg-slate-950/40 px-3 py-2"
+      >
+        <summary className="cursor-pointer select-none text-xs font-semibold text-slate-200">
+          单AGENT提示词（供单CLI工具顺序执行）
+        </summary>
+        <div className="mt-2">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <div className="text-xs text-slate-500">只包含必要信息，可直接复制给单个 CLI agent。</div>
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={Boolean(disabled) || singleAgentPrompt.loading}
+                onClick={() => void handleFetchSingleAgentPrompt()}
+              >
+                {singleAgentPrompt.loading ? '生成中…' : '刷新'}
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={!singleAgentPrompt.prompt}
+                onClick={() => void handleCopySingleAgentPrompt()}
+              >
+                复制
+              </Button>
+            </div>
+          </div>
+
+          {singleAgentPrompt.error ? (
+            <div className="mb-2 rounded border border-red-900/40 bg-red-950/20 px-2 py-1 text-xs text-red-200">
+              生成失败：{singleAgentPrompt.error}
+            </div>
+          ) : null}
+
+          {singleAgentPrompt.loading ? (
+            <div className="text-xs text-slate-500">生成中…</div>
+          ) : singleAgentPrompt.prompt ? (
+            <pre className="max-h-[420px] overflow-auto whitespace-pre-wrap break-words rounded border border-slate-800 bg-slate-950 px-2 py-2 text-xs text-slate-100">
+              {singleAgentPrompt.prompt}
+            </pre>
+          ) : (
+            <div className="text-xs text-slate-500">暂无内容，点击上方按钮生成。</div>
+          )}
         </div>
       </details>
 
@@ -1010,15 +1184,16 @@ export function ManualTaskRunner({
       </div>
 
       <div className="space-y-3">
-        {tasks.map((task) => {
-          const done = doneById.get(task.id) === true;
-          const status = statusById.get(task.id) ?? (done ? 'completed' : 'pending');
-           const missingDeps = (task.dependencies || []).filter((depId) => !doneById.get(depId));
-           const blocked = missingDeps.length > 0;
-           const ready = !blocked && status === 'pending';
-           const showPrompt = promptForTask?.taskId === task.id;
-           const detailsOpen = taskDetailsOpenById[task.id] === true;
-           const docState = taskDocById[task.id];
+         {tasks.map((task) => {
+           const done = doneById.get(task.id) === true;
+           const status = statusById.get(task.id) ?? (done ? 'completed' : 'pending');
+            const missingDeps = (task.dependencies || []).filter((depId) => !doneById.get(depId));
+            const blocked = missingDeps.length > 0;
+            const blockedInfo = blocked ? formatTaskIdList(missingDeps, 3) : null;
+            const ready = !blocked && status === 'pending';
+            const showPrompt = promptForTask?.taskId === task.id;
+            const detailsOpen = taskDetailsOpenById[task.id] === true;
+            const docState = taskDocById[task.id];
 
            return (
              <div
@@ -1055,18 +1230,19 @@ export function ManualTaskRunner({
                               ? 'text-purple-300'
                               : 'text-slate-500'
                     }`}
+                    title={blockedInfo ? `被阻塞：${blockedInfo.full}` : undefined}
                   >
                     {status === 'completed'
                       ? '已完成'
                       : status === 'running'
                         ? '进行中'
-                        : blocked
-                          ? '被前置任务阻塞'
-                          : ready
-                            ? '可开始'
-                            : '未开始'}
-                  </span>
-                </div>
+                         : blocked
+                           ? `被阻塞：${blockedInfo?.text ?? missingDeps.join(', ')}`
+                           : ready
+                             ? '可开始'
+                             : '未开始'}
+                   </span>
+                 </div>
                 <div className="ml-auto flex flex-wrap items-center gap-2">
                   <Button size="sm" variant="ghost" onClick={() => handleToggleTaskDetails(task)}>
                     {detailsOpen ? '收起详情' : '查看详情'}
