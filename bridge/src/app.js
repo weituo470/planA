@@ -3722,6 +3722,11 @@ async function generateClarificationsWithModel(prompt, options = {}) {
     if (/(请提供|需要补充|原始需求.*完整|无法|不能|不明确|不清楚|缺失)/.test(trimmed)) {
       return true;
     }
+    if (/(前端框架|后端框架|数据库选型|部署方式|技术栈)/i.test(trimmed)) return true;
+    const choiceHint = /(选型|选择|选用|用什么|使用什么|采用什么|哪(种|个)|还是|或者|\sor\s)/i;
+    const targetHint =
+      /(前端|后端|框架|编程语言|数据库|db|mysql|postgres|postgresql|mongo|mongodb|redis|docker|kubernetes|k8s|云|aws|gcp|azure|react|vue|angular|next\.?js|nuxt|nestjs|express|koa|spring|django|flask|fastapi)/i;
+    if (choiceHint.test(trimmed) && targetHint.test(trimmed)) return true;
     return false;
   };
 
@@ -3731,6 +3736,15 @@ async function generateClarificationsWithModel(prompt, options = {}) {
     return normalized.questions.every((q) => {
       if (isBadQuestionText(q.question)) return false;
       if (!Array.isArray(q.options) || q.options.length < 2) return false;
+      if (
+        q.options.some((opt) =>
+          /(react|vue|angular|next\.?js|nuxt|nestjs|express|koa|spring|django|flask|fastapi|mysql|postgres|postgresql|mongo|mongodb|redis|docker|kubernetes|k8s|aws|gcp|azure)/i.test(
+            String(opt?.label || ''),
+          ),
+        )
+      ) {
+        return false;
+      }
       return q.options.every((opt) => typeof opt.label === 'string' && opt.label.trim());
     });
   };

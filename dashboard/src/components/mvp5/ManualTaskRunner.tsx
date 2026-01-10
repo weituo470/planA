@@ -8,6 +8,31 @@ const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
 
 type ToastType = 'info' | 'error';
 
+type ParallelPolicy = 'serial' | 'conservative' | 'aggressive';
+
+const PARALLEL_POLICY_MAX_RUNNING: Record<ParallelPolicy, number> = {
+  serial: 1,
+  conservative: 3,
+  aggressive: 8,
+};
+
+const GLOBAL_LOCK_SCOPE_MARKERS = [
+  'package.json',
+  'package-lock.json',
+  'pnpm-lock.yaml',
+  'yarn.lock',
+  'bun.lockb',
+  'npm-shrinkwrap.json',
+  '.env',
+  '.env.local',
+  '.env.production',
+  'node_modules',
+  'dist',
+  'build',
+  'prisma/schema.prisma',
+  'prisma/migrations',
+];
+
 export type DagTask = {
   id: string;
   title: string;
@@ -103,6 +128,22 @@ function normalizeScopePathForConflict(value: string) {
     .replace(/^\.\/+/, '')
     .replace(/\/$/, '')
     .toLowerCase();
+}
+
+function scopeHitsGlobalLock(scope: string[]) {
+  if (!Array.isArray(scope) || scope.length === 0) return true;
+  const normalized = scope.map((v) => normalizeScopePathForConflict(v)).filter(Boolean);
+  return normalized.some((path) => {
+    return GLOBAL_LOCK_SCOPE_MARKERS.some((marker) => {
+      const normalizedMarker = normalizeScopePathForConflict(marker);
+      if (!normalizedMarker) return false;
+      if (path === normalizedMarker) return true;
+      if (path.startsWith(`${normalizedMarker}/`)) return true;
+      if (path.endsWith(`/${normalizedMarker}`)) return true;
+      if (!normalizedMarker.includes('/') && path.includes(`/${normalizedMarker}/`)) return true;
+      return false;
+    });
+  });
 }
 
 function scopesMayConflict(a: string, b: string) {
@@ -509,6 +550,8 @@ export function ManualTaskRunner({
     chainBusyRef.current = chainBusy;
   }, [chainBusy]);
 
+  const [parallelPolicy, setParallelPolicy] = useState<ParallelPolicy>('conservative');
+
   const [taskDetailsOpenById, setTaskDetailsOpenById] = useState<Record<string, boolean>>({});
   const [taskDocById, setTaskDocById] = useState<
     Record<string, { loading: boolean; error: string | null; runDocPathAbs?: string; content?: string }>
@@ -613,7 +656,13 @@ export function ManualTaskRunner({
       if (missingDeps.length) continue;
       const blockers = runningTasks
         .filter((other) => other.id !== task.id)
-        .filter((other) => scopeListsMayConflict(task.scope ?? [], other.scope ?? []))
+        .filter((other) => {
+          const scope = task.scope ?? [];
+          const otherScope = other.scope ?? [];
+          if (scopeHitsGlobalLock(scope)) return true;
+          if (scopeHitsGlobalLock(otherScope)) return true;
+          return scopeListsMayConflict(scope, otherScope);
+        })
         .map((other) => other.id);
       if (blockers.length) map[task.id] = blockers;
     }
@@ -742,9 +791,37 @@ export function ManualTaskRunner({
   const startTaskInClaudeAuto = useCallback(
     async (task: DagTask, reason: string) => {
       if (!onRunPromptInClaudeAutoTerminal) throw new Error('终端面板未就绪');
-      const runningConflicts = tasks
-        .filter((t) => t.id !== task.id && (statusById.get(t.id) ?? 'pending') === 'running')
-        .filter((t) => scopeListsMayConflict(task.scope ?? [], t.scope ?? []))
+      const taskScope = task.scope ?? [];
+      const taskGlobalLock = scopeHitsGlobalLock(taskScope);
+      const maxRunning = PARALLEL_POLICY_MAX_RUNNING[parallelPolicy];
+      const runningTasks = tasks.filter(
+        (t) => t.id !== task.id && (statusById.get(t.id) ?? 'pending') === 'running',
+      );
+      if (runningTasks.length >= maxRunning) {
+        const info = formatTaskIdList(
+          runningTasks.map((t) => t.id),
+          6,
+        );
+        throw new Error(
+          `并行策略限制(${parallelPolicy})：运行中任务已达上限(${runningTasks.length}/${maxRunning})（${info.text}）`,
+        );
+      }
+      const runningGlobalLockIds = runningTasks
+        .filter((t) => scopeHitsGlobalLock(t.scope ?? []))
+        .map((t) => t.id);
+      if (runningGlobalLockIds.length) {
+        const info = formatTaskIdList(runningGlobalLockIds, 6);
+        throw new Error(`全局资源占用冲突：运行中任务占用全局资源（${info.text}）`);
+      }
+      if (taskGlobalLock && runningTasks.length) {
+        const info = formatTaskIdList(
+          runningTasks.map((t) => t.id),
+          6,
+        );
+        throw new Error(`全局资源占用冲突：${task.id} 需要独占运行（${info.text}）`);
+      }
+      const runningConflicts = runningTasks
+        .filter((t) => scopeListsMayConflict(taskScope, t.scope ?? []))
         .map((t) => t.id);
       if (runningConflicts.length) {
         const info = formatTaskIdList(runningConflicts, 6);
@@ -769,6 +846,7 @@ export function ManualTaskRunner({
       fetchPromptForTask,
       onRunPromptInClaudeAutoTerminal,
       onToast,
+      parallelPolicy,
       specId,
       statusById,
       tasks,
@@ -801,22 +879,36 @@ export function ManualTaskRunner({
         });
         if (!readyTasks.length) return;
 
-        const runningScopes = tasks
-          .filter((t) => (statusById.get(t.id) ?? 'pending') === 'running')
-          .map((t) => t.scope ?? []);
+        const runningTasks = tasks.filter((t) => (statusById.get(t.id) ?? 'pending') === 'running');
+        const runningCount = runningTasks.length;
+        const maxRunning = PARALLEL_POLICY_MAX_RUNNING[parallelPolicy];
+        if (runningCount >= maxRunning) return;
+        if (runningTasks.some((t) => scopeHitsGlobalLock(t.scope ?? []))) return;
+
+        const slots = Math.max(0, maxRunning - runningCount);
+        const sortedReady = readyTasks.slice().sort((a, b) => a.id.localeCompare(b.id));
+        const globalLockReady = sortedReady.filter((t) => scopeHitsGlobalLock(t.scope ?? []));
         const selected: DagTask[] = [];
-        const selectedScopes: string[][] = [];
         const skipped: DagTask[] = [];
-        for (const task of readyTasks) {
-          const scope = task.scope ?? [];
-          const conflictsRunning = runningScopes.some((s) => scopeListsMayConflict(scope, s));
-          const conflictsSelected = selectedScopes.some((s) => scopeListsMayConflict(scope, s));
-          if (conflictsRunning || conflictsSelected) {
-            skipped.push(task);
-            continue;
+
+        if (globalLockReady.length) {
+          if (runningCount > 0) return;
+          selected.push(globalLockReady[0]);
+        } else {
+          const runningScopes = runningTasks.map((t) => t.scope ?? []);
+          const selectedScopes: string[][] = [];
+          for (const task of sortedReady) {
+            if (selected.length >= slots) break;
+            const scope = task.scope ?? [];
+            const conflictsRunning = runningScopes.some((s) => scopeListsMayConflict(scope, s));
+            const conflictsSelected = selectedScopes.some((s) => scopeListsMayConflict(scope, s));
+            if (conflictsRunning || conflictsSelected) {
+              skipped.push(task);
+              continue;
+            }
+            selected.push(task);
+            selectedScopes.push(scope);
           }
-          selected.push(task);
-          selectedScopes.push(scope);
         }
         if (!selected.length) return;
 
@@ -850,6 +942,7 @@ export function ManualTaskRunner({
       doneById,
       onRunPromptInClaudeAutoTerminal,
       onToast,
+      parallelPolicy,
       startTaskInClaudeAuto,
       statusById,
       tasks,
@@ -1019,9 +1112,29 @@ export function ManualTaskRunner({
         onToast(`前置任务未完成：${missing.join(', ')}`, 'error');
         return;
       }
-      const runningConflicts = tasks
-        .filter((t) => t.id !== task.id && (statusById.get(t.id) ?? 'pending') === 'running')
-        .filter((t) => scopeListsMayConflict(task.scope ?? [], t.scope ?? []))
+      const taskScope = task.scope ?? [];
+      const taskGlobalLock = scopeHitsGlobalLock(taskScope);
+      const runningTasks = tasks.filter(
+        (t) => t.id !== task.id && (statusById.get(t.id) ?? 'pending') === 'running',
+      );
+      const runningGlobalLockIds = runningTasks
+        .filter((t) => scopeHitsGlobalLock(t.scope ?? []))
+        .map((t) => t.id);
+      if (runningGlobalLockIds.length) {
+        const info = formatTaskIdList(runningGlobalLockIds, 6);
+        onToast(`全局资源占用冲突：运行中任务占用全局资源（${info.text}）`, 'error');
+        return;
+      }
+      if (taskGlobalLock && runningTasks.length) {
+        const info = formatTaskIdList(
+          runningTasks.map((t) => t.id),
+          6,
+        );
+        onToast(`全局资源占用冲突：${task.id} 需要独占运行（${info.text}）`, 'error');
+        return;
+      }
+      const runningConflicts = runningTasks
+        .filter((t) => scopeListsMayConflict(taskScope, t.scope ?? []))
         .map((t) => t.id);
       if (runningConflicts.length) {
         const info = formatTaskIdList(runningConflicts, 6);
@@ -1297,6 +1410,20 @@ export function ManualTaskRunner({
                     ? '继续'
                     : '开始'}
             </Button>
+            <div className="flex items-center gap-2 text-xs text-slate-400">
+              <span>并行策略</span>
+              <select
+                className="h-8 rounded border border-slate-700 bg-slate-950 px-2 text-xs text-slate-100"
+                value={parallelPolicy}
+                onChange={(e) => setParallelPolicy(e.target.value as ParallelPolicy)}
+                disabled={Boolean(disabled) || chainBusy}
+                title="更严格策略可降低同文件并发修改导致的冲突"
+              >
+                <option value="serial">串行(1)</option>
+                <option value="conservative">保守(≤3)</option>
+                <option value="aggressive">激进(≤8)</option>
+              </select>
+            </div>
             {totalElapsedText ? (
               <div className="text-xs text-slate-400">
                 总耗时：<span className="font-mono text-slate-200">{totalElapsedText}</span>

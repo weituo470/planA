@@ -2604,6 +2604,23 @@ export default function App() {
     [tasksAtomicContent],
   );
   const terminalPanelRef = useRef<TerminalPanelHandle | null>(null);
+  const mvp5TaskStatusByIdForTerminal = useMemo(() => {
+    const parsed = parseDagTasksFromTasksContent(String(artifactContent.tasks ?? ''));
+    const tasks = parsed?.tasks ?? [];
+    const map: Record<string, 'pending' | 'running' | 'completed' | 'failed'> = {};
+    for (const task of tasks) {
+      const status = task.status ?? (task.done ? 'completed' : 'pending');
+      map[task.id] =
+        status === 'running'
+          ? 'running'
+          : status === 'completed'
+            ? 'completed'
+            : status === 'failed'
+              ? 'failed'
+              : 'pending';
+    }
+    return map;
+  }, [artifactContent.tasks]);
   const tasksToolsDetailsRef = useRef<HTMLDetailsElement | null>(null);
   const [tasksToolsOpen, setTasksToolsOpen] = useState(false);
 
@@ -4522,6 +4539,8 @@ export default function App() {
                       onOpenCliConfig={openCliConfig}
                       onTerminalData={handleClaudeAutoTerminalData}
                       onTerminalExit={handleClaudeAutoTerminalExit}
+                      taskStatusSpecName={selectedSpecName || undefined}
+                      taskStatusById={mvp5TaskStatusByIdForTerminal}
                     />
                   </div>
                 </div>

@@ -41,6 +41,8 @@ type TerminalTab = TerminalListItem & {
   runDocPath?: string;
 };
 
+type TaskStatus = 'pending' | 'running' | 'completed' | 'failed';
+
 type TerminalBufferItem = { seq: number; data: string };
 
 type CliToolInfo = {
@@ -212,12 +214,16 @@ export function TerminalPanelInner(
     onOpenCliConfig,
     onTerminalExit,
     onTerminalData,
+    taskStatusSpecName,
+    taskStatusById,
   }: {
     className?: string;
     heightClass?: string;
     onOpenCliConfig?: () => void;
     onTerminalExit?: (event: { terminalId: string; exitCode: number }) => void;
     onTerminalData?: (event: { terminalId: string; seq: number | null; data: string }) => void;
+    taskStatusSpecName?: string;
+    taskStatusById?: Record<string, TaskStatus>;
   },
   ref: ForwardedRef<TerminalPanelHandle>,
 ) {
@@ -1534,15 +1540,30 @@ export function TerminalPanelInner(
           <div className="mt-2 flex items-center gap-2 overflow-auto rounded-md border border-slate-800 bg-slate-950/50 px-2 py-1">
             {tabs.map((t) => {
               const isActive = t.id === activeId;
-              const tone = t.running ? 'running' : t.exitCode === 0 ? 'completed' : ('idle' as const);
+              const mappedTaskStatus =
+                t.taskId && taskStatusById && (!taskStatusSpecName || t.specName === taskStatusSpecName)
+                  ? (taskStatusById[t.taskId] ?? null)
+                  : null;
+              const tone =
+                mappedTaskStatus === 'running'
+                  ? ('running' as const)
+                  : mappedTaskStatus === 'completed'
+                    ? ('completed' as const)
+                    : mappedTaskStatus === 'failed'
+                      ? ('failed' as const)
+                      : t.running
+                        ? ('running' as const)
+                        : t.exitCode === 0
+                          ? ('completed' as const)
+                          : ('idle' as const);
               const toneText =
                 tone === 'running'
                   ? 'text-blue-300'
                   : tone === 'completed'
                     ? 'text-green-300'
-                    : isActive
-                      ? 'text-slate-100'
-                      : 'text-slate-200';
+                    : tone === 'failed'
+                      ? 'text-red-300'
+                      : 'text-slate-100';
               return (
                 <div
                   key={t.id}

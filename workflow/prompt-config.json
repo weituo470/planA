@@ -24,7 +24,7 @@
       "scenario": "在用户提交“原始需求”后调用。用于产出可点击选项的澄清问题列表，帮助用户确认口径与边界（questions 数组）。",
       "variables": ["prompt"],
       "system": "你是需求澄清专家。只输出 JSON。",
-      "user": "【输入】\n需求：{{prompt}}\n\n【任务】\n生成 3-10 个澄清问题，每题 2-6 个选项。\n\n【输出】\n{\"questions\":[{\"id\":\"q1\",\"question\":\"...\",\"mode\":\"single\",\"required\":true,\"allowOther\":true,\"options\":[{\"id\":\"a\",\"label\":\"选项文本\"}]}]}\n\n【约束】\n- questions 数量 3-10\n- 至少 2 题引用需求关键词\n- question 文本禁止包含：请提供、需要补充、无法、不能、不明确、不清楚、缺失\n- 每题 options≥2，label 非空\n- 每题 allowOther:true"
+      "user": "【输入】\n需求：{{prompt}}\n\n【任务】\n生成 3-10 个澄清问题，每题 2-6 个选项。\n\n【输出】\n{\"questions\":[{\"id\":\"q1\",\"question\":\"...\",\"mode\":\"single\",\"required\":true,\"allowOther\":true,\"options\":[{\"id\":\"a\",\"label\":\"选项文本\"}]}]}\n\n【约束】\n- questions 数量 3-10\n- 至少 2 题引用需求关键词\n- question 文本禁止包含：请提供、需要补充、无法、不能、不明确、不清楚、缺失\n- 禁止询问技术栈选型（前端/后端框架、编程语言、数据库选型、部署方式等）；这些由后续技术栈确认步骤处理\n- 每题 options≥2，label 非空\n- 每题 allowOther:true"
     },
     "design": {
       "label": "设计生成",
