@@ -17,6 +17,7 @@ export type DagTask = {
   estimated_complexity?: string;
   status?: 'pending' | 'running' | 'completed';
   done?: boolean;
+  startedAt?: string;
   doneAt?: string;
 };
 
@@ -77,8 +78,20 @@ function normalizeDagTask(input: any, index: number): DagTask | null {
     typeof obj.estimated_complexity === 'string' ? obj.estimated_complexity.trim() : undefined;
   const status = normalizeTaskStatus(obj.status);
   const done = obj.done === true || status === 'completed';
+  const startedAt = typeof obj.startedAt === 'string' ? obj.startedAt.trim() : undefined;
   const doneAt = typeof obj.doneAt === 'string' ? obj.doneAt.trim() : undefined;
-  return { id, title, description, dependencies, scope, estimated_complexity, status: done ? 'completed' : status, done, doneAt };
+  return {
+    id,
+    title,
+    description,
+    dependencies,
+    scope,
+    estimated_complexity,
+    status: done ? 'completed' : status,
+    done,
+    startedAt,
+    doneAt,
+  };
 }
 
 function normalizeScopePathForConflict(value: string) {
@@ -86,6 +99,7 @@ function normalizeScopePathForConflict(value: string) {
     .trim()
     .replace(/\\/g, '/')
     .replace(/\/+/g, '/')
+    .replace(/^\/+/, '')
     .replace(/^\.\/+/, '')
     .replace(/\/$/, '')
     .toLowerCase();
@@ -245,6 +259,23 @@ async function copyTextToClipboard(text: string) {
   }
 }
 
+function parseIsoMs(value: string | null | undefined) {
+  const t = Date.parse(String(value ?? ''));
+  return Number.isFinite(t) ? t : null;
+}
+
+function formatDurationMs(ms: number | null) {
+  if (ms == null || !Number.isFinite(ms)) return '';
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return `${minutes}m${String(seconds).padStart(2, '0')}s`;
+  const hours = Math.floor(minutes / 60);
+  const mm = minutes % 60;
+  return `${hours}h${String(mm).padStart(2, '0')}m`;
+}
+
 function buildTaskGraphFromDagTasks(tasks: DagTask[]): TaskGraph {
   const taskIds = new Set(tasks.map((t) => t.id));
 
@@ -257,6 +288,10 @@ function buildTaskGraphFromDagTasks(tasks: DagTask[]): TaskGraph {
     outDegree: 0,
     riskLevel: undefined,
     requiresInteraction: false,
+    status: t.status,
+    done: t.done,
+    startedAt: t.startedAt,
+    doneAt: t.doneAt,
   }));
 
   const edges: TaskGraph['edges'] = [];
@@ -447,6 +482,19 @@ export function ManualTaskRunner({
   const singleAgentPromptDetailsRef = useRef<HTMLDetailsElement | null>(null);
   const [dagExpanded, setDagExpanded] = useState(true);
   const [dagResetKey, setDagResetKey] = useState(0);
+  const [dagHeight, setDagHeight] = useState(() => {
+    if (typeof window === 'undefined') return 560;
+    return Math.max(560, Math.floor(window.innerHeight * 0.9));
+  });
+
+  useEffect(() => {
+    const update = () => {
+      setDagHeight(Math.max(560, Math.floor(window.innerHeight * 0.9)));
+    };
+    update();
+    window.addEventListener('resize', update);
+    return () => window.removeEventListener('resize', update);
+  }, []);
 
   const [chainState, setChainState] = useState<'idle' | 'running' | 'paused'>('idle');
   const chainStateRef = useRef<'idle' | 'running' | 'paused'>(chainState);
@@ -518,6 +566,59 @@ export function ManualTaskRunner({
     }
     return map;
   }, [tasks]);
+
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const hasStarted = useMemo(() => tasks.some((t) => parseIsoMs(t.startedAt) != null), [tasks]);
+  const hasRunningTask = useMemo(
+    () => tasks.some((t) => (statusById.get(t.id) ?? 'pending') === 'running'),
+    [statusById, tasks],
+  );
+  const allDone = useMemo(
+    () => tasks.length > 0 && tasks.every((t) => doneById.get(t.id) === true),
+    [doneById, tasks],
+  );
+
+  useEffect(() => {
+    if (!hasStarted) return;
+    if (chainState === 'idle' && !hasRunningTask) return;
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [chainState, hasRunningTask, hasStarted]);
+
+  const totalElapsedText = useMemo(() => {
+    if (!hasStarted) return '';
+    const startedList = tasks.map((t) => parseIsoMs(t.startedAt)).filter((v) => v != null) as number[];
+    if (!startedList.length) return '';
+    const start = Math.min(...startedList);
+
+    const doneList = tasks.map((t) => parseIsoMs(t.doneAt)).filter((v) => v != null) as number[];
+    const maxDone = doneList.length ? Math.max(...doneList) : null;
+
+    const end =
+      allDone && maxDone != null
+        ? maxDone
+        : hasRunningTask || chainState !== 'idle'
+          ? nowMs
+          : maxDone ?? nowMs;
+    return formatDurationMs(end - start);
+  }, [allDone, chainState, hasRunningTask, hasStarted, nowMs, tasks]);
+
+  const resourceBlockedById = useMemo(() => {
+    const runningTasks = tasks.filter((t) => (statusById.get(t.id) ?? 'pending') === 'running');
+    const map: Record<string, string[]> = {};
+    for (const task of tasks) {
+      const status = statusById.get(task.id) ?? (getTaskDone(task) ? 'completed' : 'pending');
+      if (status !== 'pending') continue;
+      const missingDeps = (task.dependencies || []).filter((depId) => !doneById.get(depId));
+      if (missingDeps.length) continue;
+      const blockers = runningTasks
+        .filter((other) => other.id !== task.id)
+        .filter((other) => scopeListsMayConflict(task.scope ?? [], other.scope ?? []))
+        .map((other) => other.id);
+      if (blockers.length) map[task.id] = blockers;
+    }
+    return map;
+  }, [doneById, statusById, tasks]);
 
   const taskGraph = useMemo(() => buildTaskGraphFromDagTasks(tasks), [tasks]);
   const taskStatusByIdForDag = useMemo(() => {
@@ -641,6 +742,14 @@ export function ManualTaskRunner({
   const startTaskInClaudeAuto = useCallback(
     async (task: DagTask, reason: string) => {
       if (!onRunPromptInClaudeAutoTerminal) throw new Error('终端面板未就绪');
+      const runningConflicts = tasks
+        .filter((t) => t.id !== task.id && (statusById.get(t.id) ?? 'pending') === 'running')
+        .filter((t) => scopeListsMayConflict(task.scope ?? [], t.scope ?? []))
+        .map((t) => t.id);
+      if (runningConflicts.length) {
+        const info = formatTaskIdList(runningConflicts, 6);
+        throw new Error(`文件占用冲突：${task.id} 与运行中任务冲突（${info.text}）`);
+      }
       const { prompt } = await fetchPromptForTask(task);
       const { promptWithMarkers, doneMarker, failedMarker } = buildClaudePromptWithMarkers(
         prompt,
@@ -655,7 +764,15 @@ export function ManualTaskRunner({
       onToast(`已启动：${task.id} · ${created.title || 'Claude Code'} · ${reason}`, 'info');
       return created;
     },
-    [buildClaudePromptWithMarkers, fetchPromptForTask, onRunPromptInClaudeAutoTerminal, onToast, specId],
+    [
+      buildClaudePromptWithMarkers,
+      fetchPromptForTask,
+      onRunPromptInClaudeAutoTerminal,
+      onToast,
+      specId,
+      statusById,
+      tasks,
+    ],
   );
 
   const autoStartAllReadyTasks = useCallback(
@@ -873,9 +990,12 @@ export function ManualTaskRunner({
         return;
       }
       const nextTask = { ...(list[idx] || {}) };
+      const nowIso = new Date().toISOString();
       nextTask.status = 'completed';
       nextTask.done = true;
-      nextTask.doneAt = new Date().toISOString();
+      nextTask.doneAt = nowIso;
+      const startedAt = typeof nextTask.startedAt === 'string' ? nextTask.startedAt.trim() : '';
+      if (startedAt) nextTask.startedAt = startedAt;
       list[idx] = nextTask;
 
       const nextPayload = { ...payload, tasks: list };
@@ -899,6 +1019,15 @@ export function ManualTaskRunner({
         onToast(`前置任务未完成：${missing.join(', ')}`, 'error');
         return;
       }
+      const runningConflicts = tasks
+        .filter((t) => t.id !== task.id && (statusById.get(t.id) ?? 'pending') === 'running')
+        .filter((t) => scopeListsMayConflict(task.scope ?? [], t.scope ?? []))
+        .map((t) => t.id);
+      if (runningConflicts.length) {
+        const info = formatTaskIdList(runningConflicts, 6);
+        onToast(`文件占用冲突（运行中）：${info.text}`, 'error');
+        return;
+      }
 
       const parsedDoc = parseDagTasksFromTasksContent(tasksContent);
       if (!parsedDoc) {
@@ -913,8 +1042,12 @@ export function ManualTaskRunner({
         return;
       }
       const nextTask = { ...(list[idx] || {}) };
+      const nowIso = new Date().toISOString();
+      const hadDoneAt = typeof nextTask.doneAt === 'string' && nextTask.doneAt.trim();
       nextTask.status = 'running';
       nextTask.done = false;
+      const startedAt = typeof nextTask.startedAt === 'string' ? nextTask.startedAt.trim() : '';
+      nextTask.startedAt = hadDoneAt ? nowIso : startedAt || nowIso;
       delete nextTask.doneAt;
       list[idx] = nextTask;
 
@@ -927,7 +1060,7 @@ export function ManualTaskRunner({
       await onSaveTasksContent(nextContent);
       onToast(`已标记进行中：${task.id}`, 'info');
     },
-    [disabled, doneById, onSaveTasksContent, onToast, tasksContent],
+    [disabled, doneById, onSaveTasksContent, onToast, statusById, tasks, tasksContent],
   );
 
   const taskActionsByIdForDag = useMemo(() => {
@@ -945,19 +1078,40 @@ export function ManualTaskRunner({
       const status = statusById.get(task.id) ?? (done ? 'completed' : 'pending');
       const missingDeps = (task.dependencies || []).filter((depId) => !doneById.get(depId));
       const blocked = missingDeps.length > 0;
+      const resourceBlockers = resourceBlockedById?.[task.id] ?? [];
+      const resourceBlocked = resourceBlockers.length > 0;
+      const resourceBlockedText = resourceBlocked ? formatTaskIdList(resourceBlockers, 3) : null;
       const promptLoading = promptLoadingTaskId === task.id;
+
+      const startTitle = blocked
+        ? `前置任务未完成：${missingDeps.join(', ')}`
+        : resourceBlocked
+          ? `文件占用冲突（运行中）：${resourceBlockedText?.text ?? resourceBlockers.join(', ')}`
+          : '启动 Claude Code（全自动）并执行任务';
 
       map[task.id] = {
         start: {
           label: promptLoading ? '生成中…' : '开始',
-          title: '启动 Claude Code（全自动）并执行任务',
-          disabled: Boolean(disabled) || done || promptLoading || chainState === 'paused' || chainBusy,
+          title: startTitle,
+          disabled:
+            Boolean(disabled) ||
+            done ||
+            promptLoading ||
+            chainState === 'paused' ||
+            chainBusy ||
+            blocked ||
+            resourceBlocked ||
+            status === 'running',
           onClick: () => void handleStartClaudeAuto(task),
         },
         running: {
           label: '进行中',
-          title: blocked ? `被阻塞：${missingDeps.join(', ')}` : '标记进行中',
-          disabled: Boolean(disabled) || done || blocked || status === 'running',
+          title: blocked
+            ? `被阻塞：${missingDeps.join(', ')}`
+            : resourceBlocked
+              ? `文件占用冲突（运行中）：${resourceBlockedText?.text ?? resourceBlockers.join(', ')}`
+              : '标记进行中',
+          disabled: Boolean(disabled) || done || blocked || resourceBlocked || status === 'running',
           onClick: () => void handleMarkRunning(task),
         },
         done: {
@@ -980,6 +1134,7 @@ export function ManualTaskRunner({
     chainBusy,
     chainState,
     promptLoadingTaskId,
+    resourceBlockedById,
     statusById,
     tasks,
   ]);
@@ -1009,7 +1164,7 @@ export function ManualTaskRunner({
           <Button
             size="sm"
             variant="outline"
-            disabled={Boolean(disabled) || singleAgentPrompt.loading}
+            disabled={singleAgentPrompt.loading}
             onClick={() => void handleFetchSingleAgentPrompt()}
           >
             {singleAgentPrompt.loading ? '生成中…' : '获取单AGENT提示词'}
@@ -1034,6 +1189,13 @@ export function ManualTaskRunner({
       <details
         ref={singleAgentPromptDetailsRef}
         className="mb-3 rounded-md border border-slate-800 bg-slate-950/40 px-3 py-2"
+        onToggle={(e) => {
+          const el = e.currentTarget;
+          if (!el.open) return;
+          if (singleAgentPrompt.loading) return;
+          if (String(singleAgentPrompt.prompt || '').trim()) return;
+          void handleFetchSingleAgentPrompt();
+        }}
       >
         <summary className="cursor-pointer select-none text-xs font-semibold text-slate-200">
           单AGENT提示词（供单CLI工具顺序执行）
@@ -1045,7 +1207,7 @@ export function ManualTaskRunner({
               <Button
                 size="sm"
                 variant="ghost"
-                disabled={Boolean(disabled) || singleAgentPrompt.loading}
+                disabled={singleAgentPrompt.loading}
                 onClick={() => void handleFetchSingleAgentPrompt()}
               >
                 {singleAgentPrompt.loading ? '生成中…' : '刷新'}
@@ -1135,6 +1297,11 @@ export function ManualTaskRunner({
                     ? '继续'
                     : '开始'}
             </Button>
+            {totalElapsedText ? (
+              <div className="text-xs text-slate-400">
+                总耗时：<span className="font-mono text-slate-200">{totalElapsedText}</span>
+              </div>
+            ) : null}
             <button
               type="button"
               onClick={() => {
@@ -1159,9 +1326,10 @@ export function ManualTaskRunner({
             <TaskDagGraph
               graph={taskGraph}
               taskStatusById={taskStatusByIdForDag}
+              resourceBlockedById={resourceBlockedById}
               taskActionsById={taskActionsByIdForDag}
               resetKey={dagResetKey}
-              height={560}
+              height={dagHeight}
             />
           </div>
         ) : (
@@ -1196,7 +1364,12 @@ export function ManualTaskRunner({
             const missingDeps = (task.dependencies || []).filter((depId) => !doneById.get(depId));
             const blocked = missingDeps.length > 0;
             const blockedInfo = blocked ? formatTaskIdList(missingDeps, 3) : null;
-            const ready = !blocked && status === 'pending';
+            const resourceBlockers = resourceBlockedById?.[task.id] ?? [];
+            const resourceBlocked = resourceBlockers.length > 0;
+            const resourceBlockedInfo = resourceBlocked
+              ? formatTaskIdList(resourceBlockers, 3)
+              : null;
+            const ready = !blocked && !resourceBlocked && status === 'pending';
             const showPrompt = promptForTask?.taskId === task.id;
             const detailsOpen = taskDetailsOpenById[task.id] === true;
             const docState = taskDocById[task.id];
@@ -1216,7 +1389,7 @@ export function ManualTaskRunner({
                         ? 'bg-green-400'
                         : status === 'running'
                           ? 'bg-blue-300'
-                          : blocked
+                          : blocked || resourceBlocked
                             ? 'bg-amber-300'
                             : ready
                               ? 'bg-purple-400'
@@ -1230,13 +1403,19 @@ export function ManualTaskRunner({
                         ? 'text-green-400'
                         : status === 'running'
                           ? 'text-blue-300'
-                          : blocked
+                          : blocked || resourceBlocked
                             ? 'text-amber-300'
                             : ready
                               ? 'text-purple-300'
                               : 'text-slate-500'
                     }`}
-                    title={blockedInfo ? `被阻塞：${blockedInfo.full}` : undefined}
+                    title={
+                      blockedInfo
+                        ? `被阻塞：${blockedInfo.full}`
+                        : resourceBlockedInfo
+                          ? `文件占用：${resourceBlockedInfo.full}`
+                          : undefined
+                    }
                   >
                     {status === 'completed'
                       ? '已完成'
@@ -1244,6 +1423,8 @@ export function ManualTaskRunner({
                         ? '进行中'
                          : blocked
                            ? `被阻塞：${blockedInfo?.text ?? missingDeps.join(', ')}`
+                           : resourceBlocked
+                             ? `文件占用：${resourceBlockedInfo?.text ?? resourceBlockers.join(', ')}`
                            : ready
                              ? '可开始'
                              : '未开始'}
@@ -1266,7 +1447,7 @@ export function ManualTaskRunner({
                     <button
                       type="button"
                       onClick={() => void handleMarkRunning(task)}
-                      disabled={disabled || done || blocked || status === 'running'}
+                      disabled={disabled || done || blocked || resourceBlocked || status === 'running'}
                       className={`group inline-flex items-center gap-1 rounded px-1 py-0.5 text-xs transition-colors hover:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500/30 disabled:cursor-not-allowed disabled:opacity-40 ${
                         status === 'running' ? 'text-blue-300' : 'text-slate-400'
                       }`}
@@ -1312,6 +1493,11 @@ export function ManualTaskRunner({
                   {blocked ? (
                     <div className="mt-2 rounded border border-amber-900/40 bg-amber-950/20 px-2 py-1 text-xs text-amber-300">
                       前置任务未完成：{missingDeps.join(', ')}
+                    </div>
+                  ) : null}
+                  {resourceBlocked ? (
+                    <div className="mt-2 rounded border border-amber-900/40 bg-amber-950/20 px-2 py-1 text-xs text-amber-300">
+                      文件占用冲突（运行中）：{resourceBlockers.join(', ')}
                     </div>
                   ) : null}
 

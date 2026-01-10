@@ -773,7 +773,7 @@ export default function App() {
   const [taskView, setTaskView] = useState<TaskView>('tasks');
   const [tasksAtomicContent, setTasksAtomicContent] = useState('');
   const [atomicDisplayMode, setAtomicDisplayMode] = useState<'list' | 'raw'>('list');
-  const [explorerOpen, setExplorerOpen] = useState(true);
+  const [explorerOpen, setExplorerOpen] = useState(false);
   const [tasksDisplayMode, setTasksDisplayMode] = useState<'markdown' | 'raw'>('markdown');
   const [tasksMarkdownTab, setTasksMarkdownTab] = useState<'runner' | 'orchestrator'>('runner');
   const [atomizeStatus, setAtomizeStatus] = useState<AtomizeStatus | null>(null);
@@ -2637,18 +2637,24 @@ export default function App() {
       if (idx < 0) return null;
 
       const nextTask = { ...(list[idx] || {}) };
+      const nowIso = new Date().toISOString();
       if (status === 'running') {
         nextTask.status = 'running';
         nextTask.done = false;
+        const startedAt = typeof nextTask.startedAt === 'string' ? nextTask.startedAt.trim() : '';
+        nextTask.startedAt = startedAt || nowIso;
         delete nextTask.doneAt;
       } else if (status === 'completed') {
         nextTask.status = 'completed';
         nextTask.done = true;
-        nextTask.doneAt = new Date().toISOString();
+        nextTask.doneAt = nowIso;
+        const startedAt = typeof nextTask.startedAt === 'string' ? nextTask.startedAt.trim() : '';
+        if (startedAt) nextTask.startedAt = startedAt;
       } else {
         nextTask.status = 'pending';
         nextTask.done = false;
         delete nextTask.doneAt;
+        delete nextTask.startedAt;
       }
       list[idx] = nextTask;
 

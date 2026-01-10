@@ -100,6 +100,23 @@ function statusBadgeClass(status: TaskVisualStatus) {
   return 'bg-slate-800/80 text-slate-300 ring-1 ring-slate-700';
 }
 
+function parseIsoMs(value: string | null | undefined) {
+  const t = Date.parse(String(value ?? ''));
+  return Number.isFinite(t) ? t : null;
+}
+
+function formatDurationMs(ms: number | null) {
+  if (ms == null || !Number.isFinite(ms)) return '';
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return `${minutes}m${String(seconds).padStart(2, '0')}s`;
+  const hours = Math.floor(minutes / 60);
+  const mm = minutes % 60;
+  return `${hours}h${String(mm).padStart(2, '0')}m`;
+}
+
 function formatTaskIdList(ids: string[], max = 3) {
   const list = ids.map((v) => String(v || '').trim()).filter(Boolean);
   const shown = list.slice(0, Math.max(1, Math.floor(max)));
@@ -127,12 +144,15 @@ function deriveTaskVisualStatus(
   status: TaskStatus,
   graph: TaskGraph,
   taskStatusById?: Record<string, TaskStatus | undefined>,
+  resourceBlockedById?: Record<string, string[] | undefined>,
 ): TaskVisualStatus {
   if (status !== 'pending') return status;
   const deps = dependencyIdsForTask(graph, taskId);
   if (!deps.length) return 'ready';
   const blocked = deps.some((depId) => (taskStatusById?.[depId] ?? 'pending') !== 'completed');
-  return blocked ? 'blocked' : 'ready';
+  if (blocked) return 'blocked';
+  const resourceBlockers = resourceBlockedById?.[taskId] ?? [];
+  return Array.isArray(resourceBlockers) && resourceBlockers.length ? 'blocked' : 'ready';
 }
 
 type TaskDagBounds = {
@@ -178,6 +198,7 @@ function computeDagBounds(nodes: Node[]): TaskDagBounds | null {
 export function TaskDagGraph({
   graph,
   taskStatusById,
+  resourceBlockedById,
   taskActionsById,
   resetKey,
   className = '',
@@ -185,6 +206,7 @@ export function TaskDagGraph({
 }: {
   graph: TaskGraph;
   taskStatusById?: Record<string, TaskStatus | undefined>;
+  resourceBlockedById?: Record<string, string[] | undefined>;
   taskActionsById?: TaskActionsById;
   resetKey?: number;
   className?: string;
@@ -277,17 +299,35 @@ export function TaskDagGraph({
   const { nodes: layoutedNodes, edges: layoutedEdges, bounds } = useMemo(() => {
     const actionsEnabled = Boolean(taskActionsById);
     const nodeWidth = actionsEnabled ? 300 : 260;
-    const nodeHeight = actionsEnabled ? 120 : 90;
+    const nodeHeight = actionsEnabled ? 136 : 104;
     const nodesep = actionsEnabled ? 18 : 16;
     const ranksep = actionsEnabled ? 44 : 40;
 
     const nodes: Node[] = (graph?.tasks ?? []).map((t, idx) => {
       const status = taskStatusById?.[t.id] ?? 'pending';
-      const visualStatus = deriveTaskVisualStatus(t.id, status, graph, taskStatusById);
+      const visualStatus = deriveTaskVisualStatus(
+        t.id,
+        status,
+        graph,
+        taskStatusById,
+        resourceBlockedById,
+      );
+      const startedAtMs = parseIsoMs((t as any)?.startedAt);
+      const doneAtMs = parseIsoMs((t as any)?.doneAt);
+      const durationMs =
+        visualStatus === 'completed' && startedAtMs != null && doneAtMs != null
+          ? doneAtMs - startedAtMs
+          : null;
+      const durationText = durationMs != null ? formatDurationMs(durationMs) : '';
       const actions = taskActionsById?.[t.id];
       const deps = dependencyIdsForTask(graph, t.id);
       const missingDeps = deps.filter((depId) => (taskStatusById?.[depId] ?? 'pending') !== 'completed');
       const blockedInfo = missingDeps.length ? formatTaskIdList(missingDeps, 3) : null;
+      const resourceBlockers = resourceBlockedById?.[t.id] ?? [];
+      const resourceBlockedInfo =
+        !blockedInfo && Array.isArray(resourceBlockers) && resourceBlockers.length
+          ? formatTaskIdList(resourceBlockers, 3)
+          : null;
       return {
         id: t.id,
         type: 'default',
@@ -338,12 +378,23 @@ export function TaskDagGraph({
                    )}
                  </span>
                </div>
-              {visualStatus === 'blocked' && blockedInfo ? (
+                {visualStatus === 'blocked' && (blockedInfo || resourceBlockedInfo) ? (
                 <div
                   className="mt-1 truncate text-[11px] font-light text-amber-200/90"
-                  title={`被阻塞：${blockedInfo.full}`}
+                  title={
+                    blockedInfo
+                      ? `被阻塞：${blockedInfo.full}`
+                      : `文件占用：${resourceBlockedInfo?.full ?? ''}`
+                  }
                 >
-                  被阻塞：{blockedInfo.text}
+                  {blockedInfo
+                    ? `被阻塞：${blockedInfo.text}`
+                    : `文件占用：${resourceBlockedInfo?.text ?? ''}`}
+                </div>
+              ) : null}
+              {durationText ? (
+                <div className="mt-1 text-[11px] font-light text-slate-300/90">
+                  用时：<span className="font-mono text-slate-200">{durationText}</span>
                 </div>
               ) : null}
                <div className="flex-1" />
@@ -442,7 +493,13 @@ export function TaskDagGraph({
         const isConflict = e.type === 'conflict';
         const sourceStatus = taskStatusById?.[from] ?? 'pending';
         const targetStatus = taskStatusById?.[to] ?? 'pending';
-        const targetVisualStatus = deriveTaskVisualStatus(to, targetStatus, graph, taskStatusById);
+        const targetVisualStatus = deriveTaskVisualStatus(
+          to,
+          targetStatus,
+          graph,
+          taskStatusById,
+          resourceBlockedById,
+        );
         const isBlocking = !isConflict && targetStatus === 'pending' && sourceStatus !== 'completed';
         const isSatisfied = !isConflict && sourceStatus === 'completed';
         const isFlowing =
@@ -480,7 +537,7 @@ export function TaskDagGraph({
 
     const layouted = layoutDag(nodes, edges, { nodeWidth, nodeHeight, nodesep, ranksep });
     return { ...layouted, bounds: computeDagBounds(layouted.nodes) };
-  }, [graph, statusKey, taskActionsById, taskStatusById]);
+  }, [graph, resourceBlockedById, statusKey, taskActionsById, taskStatusById]);
 
   const [rfNodes, setRfNodes, onNodesChange] = useNodesState<Node>([]);
   const [rfEdges, setRfEdges] = useEdgesState<Edge>([]);

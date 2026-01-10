@@ -439,9 +439,33 @@ function registerMvp5Routes(app, ctx) {
             runDocContent = runDocContent ? String(runDocContent).slice(0, 18000).trimEnd() : '';
           }
         }
+
+        const truncateInline = (value, maxLen = 420) => {
+          const text = String(value ?? '')
+            .replace(/\r?\n/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (!text) return '';
+          if (text.length <= maxLen) return text;
+          return `${text.slice(0, maxLen).trimEnd()}…`;
+        };
+        const title = String(task?.title || '').trim();
+        const desc = truncateInline(task?.description || '', 520);
+        const scope = Array.isArray(task?.scope)
+          ? task.scope.map((v) => String(v || '').trim()).filter(Boolean)
+          : [];
+        const scopeText = scope.length
+          ? `scope（写锁）：${scope.join(', ')}`
+          : 'scope（写锁）：（为空：默认串行，且不得与其它任务并发）';
+
         const prompt = [
+          `任务：${taskId}${title ? `｜${title}` : ''}`,
+          desc ? `要求：${desc}` : null,
+          scopeText,
           `请按任务文档（绝对路径）${runDocPathAbs} 实现该任务，完成后自检并用简短要点总结变更与验证结果。`,
+          '硬性约束：不要猜测/兜底；缺信息就明确报错并停止。',
           '注意：修改已存在文件前先读取内容，再做最小化修改（避免 “Write 未 Read” 类工具冲突）。',
+          '为避免并发冲突：只修改 scope（写锁）内文件/目录；若必须越界，先停止并说明原因与影响。',
           projectDirForPrompt ? `建议工作目录：${projectDirForPrompt}` : null,
         ]
           .filter(Boolean)
@@ -619,24 +643,81 @@ function registerMvp5Routes(app, ctx) {
             cycle: cycleNodes,
           });
         }
-    
+
+        const requirementsPath = resolveSpecFile(specName, 'requirements');
+        if (!requirementsPath || !fs.existsSync(requirementsPath)) {
+          return res.status(409).json({
+            error: 'requirements.md 不存在，无法生成单AGENT提示词（需要整体需求）',
+            requirementsPath: requirementsPath ? normalizePathForPrompt(requirementsPath) : null,
+          });
+        }
+        const requirementsMarkdown = fs.readFileSync(requirementsPath, 'utf8');
+        const requirementsRaw = String(requirementsMarkdown || '').trim();
+        if (!requirementsRaw) {
+          return res.status(409).json({
+            error: 'requirements.md 为空，无法生成单AGENT提示词（需要整体需求）',
+            requirementsPath: normalizePathForPrompt(requirementsPath),
+          });
+        }
+        const extractSection = (markdown, heading) => {
+          const text = String(markdown || '').replace(/\r\n/g, '\n');
+          const marker = `## ${String(heading || '').trim()}`.trim();
+          const idx = text.indexOf(marker);
+          if (idx < 0) return '';
+          const after = text.slice(idx + marker.length).replace(/^\s+/, '');
+          const next = after.search(/^##\s+/m);
+          const section = next >= 0 ? after.slice(0, next) : after;
+          return String(section || '').trim();
+        };
+        const requirementsOverviewRaw = extractSection(requirementsMarkdown, '原始需求') || requirementsRaw;
+        const requirementsOverview = truncateText(requirementsOverviewRaw, 2600).trimEnd();
+
+        let designOverview = '';
+        try {
+          const designPath = resolveSpecFile(specName, 'design');
+          if (designPath && fs.existsSync(designPath)) {
+            const designMarkdown = fs.readFileSync(designPath, 'utf8');
+            const designRaw = String(designMarkdown || '').trim();
+            if (designRaw) {
+              const designOverviewRaw = extractSection(designMarkdown, '设计') || designRaw;
+              designOverview = truncateText(designOverviewRaw, 1800).trimEnd();
+            }
+          }
+        } catch {
+          designOverview = '';
+        }
+
         const truncateInline = (value, maxLen = 900) => {
           const text = String(value ?? '').trim().replace(/\s+/g, ' ');
           if (text.length <= maxLen) return text;
           return `${text.slice(0, Math.max(1, maxLen - 1)).trimEnd()}…`;
         };
-    
+
         const lines = [];
         lines.push('你是一个单 Agent 的 CLI 开发助手。');
         if (projectDirForPrompt) lines.push(`工作目录（建议）：${projectDirForPrompt}`);
         lines.push('');
+        lines.push('整体需求（摘要）：');
+        lines.push(requirementsOverview);
+        if (designOverview) {
+          lines.push('');
+          lines.push('设计摘要（可选）：');
+          lines.push(designOverview);
+        }
+        lines.push('');
         lines.push('目标：按 DAG 依赖顺序完成全部任务；最后执行“最终修复与调试（收尾）”。');
+        lines.push(`任务总数：${order.length}（必须全部完成，不要只完成第 1 个任务就结束）。`);
         lines.push('');
         lines.push('硬性约束（必须遵守）：');
         lines.push('- 不要使用任何兜底/猜测/编造输出；有问题就明确报错并停止。');
         lines.push('- 修改“已存在文件”前先读取内容，再做最小化 diff/patch；不要直接覆盖写入（避免 “Write 未 Read” 冲突）。');
         lines.push('- 严格串行执行（单 Agent），不要并发。');
         lines.push('- 优先只修改当前任务 scope 内文件/目录；若必须越界，先说明原因与影响。');
+        lines.push('');
+        lines.push('执行规则（避免误会）：');
+        lines.push('- 你必须在同一次运行里，按顺序连续执行完所有任务；不要在完成 task_1 后停下来等待用户确认。');
+        lines.push('- 完成一个任务后，立刻开始下一个任务，直到最后的“收尾任务”也完成才结束。');
+        lines.push('- 只有当遇到阻塞性错误（缺依赖/无法定位文件/权限/命令失败）时才停止，并输出清晰的错误与定位信息。');
         lines.push('');
         lines.push('执行顺序（拓扑）：');
         lines.push(order.map((id, idx) => `${idx + 1}. ${id}`).join('\n'));
@@ -663,10 +744,10 @@ function registerMvp5Routes(app, ctx) {
         lines.push('');
         lines.push('每完成一个任务后：');
         lines.push('- 做一次最小自测（按项目现有脚本/健康检查），记录结果。');
-        lines.push('- 如需写回进度：更新 tasks.md 的 TASKS_JSON（status/done/doneAt）。');
-        lines.push('- 在回复最后单独输出一行：[[TASK_DONE <TASK_ID>]]；失败则输出：[[TASK_FAILED <TASK_ID>]]。');
+        lines.push('- 写回进度：更新 tasks.md 的 TASKS_JSON（status/done/startedAt/doneAt）。');
+        lines.push('- 在输出里追加一行简短日志：DONE <TASK_ID>（例如：DONE task_3）。');
         lines.push('');
-        lines.push('现在开始执行第 1 个任务。');
+        lines.push('现在从第 1 个任务开始执行，并在同一次运行中完成全部任务后再结束。');
     
         const prompt = lines.join('\n').trim();
         return res.json({

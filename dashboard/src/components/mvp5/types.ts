@@ -11,6 +11,10 @@ export interface TaskNode {
   outDegree: number;
   riskLevel?: 'low' | 'medium' | 'high';
   requiresInteraction?: boolean;
+  status?: 'pending' | 'running' | 'completed' | 'failed';
+  done?: boolean;
+  startedAt?: string;
+  doneAt?: string;
 }
 
 export interface DependencyEdge {

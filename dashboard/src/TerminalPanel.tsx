@@ -16,6 +16,8 @@ import '@xterm/xterm/css/xterm.css';
 import { Button } from './components/ui/button';
 
 const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
+const TERMINAL_SPACES_STORAGE_KEY = 'mvp5:terminalSpaces';
+const TERMINAL_ACTIVE_SPACE_STORAGE_KEY = 'mvp5:terminalActiveSpace';
 
 type TerminalListItem = {
   id: string;
@@ -75,6 +77,51 @@ type DirListing = {
   parent: string | null;
   dirs: { name: string; path: string }[];
 };
+
+type TerminalSpace = {
+  id: string;
+  label: string;
+  cwd: string;
+};
+
+function safeJsonParse(value: string | null) {
+  if (!value) return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeTerminalSpace(value: any): TerminalSpace | null {
+  const obj = value && typeof value === 'object' ? value : null;
+  if (!obj) return null;
+  const id = String(obj.id ?? '').trim();
+  const label = String(obj.label ?? '').trim();
+  const cwd = String(obj.cwd ?? '').trim();
+  if (!id || !label || !cwd) return null;
+  return { id, label, cwd };
+}
+
+function loadTerminalSpacesFromStorage(): TerminalSpace[] {
+  if (typeof window === 'undefined') return [];
+  const parsed = safeJsonParse(window.localStorage.getItem(TERMINAL_SPACES_STORAGE_KEY));
+  const list = Array.isArray(parsed) ? parsed : [];
+  return list.map(normalizeTerminalSpace).filter(Boolean) as TerminalSpace[];
+}
+
+function loadActiveSpaceIdFromStorage(): string {
+  if (typeof window === 'undefined') return 'default';
+  const raw = String(window.localStorage.getItem(TERMINAL_ACTIVE_SPACE_STORAGE_KEY) ?? '').trim();
+  return raw || 'default';
+}
+
+function createSpaceId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `space_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
 
 async function apiJson<T>(
   path: string,
@@ -184,6 +231,7 @@ export function TerminalPanelInner(
   const [cwdSaving, setCwdSaving] = useState(false);
   const [cwdError, setCwdError] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerTarget, setPickerTarget] = useState<'workspace' | 'space'>('workspace');
   const [pickerLoading, setPickerLoading] = useState(false);
   const [pickerError, setPickerError] = useState<string | null>(null);
   const [pickerListing, setPickerListing] = useState<DirListing | null>(null);
@@ -195,6 +243,15 @@ export function TerminalPanelInner(
   const [cwdMkdirError, setCwdMkdirError] = useState<string | null>(null);
   const [cliTools, setCliTools] = useState<CliToolInfo[]>([]);
   const [cliToolsError, setCliToolsError] = useState<string | null>(null);
+  const [terminalSpaces, setTerminalSpaces] = useState<TerminalSpace[]>(() =>
+    loadTerminalSpacesFromStorage(),
+  );
+  const [activeSpaceId, setActiveSpaceId] = useState<string>(() => loadActiveSpaceIdFromStorage());
+  const [spaceManagerOpen, setSpaceManagerOpen] = useState(false);
+  const [spaceEditingId, setSpaceEditingId] = useState<string | null>(null);
+  const [spaceDraftLabel, setSpaceDraftLabel] = useState('');
+  const [spaceDraftCwd, setSpaceDraftCwd] = useState('');
+  const [spaceError, setSpaceError] = useState<string | null>(null);
 
   const socketRef = useRef<Socket | null>(null);
   const containersRef = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -223,6 +280,35 @@ export function TerminalPanelInner(
     if (workspace?.effectiveCwd) return workspace.effectiveCwd;
     return null;
   }, [cwdDraft, workspace?.effectiveCwd]);
+
+  const activeSpace = useMemo(() => {
+    if (!activeSpaceId || activeSpaceId === 'default') return null;
+    return terminalSpaces.find((s) => s.id === activeSpaceId) ?? null;
+  }, [activeSpaceId, terminalSpaces]);
+
+  const desiredTerminalCwd = useMemo(() => {
+    const spaceCwd = activeSpace?.cwd?.trim();
+    return spaceCwd || desiredCwd;
+  }, [activeSpace?.cwd, desiredCwd]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    window.localStorage.setItem(TERMINAL_SPACES_STORAGE_KEY, JSON.stringify(terminalSpaces));
+  }, [terminalSpaces]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    window.localStorage.setItem(
+      TERMINAL_ACTIVE_SPACE_STORAGE_KEY,
+      String(activeSpaceId || 'default'),
+    );
+  }, [activeSpaceId]);
+
+  useEffect(() => {
+    if (activeSpaceId === 'default') return;
+    if (terminalSpaces.some((s) => s.id === activeSpaceId)) return;
+    setActiveSpaceId('default');
+  }, [activeSpaceId, terminalSpaces]);
 
   const sendTerminalResize = useCallback(async (terminalId: string, cols: number, rows: number) => {
     const socket = socketRef.current;
@@ -485,7 +571,7 @@ export function TerminalPanelInner(
             title: template.title,
             command: template.command,
             args: template.args,
-            ...(desiredCwd ? { cwd: desiredCwd } : {}),
+            ...(desiredTerminalCwd ? { cwd: desiredTerminalCwd } : {}),
             cols: size.cols,
             rows: size.rows,
           }),
@@ -498,6 +584,7 @@ export function TerminalPanelInner(
         title: data.title || template.title,
         command: template.command,
         args: template.args,
+        ...(desiredTerminalCwd ? { cwd: desiredTerminalCwd } : {}),
         running: true,
         createdAt: new Date().toISOString(),
         ...(meta ?? {}),
@@ -505,7 +592,7 @@ export function TerminalPanelInner(
       setActiveId(data.id);
       return data.id;
     },
-    [addOrUpdateTab, desiredCwd, getPreferredSize],
+    [addOrUpdateTab, desiredTerminalCwd, getPreferredSize],
   );
 
   const createCliToolTerminal = useCallback(
@@ -519,7 +606,7 @@ export function TerminalPanelInner(
           method: 'POST',
           body: JSON.stringify({
             toolId,
-            ...(desiredCwd ? { cwd: desiredCwd } : {}),
+            ...(desiredTerminalCwd ? { cwd: desiredTerminalCwd } : {}),
             cols: size.cols,
             rows: size.rows,
           }),
@@ -532,6 +619,7 @@ export function TerminalPanelInner(
         title: data.title || tool.label || tool.id,
         command: tool.command,
         args: Array.isArray(tool.args) ? tool.args : [],
+        ...(desiredTerminalCwd ? { cwd: desiredTerminalCwd } : {}),
         running: true,
         createdAt: new Date().toISOString(),
         kind: 'custom',
@@ -539,7 +627,7 @@ export function TerminalPanelInner(
       setActiveId(data.id);
       return data.id;
     },
-    [addOrUpdateTab, desiredCwd, getPreferredSize],
+    [addOrUpdateTab, desiredTerminalCwd, getPreferredSize],
   );
 
   const startCodexAtomicTask = useCallback(
@@ -556,7 +644,7 @@ export function TerminalPanelInner(
           method: 'POST',
           body: JSON.stringify({
             taskId,
-            ...(desiredCwd ? { cwd: desiredCwd } : {}),
+            ...(desiredTerminalCwd ? { cwd: desiredTerminalCwd } : {}),
             cols: size.cols,
             rows: size.rows,
           }),
@@ -577,7 +665,7 @@ export function TerminalPanelInner(
       setActiveId(data.terminalId);
       return { terminalId: data.terminalId, title: data.title, runDocPath: data.runDocPath };
     },
-    [addOrUpdateTab, desiredCwd, getPreferredSize],
+    [addOrUpdateTab, desiredTerminalCwd, getPreferredSize],
   );
 
   const listAssignableCliTerminals = useCallback((): AssignableCliTerminal[] => {
@@ -1055,6 +1143,179 @@ export function TerminalPanelInner(
         </div>
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+        <div className="text-slate-400">终端空间</div>
+        <select
+          className="h-8 rounded-md border border-slate-700 bg-slate-950 px-2 text-xs text-slate-100 outline-none focus:ring-2 focus:ring-cyan-500"
+          value={activeSpaceId}
+          onChange={(e) => setActiveSpaceId(e.target.value)}
+        >
+          <option value="default">默认（跟随默认目录）</option>
+          {terminalSpaces.map((space) => (
+            <option key={space.id} value={space.id}>
+              {space.label}
+            </option>
+          ))}
+        </select>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            setSpaceError(null);
+            setSpaceManagerOpen((prev) => !prev);
+          }}
+        >
+          管理
+        </Button>
+        {activeSpace?.cwd ? (
+          <div className="text-slate-500">
+            当前空间目录：<span className="font-mono">{activeSpace.cwd}</span>
+          </div>
+        ) : null}
+      </div>
+      {spaceManagerOpen ? (
+        <div className="mt-2 rounded-md border border-slate-800 bg-slate-950/40 px-3 py-2 text-xs text-slate-300">
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="font-semibold text-slate-200">空间管理</div>
+            <div className="ml-auto flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setSpaceEditingId(null);
+                  setSpaceDraftLabel('');
+                  setSpaceDraftCwd(desiredCwd ?? '');
+                  setSpaceError(null);
+                }}
+              >
+                新建空间
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => setSpaceManagerOpen(false)}>
+                关闭
+              </Button>
+            </div>
+          </div>
+
+          {spaceError ? (
+            <div className="mt-2 rounded border border-red-900/40 bg-red-950/20 px-2 py-1 text-xs text-red-200">
+              {spaceError}
+            </div>
+          ) : null}
+
+          <div className="mt-2 grid grid-cols-1 gap-2 md:grid-cols-[200px_1fr_auto_auto] md:items-center">
+            <input
+              className="h-8 w-full rounded-md border border-slate-700 bg-slate-950 px-2 text-xs text-slate-100 outline-none focus:ring-2 focus:ring-cyan-500"
+              value={spaceDraftLabel}
+              onChange={(e) => setSpaceDraftLabel(e.target.value)}
+              placeholder="空间名称（例如：项目A）"
+            />
+            <input
+              className="h-8 w-full rounded-md border border-slate-700 bg-slate-950 px-2 font-mono text-xs text-slate-100 outline-none focus:ring-2 focus:ring-cyan-500"
+              value={spaceDraftCwd}
+              onChange={(e) => setSpaceDraftCwd(e.target.value)}
+              placeholder="项目目录（例如：D:\\path\\to\\repo）"
+            />
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                setPickerTarget('space');
+                setPickerOpen(true);
+              }}
+            >
+              选择目录
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                const label = spaceDraftLabel.trim();
+                const cwd = spaceDraftCwd.trim();
+                if (!label) {
+                  setSpaceError('空间名称不能为空');
+                  return;
+                }
+                if (!cwd) {
+                  setSpaceError('空间目录不能为空');
+                  return;
+                }
+                setSpaceError(null);
+                const nextId = spaceEditingId || createSpaceId();
+                setTerminalSpaces((prev) => {
+                  const existed = prev.some((s) => s.id === nextId);
+                  const next = existed
+                    ? prev.map((s) => (s.id === nextId ? { ...s, label, cwd } : s))
+                    : [...prev, { id: nextId, label, cwd }];
+                  return next;
+                });
+                setActiveSpaceId(nextId);
+                setSpaceEditingId(null);
+                setSpaceDraftLabel('');
+                setSpaceDraftCwd('');
+              }}
+            >
+              {spaceEditingId ? '保存' : '添加'}
+            </Button>
+          </div>
+
+          <div className="mt-3 text-[11px] text-slate-400">已有空间</div>
+          {terminalSpaces.length ? (
+            <div className="mt-1 space-y-1">
+              {terminalSpaces.map((space) => (
+                <div
+                  key={space.id}
+                  className="flex flex-wrap items-center gap-2 rounded border border-slate-800 bg-slate-950/40 px-2 py-1"
+                >
+                  <button
+                    type="button"
+                    className={`text-left text-xs ${
+                      activeSpaceId === space.id ? 'text-cyan-300' : 'text-slate-200'
+                    }`}
+                    onClick={() => setActiveSpaceId(space.id)}
+                    title={space.cwd}
+                  >
+                    {space.label}
+                  </button>
+                  <div className="min-w-0 flex-1 truncate font-mono text-[11px] text-slate-500">
+                    {space.cwd}
+                  </div>
+                  <button
+                    type="button"
+                    className="text-xs text-slate-400 hover:text-slate-200"
+                    onClick={() => {
+                      setSpaceEditingId(space.id);
+                      setSpaceDraftLabel(space.label);
+                      setSpaceDraftCwd(space.cwd);
+                      setSpaceError(null);
+                    }}
+                  >
+                    编辑
+                  </button>
+                  <button
+                    type="button"
+                    className="text-xs text-red-300 hover:text-red-200"
+                    onClick={() => {
+                      const ok = window.confirm(`确认删除空间：${space.label} ?`);
+                      if (!ok) return;
+                      setTerminalSpaces((prev) => prev.filter((s) => s.id !== space.id));
+                      if (activeSpaceId === space.id) setActiveSpaceId('default');
+                      if (spaceEditingId === space.id) {
+                        setSpaceEditingId(null);
+                        setSpaceDraftLabel('');
+                        setSpaceDraftCwd('');
+                      }
+                    }}
+                  >
+                    删除
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="mt-1 text-xs text-slate-500">暂无空间（可点击上方“新建空间”添加）</div>
+          )}
+        </div>
+      ) : null}
+      <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-400">
         <div className="text-slate-400">默认目录</div>
         <input
           className="h-8 w-[460px] max-w-full rounded-md border border-slate-700 bg-slate-950 px-2 font-mono text-xs text-slate-100 outline-none focus:ring-2 focus:ring-cyan-500"
@@ -1065,7 +1326,10 @@ export function TerminalPanelInner(
         <Button
           variant="outline"
           size="sm"
-          onClick={() => setPickerOpen(true)}
+          onClick={() => {
+            setPickerTarget('workspace');
+            setPickerOpen(true);
+          }}
           disabled={cwdSaving}
         >
           选择目录
@@ -1118,7 +1382,9 @@ export function TerminalPanelInner(
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
           <div className="w-[860px] max-w-[96vw] overflow-hidden rounded-lg border border-slate-700 bg-slate-950 shadow-2xl">
             <div className="flex items-center gap-2 border-b border-slate-800 px-4 py-3 text-sm text-slate-100">
-              <div className="font-semibold">选择默认目录</div>
+              <div className="font-semibold">
+                {pickerTarget === 'space' ? '选择空间目录' : '选择默认目录'}
+              </div>
               <div className="ml-auto flex items-center gap-2">
                 <Button
                   variant="outline"
@@ -1159,7 +1425,11 @@ export function TerminalPanelInner(
                     size="sm"
                     onClick={() => {
                       if (!pickerListing?.path) return;
-                      setCwdDraft(pickerListing.path);
+                      if (pickerTarget === 'space') {
+                        setSpaceDraftCwd(pickerListing.path);
+                      } else {
+                        setCwdDraft(pickerListing.path);
+                      }
                       setPickerOpen(false);
                     }}
                     disabled={pickerLoading || !pickerListing?.path}
@@ -1207,7 +1477,11 @@ export function TerminalPanelInner(
                         className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-slate-900"
                         onClick={() => void loadDirListing(d.path)}
                         onDoubleClick={() => {
-                          setCwdDraft(d.path);
+                          if (pickerTarget === 'space') {
+                            setSpaceDraftCwd(d.path);
+                          } else {
+                            setCwdDraft(d.path);
+                          }
                           setPickerOpen(false);
                         }}
                       >
@@ -1260,11 +1534,20 @@ export function TerminalPanelInner(
           <div className="mt-2 flex items-center gap-2 overflow-auto rounded-md border border-slate-800 bg-slate-950/50 px-2 py-1">
             {tabs.map((t) => {
               const isActive = t.id === activeId;
+              const tone = t.running ? 'running' : t.exitCode === 0 ? 'completed' : ('idle' as const);
+              const toneText =
+                tone === 'running'
+                  ? 'text-blue-300'
+                  : tone === 'completed'
+                    ? 'text-green-300'
+                    : isActive
+                      ? 'text-slate-100'
+                      : 'text-slate-200';
               return (
                 <div
                   key={t.id}
-                  className={`flex items-center gap-1 rounded px-2 py-1 text-xs ${
-                    isActive ? 'bg-slate-800 text-slate-100' : 'bg-transparent text-slate-300'
+                  className={`flex items-center gap-1 rounded px-2 py-1 text-xs ${toneText} ${
+                    isActive ? 'bg-slate-800' : 'bg-transparent'
                   }`}
                 >
                   <button
