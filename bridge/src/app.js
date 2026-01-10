@@ -160,7 +160,7 @@ const DEFAULT_PROMPT_CONFIG = {
       '本文件集中管理本项目所有可编辑的 LLM 提示词模板（system/user）。\n' +
       '每个 stages.<key> 对应一个自动化步骤：生成/澄清/评分/编排；Bridge 调用模型时会读取这里的模板，并用 {{变量}} 注入上下文。\n' +
       '统一约定：默认只输出 JSON（不要 Markdown/解释），以便被程序可靠解析。\n' +
-      'MVP5 智能任务编排会优先使用 Claude 4.5 Opus（claude-opus-4-5-20251101）生成“并发受限、worker 池复用”的执行方案；失败会自动降级为规则方案。',
+      'MVP5 智能任务编排会优先使用 Claude 4.5 Opus（claude-opus-4-5-20251101）生成“并发受限、worker 池复用”的执行方案；若调用失败/输出不可解析，将直接返回错误并在 UI 暴露原因。',
   },
   stages: {
     projectCategory: {
@@ -3906,24 +3906,8 @@ function ensureRequirementsClarificationsSeeded(specName, status, prompt) {
   );
   if (normalized.requirementsConfirmed) return { changed: false, status: normalized };
   if (current.questions.length > 0) return { changed: false, status: normalized };
-  const seed = buildDefaultRequirementsClarificationQuestions(prompt);
-  const normalizedSeed = normalizeRequirementsClarifications({ questions: seed });
-  if (!normalizedSeed.questions.length) return { changed: false, status: normalized };
-
-  const now = new Date().toISOString();
-  const next = {
-    ...normalized,
-    requirementsClarifications: {
-      ...current,
-      questions: normalizedSeed.questions,
-      updatedAt: now,
-      confirmedAt: normalized.requirementsClarifications?.confirmedAt ?? null,
-      generatedBy: 'default',
-      generationError: null,
-    },
-  };
-  writeSpecStatus(specName, next);
-  return { changed: true, status: next };
+  // No default clarification questions as fallback.
+  return { changed: false, status: normalized };
 }
 
 function slugifyPrompt(prompt) {
@@ -4039,7 +4023,7 @@ function generateTasksContent(design, prompt) {
   ];
 
   const notes = [
-    '提示：本次 tasks.md 为兜底任务模板（模型输出不满足质量约束时会降级）。可直接在 TASKS_JSON 内替换/增删为更贴合的任务。',
+    '提示：本段为 tasks.md 模板（非模型生成结果），用于手工编辑/修复；可直接在 TASKS_JSON 内替换/增删任务。',
   ];
   return buildTasksDagMarkdown({ tasks }, { notes });
 }
@@ -5633,13 +5617,26 @@ async function generateTasksWithModel(design, prompt, options = {}) {
         });
 
     const payload = tryParseJson(content);
-    const rawTasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
+    if (!payload || typeof payload !== 'object') {
+      const err = new Error(`LLM tasks output not JSON: ${String(content).slice(0, 200)}`);
+      err.llmContext = describeLlmConfig(getActiveLlmConfig());
+      throw err;
+    }
+    if (!Array.isArray(payload.tasks)) {
+      const err = new Error(`LLM tasks JSON missing tasks[]: ${JSON.stringify(payload).slice(0, 200)}`);
+      err.llmContext = describeLlmConfig(getActiveLlmConfig());
+      throw err;
+    }
+    const rawTasks = payload.tasks;
     const normalized = ensureUniqueDagTaskIds(
       rawTasks.map((t, idx) => normalizeDagTaskObject(t, idx)).filter(Boolean),
     );
     if (!normalized.length) {
-      recordTelemetry(null);
-      return generateTasksContent(design, prompt);
+      const err = new Error(
+        `LLM tasks JSON contains no valid tasks: ${JSON.stringify(payload).slice(0, 200)}`,
+      );
+      err.llmContext = describeLlmConfig(getActiveLlmConfig());
+      throw err;
     }
 
     const trimmed = normalized.slice(0, Math.min(maxTasks, 25));
@@ -5921,13 +5918,9 @@ async function atomizeSummaryParts(
       );
       results.push(...subTasks);
     } catch (error) {
-      if (error?.partialTasks?.length) {
-        logAtomize(job, '子任务拆分输出不规范，已自动降级。');
-        results.push(...error.partialTasks);
-        continue;
-      }
-      logAtomize(job, '子任务拆分失败，已使用占位任务。');
-      results.push(...buildFallbackAtomicTasks(part));
+      const message = truncateText(error?.message || String(error || ''), 180);
+      logAtomize(job, `子任务拆分失败：${message}`);
+      throw error;
     }
   }
   return results;
@@ -5943,7 +5936,7 @@ async function atomizeTaskSummarySafe(
   extraReason = '',
 ) {
   const cleaned = sanitizeModelText(summary || '', '').trim();
-  if (!cleaned) return buildFallbackAtomicTasks(summary);
+  if (!cleaned) throw new Error('Empty task summary (cannot atomize)');
   const looksStructured =
     /标题：|核心逻辑：|技术细节：|验收准则：/.test(cleaned) ||
     cleaned.includes('\n');
@@ -5974,10 +5967,6 @@ async function atomizeTaskSummarySafe(
       extraReason,
     );
   } catch (error) {
-    if (error?.partialTasks?.length) {
-      logAtomize(job, `原始任务输出不规范（${error.partialReason || 'invalid'}），已自动降级。`);
-      return error.partialTasks;
-    }
     const parts = splitSummaryForAtomize(cleaned, 3);
     if (parts.length > 1) {
       logAtomize(job, `原始任务拆分为 ${parts.length} 段后重试。`);
@@ -5992,8 +5981,8 @@ async function atomizeTaskSummarySafe(
       if (results.length) return results;
     }
     const reason = truncateText(error?.message || String(error || ''), 180);
-    logAtomize(job, `原子化失败${reason ? `（${reason}）` : ''}，已生成占位任务。`);
-    return buildFallbackAtomicTasks(cleaned);
+    logAtomize(job, `原子化失败${reason ? `（${reason}）` : ''}`);
+    throw error;
   }
 }
 
@@ -6141,13 +6130,11 @@ async function runAtomizeJob(specName, job, options = {}) {
       forceNew: options?.forceNewFlowRun === true,
     });
 
-    let canUseModel = true;
     try {
       assertValidLlmConfig(getActiveLlmConfig());
     } catch (error) {
-      canUseModel = false;
       const message = truncateText(error?.message || String(error || ''), 180);
-      logAtomize(job, `模型配置不可用${message ? `（${message}）` : ''}，本次将生成占位任务。`);
+      logAtomize(job, `模型配置不可用${message ? `（${message}）` : ''}`);
       appendFlowRunStageAttempt(
         specName,
         'atomize',
@@ -6163,6 +6150,7 @@ async function runAtomizeJob(specName, job, options = {}) {
         },
         { reason: flowRunReason },
       );
+      throw error;
     }
 
     const requirementsPath = resolveSpecFile(specName, 'requirements');
@@ -6174,26 +6162,12 @@ async function runAtomizeJob(specName, job, options = {}) {
     let designMarkdown = fs.existsSync(designPath)
       ? fs.readFileSync(designPath, 'utf8')
       : '';
-    if (!designMarkdown.trim() && (requirementsContent.trim() || status.prompt)) {
-      designMarkdown = generateDesignContent(requirementsContent, status.prompt);
-      writeSpecFile(specName, 'design', designMarkdown);
-      logAtomize(job, 'design.md 缺失，已自动生成模板。');
-    }
+    if (!designMarkdown.trim()) throw new Error('design.md 缺失/为空，无法原子化');
 
     const tasksPath = resolveSpecFile(specName, 'tasks');
     let tasksMarkdown = fs.existsSync(tasksPath) ? fs.readFileSync(tasksPath, 'utf8') : '';
     let originalTasks = parseTasksForAtomize(tasksMarkdown);
-    if (!originalTasks.length && (designMarkdown.trim() || status.prompt)) {
-      const fallbackTasksMarkdown = generateTasksContent(designMarkdown, status.prompt);
-      writeSpecFile(specName, 'tasks', fallbackTasksMarkdown);
-      tasksMarkdown = fallbackTasksMarkdown;
-      originalTasks = parseTasksForAtomize(tasksMarkdown);
-      if (originalTasks.length) {
-        logAtomize(job, 'tasks.md 缺失/格式不兼容，已自动生成模板任务清单。');
-      }
-    }
-
-    if (!originalTasks.length) throw new Error('任务列表为空，无法原子化');
+    if (!originalTasks.length) throw new Error('tasks.md 为空或格式不合法，无法原子化');
 
     const designSnippet = truncateText(designMarkdown, 1200);
 
@@ -6265,17 +6239,15 @@ async function runAtomizeJob(specName, job, options = {}) {
         recordAttempt: (attempt) =>
           appendFlowRunStageAttempt(specName, 'atomize', attempt, { reason: flowRunReason }),
       };
-      const atomized = canUseModel
-        ? await atomizeTaskSummarySafe(
-            summaryForModel,
-            designSnippet,
-            maxRounds,
-            timeoutMs,
-            job,
-            telemetry,
-            iterationReason,
-          )
-        : buildFallbackAtomicTasks(originalTitle);
+      const atomized = await atomizeTaskSummarySafe(
+        summaryForModel,
+        designSnippet,
+        maxRounds,
+        timeoutMs,
+        job,
+        telemetry,
+        iterationReason,
+      );
       const section = buildAtomicSection(index, originalTitle, atomized);
       fs.appendFileSync(atomicPath, `\n\n${section}\n`, 'utf8');
       doneIndices.add(index);
@@ -6627,12 +6599,20 @@ async function createSpecTemplates(name, artifacts = ['requirements'], prompt = 
             onTelemetry,
           });
         } catch (error) {
-          const fallbackQuestions = buildDefaultRequirementsClarificationQuestions(prompt);
-          clarifications = {
-            questions: fallbackQuestions,
-            generatedBy: 'default',
+          const now = new Date().toISOString();
+          const nextStatus = readSpecStatus(name);
+          recordSpecError(nextStatus, 'requirementsClarifications', error, null);
+          nextStatus.requirementsClarifications = {
+            ...normalizeRequirementsClarifications(nextStatus.requirementsClarifications || {}),
+            questions: [],
+            updatedAt: now,
+            confirmedAt: nextStatus.requirementsClarifications?.confirmedAt ?? null,
+            generatedBy: 'llm',
             generationError: error?.message || 'Clarifications generation failed',
           };
+          writeSpecStatus(name, nextStatus);
+          onStage?.('requirementsClarifications', 'end');
+          throw error;
         }
         onStage?.('requirementsClarifications', 'end');
         const normalizedClarifications = normalizeRequirementsClarifications(clarifications);
@@ -6662,19 +6642,18 @@ async function createSpecTemplates(name, artifacts = ['requirements'], prompt = 
 
   if (categoryPromise) {
     const result = await categoryPromise;
-    const fallbackCategory = inferProjectCategoryFromPrompt(prompt);
-    const decided = result?.projectCategory || fallbackCategory;
-    const now = new Date().toISOString();
-    const status = readSpecStatus(name);
-    const nextStatus = {
-      ...status,
-      projectCategory: decided,
-      projectCategoryMeta: result
-        ? { ...result, judgedAt: now, source: 'llm' }
-        : { projectCategory: decided, confidence: null, reason: '', judgedAt: now, source: 'heuristic' },
-      techStackConfirmed: decided === 'non_software' ? true : status.techStackConfirmed,
-    };
-    writeSpecStatus(name, nextStatus);
+    if (result?.projectCategory) {
+      const now = new Date().toISOString();
+      const status = readSpecStatus(name);
+      const nextStatus = {
+        ...status,
+        projectCategory: result.projectCategory,
+        projectCategoryMeta: { ...result, judgedAt: now, source: 'llm' },
+        techStackConfirmed:
+          result.projectCategory === 'non_software' ? true : status.techStackConfirmed,
+      };
+      writeSpecStatus(name, nextStatus);
+    }
   }
 }
 
@@ -6953,6 +6932,8 @@ function listTerminalSessions() {
     args: t.args,
     cwd: t.cwd,
     running: t.running,
+    paused: t.paused === true,
+    pausedAt: t.pausedAt || null,
     createdAt: t.createdAt,
     exitedAt: t.exitedAt,
     exitCode: t.exitCode,
@@ -7020,6 +7001,8 @@ function createTerminalSession(options) {
     cwd,
     pid: proc.pid,
     running: true,
+    paused: false,
+    pausedAt: null,
     createdAt: new Date().toISOString(),
     exitedAt: null,
     exitCode: null,
@@ -7038,6 +7021,8 @@ function createTerminalSession(options) {
       args: session.args,
       cwd: session.cwd,
       running: session.running,
+      paused: session.paused === true,
+      pausedAt: session.pausedAt || null,
       createdAt: session.createdAt,
       exitedAt: session.exitedAt,
       exitCode: session.exitCode,
@@ -7055,6 +7040,8 @@ function createTerminalSession(options) {
 
   proc.onExit(({ exitCode }) => {
     session.running = false;
+    session.paused = false;
+    session.pausedAt = null;
     session.exitedAt = new Date().toISOString();
     session.exitCode = typeof exitCode === 'number' ? exitCode : null;
     io.emit('terminal:exit', {
@@ -7091,6 +7078,106 @@ function killTerminal(session) {
   } catch {
     // ignore
   }
+}
+
+function pauseTerminalSession(session) {
+  if (!session) {
+    const error = new Error('Terminal not found');
+    error.status = 404;
+    throw error;
+  }
+  if (!session.proc || !session.running) {
+    const error = new Error('Terminal is not running');
+    error.status = 409;
+    throw error;
+  }
+  if (session.paused) return session;
+
+  const pid = Number(session.pid);
+  if (!Number.isFinite(pid) || pid <= 0) {
+    const error = new Error('Terminal pid is invalid');
+    error.status = 500;
+    throw error;
+  }
+
+  try {
+    if (process.platform === 'win32') {
+      const { execFileSync } = require('child_process');
+      execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-Command',
+          `Suspend-Process -Id ${pid} -ErrorAction Stop`,
+        ],
+        { stdio: 'ignore' },
+      );
+    } else {
+      process.kill(pid, 'SIGSTOP');
+    }
+  } catch (e) {
+    const error = new Error(`Failed to pause terminal: ${e?.message || e}`);
+    error.status = 500;
+    throw error;
+  }
+
+  session.paused = true;
+  session.pausedAt = new Date().toISOString();
+  io.emit('terminal:paused', { terminalId: session.id, pid: session.pid });
+  return session;
+}
+
+function resumeTerminalSession(session) {
+  if (!session) {
+    const error = new Error('Terminal not found');
+    error.status = 404;
+    throw error;
+  }
+  if (!session.proc || !session.running) {
+    const error = new Error('Terminal is not running');
+    error.status = 409;
+    throw error;
+  }
+  if (!session.paused) return session;
+
+  const pid = Number(session.pid);
+  if (!Number.isFinite(pid) || pid <= 0) {
+    const error = new Error('Terminal pid is invalid');
+    error.status = 500;
+    throw error;
+  }
+
+  try {
+    if (process.platform === 'win32') {
+      const { execFileSync } = require('child_process');
+      execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-Command',
+          `Resume-Process -Id ${pid} -ErrorAction Stop`,
+        ],
+        { stdio: 'ignore' },
+      );
+    } else {
+      process.kill(pid, 'SIGCONT');
+    }
+  } catch (e) {
+    const error = new Error(`Failed to resume terminal: ${e?.message || e}`);
+    error.status = 500;
+    throw error;
+  }
+
+  session.paused = false;
+  session.pausedAt = null;
+  io.emit('terminal:resumed', { terminalId: session.id, pid: session.pid });
+  return session;
 }
 
 function pauseProcessIfNeeded() {
@@ -7402,6 +7489,8 @@ const routesContext = {
   requestAtomicTasks,
   resetAtomicFile,
   resizeTerminal,
+  pauseTerminalSession,
+  resumeTerminalSession,
   resolveDesignPrompt,
   resolveExistingDirectory,
   resolveFlowRunDir,

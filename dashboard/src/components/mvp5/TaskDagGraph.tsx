@@ -7,6 +7,8 @@ import ReactFlow, {
   MarkerType,
   MiniMap,
   Position,
+  useEdgesState,
+  useNodesState,
   type ReactFlowInstance,
   type Edge,
   type Node,
@@ -184,6 +186,7 @@ export function TaskDagGraph({
   const flowRef = useRef<ReactFlowInstance | null>(null);
   const boundsRef = useRef<TaskDagBounds | null>(null);
   const lastRecoverAtRef = useRef<number | null>(null);
+  const lastIssueLoggedRef = useRef<string | null>(null);
   const [renderIssue, setRenderIssue] = useState<string | null>(null);
   const [flowKey, setFlowKey] = useState(0);
   const lastHardResetAtRef = useRef<number>(0);
@@ -263,7 +266,7 @@ export function TaskDagGraph({
     recoverView('reset');
   }, [recoverView, resetKey]);
 
-  const { nodes, edges, bounds } = useMemo(() => {
+  const { nodes: layoutedNodes, edges: layoutedEdges, bounds } = useMemo(() => {
     const actionsEnabled = Boolean(taskActionsById);
     const nodeWidth = actionsEnabled ? 300 : 260;
     const nodeHeight = actionsEnabled ? 120 : 90;
@@ -460,10 +463,29 @@ export function TaskDagGraph({
     return { ...layouted, bounds: computeDagBounds(layouted.nodes) };
   }, [graph, statusKey, taskActionsById, taskStatusById]);
 
+  const [rfNodes, setRfNodes, onNodesChange] = useNodesState<Node>([]);
+  const [rfEdges, setRfEdges] = useEdgesState<Edge>([]);
+
+  useEffect(() => {
+    setRfNodes((prev) => {
+      const prevById = new Map(prev.map((n) => [n.id, n]));
+      return layoutedNodes.map((node) => {
+        const prevNode = prevById.get(node.id);
+        if (!prevNode) return node;
+        return {
+          ...node,
+          width: prevNode.width ?? node.width,
+          height: prevNode.height ?? node.height,
+        };
+      });
+    });
+    setRfEdges(layoutedEdges);
+  }, [layoutedEdges, layoutedNodes, setRfEdges, setRfNodes]);
+
   boundsRef.current = bounds;
 
   useEffect(() => {
-    if (!nodes.length) {
+    if (!rfNodes.length) {
       setRenderIssue(null);
       return;
     }
@@ -483,10 +505,8 @@ export function TaskDagGraph({
       const hasSize = rect.width > 12 && rect.height > 12;
       if (!hasSize) return;
 
-      const expectedCount = nodes.length;
+      const expectedCount = rfNodes.length;
       const domCount = root.querySelectorAll('.react-flow__node').length;
-      const expectedEdgeCount = edges.length;
-      const edgeDomCount = root.querySelectorAll('.react-flow__edge-path').length;
 
       const viewport = typeof flow.getViewport === 'function' ? flow.getViewport() : null;
       const zoom = viewport && typeof viewport.zoom === 'number' ? viewport.zoom : null;
@@ -515,31 +535,40 @@ export function TaskDagGraph({
       const issue =
         expectedCount > 0 && domCount === 0
           ? '节点未渲染'
-          : expectedEdgeCount > 0 && edgeDomCount === 0
-            ? '连线未渲染'
-            : !viewportOk
+          : !viewportOk
               ? '视图参数异常'
               : offscreen
                 ? '节点全部在视口外'
                 : null;
 
       if (issue) {
-        console.error('[TaskDagGraph] render anomaly', {
-          issue,
-          expectedCount,
-          domCount,
-          expectedEdgeCount,
-          edgeDomCount,
-          viewport,
-          bounds,
-          rect: { width: rect.width, height: rect.height },
-        });
-        setRenderIssue((prev) => prev ?? issue);
+        if (lastIssueLoggedRef.current !== issue) {
+          lastIssueLoggedRef.current = issue;
+          const payload = {
+            issue,
+            expectedCount,
+            domCount,
+            viewport,
+            bounds,
+            rect: { width: rect.width, height: rect.height },
+          };
+          if (issue === '节点全部在视口外') {
+            console.warn('[TaskDagGraph] auto-recover viewport', payload);
+          } else {
+            console.error('[TaskDagGraph] render anomaly', payload);
+          }
+        }
+
+        // “节点全部在视口外”属于可恢复问题：自动 fitView，不再作为错误提示。
+        if (issue !== '节点全部在视口外') {
+          setRenderIssue((prev) => prev ?? issue);
+        }
         recoverView(issue);
-        if (issue === '节点未渲染' || issue === '连线未渲染') hardReset(issue);
+        if (issue === '节点未渲染') hardReset(issue);
         return;
       }
 
+      lastIssueLoggedRef.current = null;
       setRenderIssue(null);
     }, 220);
 
@@ -547,7 +576,7 @@ export function TaskDagGraph({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [bounds, edges, hardReset, nodes, recoverView]);
+  }, [bounds, hardReset, recoverView, rfNodes]);
 
   return (
     <div
@@ -569,8 +598,9 @@ export function TaskDagGraph({
       ) : null}
       <ReactFlow
         key={flowKey}
-        nodes={nodes}
-        edges={edges}
+        nodes={rfNodes}
+        edges={rfEdges}
+        onNodesChange={onNodesChange}
         fitView
         fitViewOptions={{ padding: 0.12 }}
         onlyRenderVisibleElements={false}

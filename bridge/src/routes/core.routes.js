@@ -337,6 +337,8 @@ function registerCoreRoutes(app, ctx) {
           title: session.title,
           pid: session.pid,
           running: session.running,
+          paused: session.paused === true,
+          pausedAt: session.pausedAt || null,
           createdAt: session.createdAt,
           exitedAt: session.exitedAt,
           exitCode: session.exitCode,
@@ -377,6 +379,36 @@ function registerCoreRoutes(app, ctx) {
       }
       resizeTerminal(session, req.body?.cols, req.body?.rows);
       return res.json({ ok: true });
+    });
+
+    app.post('/terminals/:id/pause', (req, res) => {
+      const session = getTerminalSession(req.params.id);
+      if (!session) {
+        return res.status(404).json({ error: 'Terminal not found' });
+      }
+      try {
+        pauseTerminalSession(session);
+        return res.json({ ok: true });
+      } catch (error) {
+        return res
+          .status(error?.status || 500)
+          .json({ error: error?.message || 'Failed to pause terminal' });
+      }
+    });
+
+    app.post('/terminals/:id/resume', (req, res) => {
+      const session = getTerminalSession(req.params.id);
+      if (!session) {
+        return res.status(404).json({ error: 'Terminal not found' });
+      }
+      try {
+        resumeTerminalSession(session);
+        return res.json({ ok: true });
+      } catch (error) {
+        return res
+          .status(error?.status || 500)
+          .json({ error: error?.message || 'Failed to resume terminal' });
+      }
     });
     
     app.delete('/terminals/:id', (req, res) => {
@@ -634,6 +666,212 @@ function registerCoreRoutes(app, ctx) {
       const defaults = loadPromptDefaults();
       const presets = loadPromptPresets().filter((item) => item && typeof item === 'object');
       return res.json({ current, defaults, presets });
+    });
+    
+    const OPUS_45_MODEL_ID = 'claude-opus-4-5-20251101';
+    
+    function normalizeOpusChatSessionId(value) {
+      if (typeof value !== 'string') return null;
+      const trimmed = value.trim();
+      if (!trimmed) return null;
+      if (trimmed.length > 80) return null;
+      if (!/^[A-Za-z0-9._-]+$/.test(trimmed)) return null;
+      return trimmed;
+    }
+    
+    function normalizeOpusChatMessage(value) {
+      if (typeof value !== 'string') return null;
+      const trimmed = value.trim();
+      if (!trimmed) return null;
+      if (trimmed.length > 24000) return trimmed.slice(0, 24000);
+      return trimmed;
+    }
+    
+    function ensureDir(dirPath) {
+      try {
+        fs.mkdirSync(dirPath, { recursive: true });
+      } catch {
+        // ignore
+      }
+    }
+    
+    function readJsonFile(filePath, fallback) {
+      try {
+        if (!fs.existsSync(filePath)) return fallback;
+        return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      } catch {
+        return fallback;
+      }
+    }
+    
+    function writeJsonFile(filePath, data) {
+      const tmp = `${filePath}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
+      fs.renameSync(tmp, filePath);
+    }
+    
+    function appendMarkdown(filePath, text) {
+      fs.appendFileSync(filePath, text, 'utf8');
+    }
+    
+    function buildDefaultPromptOptimizerSystemPrompt() {
+      return [
+        '你是“提示词架构师/审计员”（Prompt Architect）。',
+        '目标：对本系统 workflow/prompt-config.json 的所有 stages 提示词做整体优化，使其更稳定、更短、更易被程序解析、且更贴合本系统流程。',
+        '约束：',
+        '- 全程使用简体中文。',
+        '- 输出务必可执行、可落地；避免空泛原则堆砌。',
+        '- 优先减少冗余上下文、减少跑偏、减少 token 消耗，同时保留必要约束（尤其是只输出 JSON 的 stages）。',
+        '- 建议要区分“通用改进”与“逐 stage 改进”；必要时提出 3-6 个澄清问题，但不要超过 6 个。',
+        '- 不要输出任何 API key、baseUrl、环境变量等敏感信息。',
+      ].join('\n');
+    }
+    
+    /**
+     * POST /prompts/opus45/chat
+     * 与 Claude 4.5 Opus（通过 Bridge 的 LLM 通道）对话，并把对话过程追加到 docs/flow_*.md 文档中。
+     *
+     * body:
+     * - message: string (required)
+     * - sessionId?: string (optional, continue previous session)
+     * - title?: string (optional, only used when creating a new session)
+     */
+    app.post('/prompts/opus45/chat', async (req, res) => {
+      try {
+        const message = normalizeOpusChatMessage(req.body?.message ?? req.body?.prompt ?? '');
+        if (!message) return res.status(400).json({ error: 'message is required' });
+    
+        const requestedSessionId = normalizeOpusChatSessionId(req.body?.sessionId);
+        const newSessionId = `opus45-promptopt-${formatTimestamp(new Date())}-${nanoid(6)}`;
+        const sessionId = requestedSessionId || newSessionId;
+    
+        const runDir = path.join(REPO_DIR, '.runlogs', 'opus45-promptopt');
+        const sessionsDir = path.join(runDir, 'sessions');
+        ensureDir(sessionsDir);
+    
+        const sessionPath = path.join(sessionsDir, `${sessionId}.json`);
+        let session = readJsonFile(sessionPath, null);
+    
+        const created = !session;
+        if (!session) {
+          const titleRaw = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+          const title = titleRaw || '提示词整体优化';
+    
+          const docName = `flow_提示词优化_Opus4.5_${sessionId}.md`;
+          const docPath = path.join(DOCS_DIR, docName);
+    
+          const promptConfig = loadPromptConfig();
+          const systemPrompt = buildDefaultPromptOptimizerSystemPrompt();
+          const contextMessage = [
+            `当前 workflow/prompt-config.json（current）如下（请以此为准进行整体优化审计）：`,
+            '```json',
+            JSON.stringify(promptConfig, null, 2),
+            '```',
+          ].join('\n');
+    
+          session = {
+            version: 1,
+            sessionId,
+            title,
+            model: OPUS_45_MODEL_ID,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            docPath,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: contextMessage },
+            ],
+          };
+    
+          ensureDir(DOCS_DIR);
+          if (!fs.existsSync(docPath)) {
+            fs.writeFileSync(
+              docPath,
+              [
+                `# Opus 4.5 对话记录：${title}`,
+                '',
+                `- sessionId: ${sessionId}`,
+                `- model: ${OPUS_45_MODEL_ID}`,
+                `- createdAt: ${session.createdAt}`,
+                '',
+                '## System',
+                '```text',
+                systemPrompt,
+                '```',
+                '',
+                '## Context',
+                contextMessage,
+                '',
+                '---',
+                '',
+              ].join('\n'),
+              'utf8',
+            );
+          }
+        }
+    
+        const cfg = {
+          ...getLlmConfigForModel(OPUS_45_MODEL_ID),
+          responseFormat: 'none',
+          timeoutMs: Number(process.env.OPUS45_PROMPTOPT_TIMEOUT_MS || 120000),
+        };
+        assertValidLlmConfig(cfg);
+    
+        const messages = Array.isArray(session.messages) ? [...session.messages] : [];
+        messages.push({ role: 'user', content: message });
+    
+        let usage = null;
+        const reply = await callLlm(messages, cfg, {
+          onUsage: (u) => {
+            usage = u || null;
+          },
+        });
+    
+        messages.push({ role: 'assistant', content: reply });
+        session.messages = messages;
+        session.updatedAt = new Date().toISOString();
+        writeJsonFile(sessionPath, session);
+    
+        const turnIndex =
+          Math.max(0, Math.floor((messages.length - 2 /*system+context*/) / 2)) || 1;
+        const usageLine = usage
+          ? `\n\n> usage: prompt=${usage.promptTokens ?? '-'} completion=${usage.completionTokens ?? '-'} total=${usage.totalTokens ?? '-'}`
+          : '';
+        appendMarkdown(
+          session.docPath,
+          [
+            `## Turn ${turnIndex}`,
+            '',
+            `### User (${new Date().toISOString()})`,
+            message,
+            '',
+            `### Opus 4.5 (${new Date().toISOString()})`,
+            reply,
+            usageLine,
+            '',
+            '---',
+            '',
+          ].join('\n'),
+        );
+    
+        emitEvent('log:append', {
+          source: 'llm',
+          message: `[llm] opus45 promptopt chat ${created ? 'created' : 'continued'}: ${sessionId}`,
+        });
+    
+        return res.json({
+          ok: true,
+          created,
+          sessionId,
+          model: OPUS_45_MODEL_ID,
+          docPath: normalizePathForPrompt(session.docPath),
+          reply,
+          usage,
+        });
+      } catch (error) {
+        console.error('[opus45] promptopt chat error:', error?.message || error);
+        return res.status(500).json({ error: error?.message || 'Opus chat failed' });
+      }
     });
     
     app.post('/prompts', (req, res) => {
@@ -981,28 +1219,18 @@ function registerCoreRoutes(app, ctx) {
       if (!fs.existsSync(filePath)) {
         const status = readSpecStatus(specName);
         if (artifact === 'design' && status?.requirementsConfirmed) {
-          const requirementsPath = resolveSpecFile(specName, 'requirements');
-          const requirementsContent = fs.existsSync(requirementsPath)
-            ? fs.readFileSync(requirementsPath, 'utf8')
-            : '';
-          const content = generateDesignContent(requirementsContent, status.prompt);
-          writeSpecFile(specName, 'design', content);
+          return res.status(409).json({
+            error: 'Design file missing while requirements confirmed',
+            specName,
+            artifact,
+          });
         }
         if (artifact === 'tasks' && status?.designConfirmed) {
-          const designPath = resolveSpecFile(specName, 'design');
-          let designContent = fs.existsSync(designPath)
-            ? fs.readFileSync(designPath, 'utf8')
-            : '';
-          if (!designContent.trim() && status?.requirementsConfirmed) {
-            const requirementsPath = resolveSpecFile(specName, 'requirements');
-            const requirementsContent = fs.existsSync(requirementsPath)
-              ? fs.readFileSync(requirementsPath, 'utf8')
-              : '';
-            designContent = generateDesignContent(requirementsContent, status.prompt);
-            writeSpecFile(specName, 'design', designContent);
-          }
-          const content = generateTasksContent(designContent, status.prompt);
-          writeSpecFile(specName, 'tasks', content);
+          return res.status(409).json({
+            error: 'Tasks file missing while design confirmed',
+            specName,
+            artifact,
+          });
         }
       }
       if (!fs.existsSync(filePath)) {
@@ -1171,16 +1399,12 @@ function registerCoreRoutes(app, ctx) {
             status.lastError = null;
           } catch (error) {
             recordSpecError(status, 'requirements', error, null);
-            const fallback = buildRequirementsMarkdown(status.prompt, {
-              summary: status.prompt,
-              background: '',
-              user_stories: [],
-              acceptance: [],
+            writeSpecStatus(specName, status);
+            console.error('Requirements generation failed:', error?.message || error);
+            return respondError(502, error?.message || 'Requirements generation failed', {
+              stage: 'requirements',
+              context: error?.llmContext || null,
             });
-            requirementsContent = upsertRequirementsClarificationsSection(
-              fallback,
-              status.requirementsClarifications?.questions,
-            );
           }
           stream?.write({ type: 'delta', stage: 'requirements', delta: requirementsContent });
           stream?.write({ type: 'stage', stage: 'requirements', state: 'end' });
@@ -1349,8 +1573,13 @@ function registerCoreRoutes(app, ctx) {
                 },
               );
             } catch (error) {
+              recordSpecError(status, 'tasks', error, null);
+              writeSpecStatus(specName, status);
               console.error('Tasks generation failed:', error?.message || error);
-              content = generateTasksContent(designContent, status.prompt);
+              return respondError(502, error?.message || 'Tasks generation failed', {
+                stage: 'tasks',
+                context: error?.llmContext || null,
+              });
             }
             stream?.write({ type: 'delta', stage: 'tasks', delta: content });
             stream?.write({ type: 'stage', stage: 'tasks', state: 'end' });
@@ -1397,64 +1626,12 @@ function registerCoreRoutes(app, ctx) {
                 },
               );
             } catch (error) {
+              recordSpecError(status, 'tasks', error, null);
+              writeSpecStatus(specName, status);
               console.error('Tasks generation failed:', error?.message || error);
-              content = buildTasksDagMarkdown({
-                tasks: [
-                  {
-                    id: 'task_1',
-                    title: '明确交付目标与范围边界',
-                    description:
-                      '定义受众、交付物形态（Markdown/PDF/Slides）、范围/不做事项清单；产出 docs/brief.md（或写入 requirements/design）。',
-                    dependencies: [],
-                    scope: ['docs/'],
-                    estimated_complexity: 'Medium',
-                  },
-                  {
-                    id: 'task_2',
-                    title: '输出目录与提纲结构',
-                    description:
-                      '基于 task_1 输出目录结构与每章要点；产出 docs/outline.md（或写入 design）。',
-                    dependencies: ['task_1'],
-                    scope: ['docs/'],
-                    estimated_complexity: 'Medium',
-                  },
-                  {
-                    id: 'task_3',
-                    title: '补齐核心内容与素材',
-                    description:
-                      '填充各章节内容，包含时间线/预算/分工/资源清单（按需求选择）；产出 docs/draft.md。',
-                    dependencies: ['task_2'],
-                    scope: ['docs/'],
-                    estimated_complexity: 'High',
-                  },
-                  {
-                    id: 'task_4',
-                    title: '整理风险清单与预案',
-                    description:
-                      '列出触发条件/影响/应对措施；产出 docs/risk.md。',
-                    dependencies: ['task_2'],
-                    scope: ['docs/'],
-                    estimated_complexity: 'Medium',
-                  },
-                  {
-                    id: 'task_5',
-                    title: '一致性校对与终稿修订',
-                    description:
-                      '统一术语、数字、口径并修订；产出 docs/final.md。',
-                    dependencies: ['task_3', 'task_4'],
-                    scope: ['docs/'],
-                    estimated_complexity: 'Medium',
-                  },
-                  {
-                    id: 'task_6',
-                    title: '导出可交付版本与版本说明',
-                    description:
-                      '按交付形态导出 Markdown/PDF/Slides，并给出版本说明与获取方式。',
-                    dependencies: ['task_5'],
-                    scope: ['docs/'],
-                    estimated_complexity: 'Low',
-                  },
-                ],
+              return respondError(502, error?.message || 'Tasks generation failed', {
+                stage: 'tasks',
+                context: error?.llmContext || null,
               });
             }
             stream?.write({ type: 'delta', stage: 'tasks', delta: content });

@@ -19,6 +19,30 @@ body {
   border-radius: 999px;
 }
 
+/* Terminal scrollbar: make it more visible */
+.xterm-viewport {
+  scrollbar-width: auto;
+  scrollbar-color: rgba(148, 163, 184, 0.65) rgba(148, 163, 184, 0.14);
+}
+
+.xterm-viewport::-webkit-scrollbar {
+  width: 10px;
+}
+
+.xterm-viewport::-webkit-scrollbar-track {
+  background: rgba(148, 163, 184, 0.14);
+}
+
+.xterm-viewport::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.65);
+  border-radius: 999px;
+  border: 2px solid rgba(2, 6, 23, 0.8);
+}
+
+.xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.85);
+}
+
 @keyframes dag-edge-flow {
   from {
     stroke-dashoffset: 0;

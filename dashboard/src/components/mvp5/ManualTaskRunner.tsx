@@ -160,6 +160,15 @@ function getTaskDone(task: DagTask) {
   return task.done === true || task.status === 'completed';
 }
 
+function extractFocusedRunDocForUi(content: string) {
+  const text = String(content ?? '').trim();
+  if (!text) return '';
+  const marker = '## 本次任务';
+  const idx = text.indexOf(marker);
+  if (idx < 0) return text;
+  return text.slice(idx).trim();
+}
+
 async function copyTextToClipboard(text: string) {
   const payload = String(text ?? '');
   if (!payload) return false;
@@ -355,6 +364,8 @@ export function ManualTaskRunner({
   onSaveTasksContent,
   onToast,
   onRunPromptInClaudeAutoTerminal,
+  onPauseClaudeAutoTerminals,
+  onResumeClaudeAutoTerminals,
 }: {
   specId: string;
   tasksContent: string;
@@ -370,6 +381,8 @@ export function ManualTaskRunner({
       failedMarker: string;
     },
   ) => Promise<{ terminalId: string; title: string }>;
+  onPauseClaudeAutoTerminals?: (specId: string) => Promise<{ paused: number; total: number }>;
+  onResumeClaudeAutoTerminals?: (specId: string) => Promise<{ resumed: number; total: number }>;
 }) {
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [promptForTask, setPromptForTask] = useState<{
@@ -380,22 +393,19 @@ export function ManualTaskRunner({
   const [promptLoadingTaskId, setPromptLoadingTaskId] = useState<string | null>(null);
   const [dagExpanded, setDagExpanded] = useState(true);
   const [dagResetKey, setDagResetKey] = useState(0);
-  const [autoContinueEnabled, setAutoContinueEnabled] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem('mvp5AutoContinueEnabled') === '1';
-    } catch {
-      return false;
-    }
-  });
-  const autoContinueEnabledRef = useRef(autoContinueEnabled);
+
+  const [chainState, setChainState] = useState<'idle' | 'running' | 'paused'>('idle');
+  const chainStateRef = useRef<'idle' | 'running' | 'paused'>(chainState);
+  const chainBusyRef = useRef(false);
+  const [chainBusy, setChainBusy] = useState(false);
+  const pausedRef = useRef(false);
   useEffect(() => {
-    autoContinueEnabledRef.current = autoContinueEnabled;
-    try {
-      localStorage.setItem('mvp5AutoContinueEnabled', autoContinueEnabled ? '1' : '0');
-    } catch {
-      // ignore
-    }
-  }, [autoContinueEnabled]);
+    chainStateRef.current = chainState;
+    pausedRef.current = chainState === 'paused';
+  }, [chainState]);
+  useEffect(() => {
+    chainBusyRef.current = chainBusy;
+  }, [chainBusy]);
 
   const [taskDetailsOpenById, setTaskDetailsOpenById] = useState<Record<string, boolean>>({});
   const [taskDocById, setTaskDocById] = useState<
@@ -547,8 +557,10 @@ export function ManualTaskRunner({
   );
 
   const autoStartAllReadyTasks = useCallback(
-    async (reason: string) => {
-      if (!autoContinueEnabledRef.current) return;
+    async (reason: string, options?: { force?: boolean }) => {
+      const force = options?.force === true;
+      if (!force && chainStateRef.current !== 'running') return;
+      if (pausedRef.current) return;
       if (!onRunPromptInClaudeAutoTerminal) return;
       if (disabled) return;
 
@@ -570,13 +582,14 @@ export function ManualTaskRunner({
         });
         if (!readyTasks.length) return;
 
-        onToast(`自动继续：启动 ${readyTasks.map((t) => t.id).join(', ')}`, 'info');
+        onToast(`任务链：启动 ${readyTasks.map((t) => t.id).join(', ')}`, 'info');
         for (const task of readyTasks) {
+          if (pausedRef.current) break;
           try {
-            await startTaskInClaudeAuto(task, `自动继续(${reason})`);
+            await startTaskInClaudeAuto(task, `任务链(${reason})`);
           } catch (e: any) {
             onToast(
-              `自动继续启动失败：${task.id} · ${String(e?.message || e || '未知错误')}`,
+              `任务链启动失败：${task.id} · ${String(e?.message || e || '未知错误')}`,
               'error',
             );
           }
@@ -618,7 +631,6 @@ export function ManualTaskRunner({
     const newlyCompleted = Array.from(completed).filter((id) => !prev.has(id));
     prevCompletedRef.current = completed;
     if (!newlyCompleted.length) return;
-    if (!autoContinueEnabledRef.current) return;
     void autoStartAllReadyTasks(`completed:${newlyCompleted.join(',')}`);
   }, [autoStartAllReadyTasks, doneById, tasks]);
 
@@ -815,7 +827,7 @@ export function ManualTaskRunner({
         start: {
           label: promptLoading ? '生成中…' : '开始',
           title: '启动 Claude Code（全自动）并执行任务',
-          disabled: Boolean(disabled) || done || promptLoading,
+          disabled: Boolean(disabled) || done || promptLoading || chainState === 'paused' || chainBusy,
           onClick: () => void handleStartClaudeAuto(task),
         },
         running: {
@@ -841,6 +853,8 @@ export function ManualTaskRunner({
     handleMarkDone,
     handleMarkRunning,
     handleStartClaudeAuto,
+    chainBusy,
+    chainState,
     promptLoadingTaskId,
     statusById,
     tasks,
@@ -874,19 +888,73 @@ export function ManualTaskRunner({
         </div>
       </div>
 
+      <details className="mb-3 rounded-md border border-slate-800 bg-slate-950/40 px-3 py-2">
+        <summary className="cursor-pointer select-none text-xs font-semibold text-slate-200">
+          完整任务文档（tasks.md）
+        </summary>
+        <div className="mt-2">
+          <pre className="max-h-[420px] overflow-auto whitespace-pre-wrap break-words rounded border border-slate-800 bg-slate-950 px-2 py-2 text-xs text-slate-100">
+            {tasksContent || ''}
+          </pre>
+        </div>
+      </details>
+
       <div className="mb-3 rounded-md border border-slate-800 bg-slate-950/40 px-2 py-2">
         <div className="flex items-center justify-between gap-2 px-1">
           <div className="text-xs font-semibold text-slate-200">DAG 图（依赖关系）</div>
           <div className="flex items-center gap-3">
-            <label className="flex items-center gap-2 text-xs text-slate-400">
-              <input
-                type="checkbox"
-                checked={autoContinueEnabled}
-                onChange={(e) => setAutoContinueEnabled(e.target.checked)}
-                className="h-3.5 w-3.5 accent-purple-500"
-              />
-              <span className="select-none">自动继续</span>
-            </label>
+            <Button
+              size="sm"
+              variant={chainState === 'running' ? 'outline' : 'default'}
+              disabled={Boolean(disabled) || chainBusy || (!onRunPromptInClaudeAutoTerminal && chainState === 'idle')}
+              onClick={async () => {
+                if (chainBusyRef.current) return;
+                chainBusyRef.current = true;
+                setChainBusy(true);
+                try {
+                  const current = chainStateRef.current;
+                  if (current === 'idle') {
+                    chainStateRef.current = 'running';
+                    pausedRef.current = false;
+                    setChainState('running');
+                    void autoStartAllReadyTasks('global-start', { force: true });
+                    return;
+                  }
+                  if (current === 'running') {
+                    chainStateRef.current = 'paused';
+                    pausedRef.current = true;
+                    setChainState('paused');
+                    autoContinueQueuedRef.current = false;
+                    if (!onPauseClaudeAutoTerminals) throw new Error('终端不支持暂停');
+                    await onPauseClaudeAutoTerminals(specId);
+                    return;
+                  }
+                  chainStateRef.current = 'running';
+                  pausedRef.current = false;
+                  setChainState('running');
+                  if (!onResumeClaudeAutoTerminals) throw new Error('终端不支持继续');
+                  await onResumeClaudeAutoTerminals(specId);
+                  void autoStartAllReadyTasks('global-resume', { force: true });
+                } catch (e: any) {
+                  onToast(String(e?.message || e || '操作失败'), 'error');
+                } finally {
+                  chainBusyRef.current = false;
+                  setChainBusy(false);
+                }
+              }}
+            >
+              {chainBusy
+                ? chainState === 'running'
+                  ? '暂停中…'
+                  : chainState === 'paused'
+                    ? '继续中…'
+                    : '启动中…'
+                : chainState === 'running'
+                  ? '暂停'
+                  : chainState === 'paused'
+                    ? '继续'
+                    : '开始'}
+            </Button>
             <button
               type="button"
               onClick={() => {
@@ -1104,7 +1172,7 @@ export function ManualTaskRunner({
                       <div className="text-xs text-slate-500">加载中…</div>
                     ) : docState?.content ? (
                       <pre className="max-h-[320px] overflow-auto whitespace-pre-wrap break-words rounded border border-slate-800 bg-slate-950 px-2 py-2 text-xs text-slate-100">
-                        {docState.content}
+                        {extractFocusedRunDocForUi(docState.content)}
                       </pre>
                     ) : (
                       <div className="text-xs text-slate-500">暂无文档内容</div>

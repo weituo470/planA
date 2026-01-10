@@ -830,7 +830,13 @@ export default function App() {
   const [modelPing, setModelPing] = useState<
     Record<
       string,
-      { status: 'pending' | 'ok' | 'error' | 'unstable' | 'unsupported'; latencyMs?: number; error?: string }
+      {
+        status: 'pending' | 'ok' | 'error' | 'unstable' | 'unsupported';
+        latencyMs?: number;
+        error?: string;
+        failures?: number;
+        lastOkAt?: number;
+      }
     >
   >({});
   const [showLlmConfig, setShowLlmConfig] = useState(false);
@@ -1128,12 +1134,64 @@ export default function App() {
       setModelPing((prev) => {
         const next = { ...prev };
         for (const opt of opts) {
-          next[opt.id] = { status: 'pending' };
+          const existing = prev[opt.id];
+          next[opt.id] = existing ? { ...existing, status: 'pending' } : { status: 'pending' };
         }
         return next;
       });
       void Promise.all(
         opts.map(async (opt) => {
+          const markFailure = (rawError: string) => {
+            const errorText = String(rawError || '').trim() || '错误';
+            const isConfigError =
+              /Missing baseUrl|Missing .*apiKey|apiKey|LLM config missing|base_url invalid|Unsupported model|invalid api key|Unauthorized|Forbidden|\\b401\\b|\\b403\\b/i.test(
+                errorText,
+              );
+            const isHardNetworkError =
+              /(ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|socket hang up|fetch failed|getaddrinfo|certificate|CERT_|self signed|TLS|SSL)/i.test(
+                errorText,
+              );
+
+            setModelPing((prev) => {
+              const existing = prev[opt.id] ?? { status: 'pending' };
+              const failures = Math.max(0, Math.floor(existing.failures ?? 0)) + 1;
+              const lastOkAt = typeof existing.lastOkAt === 'number' ? existing.lastOkAt : null;
+              const now = Date.now();
+              const recentOkWindowMs = 30 * 60 * 1000;
+              const unstableFailuresThreshold = 3;
+              const hardErrorFailuresThreshold = 3;
+              const hasRecentOk = lastOkAt != null && now - lastOkAt < recentOkWindowMs;
+
+              let status: 'ok' | 'error' | 'unstable' | 'pending' =
+                existing.status === 'ok' ? 'ok' : 'pending';
+              if (isConfigError) {
+                status = 'error';
+              } else if (hasRecentOk) {
+                // 近期成功过：放宽“不稳定”判定，连续失败达到阈值才标记不稳定。
+                status = failures >= unstableFailuresThreshold ? 'unstable' : 'ok';
+              } else {
+                // 没有近期成功：先按“待观察”，失败累积到阈值再标记“不稳定”；明确网络不可达才标红。
+                if (isHardNetworkError && failures >= hardErrorFailuresThreshold) {
+                  status = 'error';
+                } else if (failures >= unstableFailuresThreshold) {
+                  status = 'unstable';
+                } else {
+                  status = existing.status === 'ok' ? 'unstable' : existing.status;
+                }
+              }
+
+              return {
+                ...prev,
+                [opt.id]: {
+                  ...existing,
+                  status,
+                  error: errorText,
+                  failures,
+                },
+              };
+            });
+          };
+
           try {
             const result = await apiJson<LlmPingResult>(
               `/llm/ping?model=${encodeURIComponent(opt.id)}`,
@@ -1141,15 +1199,17 @@ export default function App() {
             if (result.ok) {
               setModelPing((prev) => ({
                 ...prev,
-                [opt.id]: { status: 'ok', latencyMs: result.latencyMs ?? 0 },
+                [opt.id]: {
+                  ...(prev[opt.id] ?? { status: 'pending' }),
+                  status: 'ok',
+                  latencyMs: result.latencyMs ?? 0,
+                  error: undefined,
+                  failures: 0,
+                  lastOkAt: Date.now(),
+                },
               }));
             } else {
-              const errorText = String(result.error || '');
-              const isConfigError = /Missing baseUrl|apiKey|LLM config missing|base_url invalid|Unsupported model/i.test(errorText);
-              setModelPing((prev) => ({
-                ...prev,
-                [opt.id]: { status: isConfigError ? 'error' : 'unstable', error: result.error || '错误' },
-              }));
+              markFailure(String(result.error || '错误'));
             }
           } catch (e: any) {
             if (e?.status === 404) {
@@ -1159,10 +1219,7 @@ export default function App() {
               }));
               return;
             }
-            setModelPing((prev) => ({
-              ...prev,
-              [opt.id]: { status: 'unstable', error: String(e?.message || e) },
-            }));
+            markFailure(String(e?.message || e || '错误'));
           }
         }),
       );
@@ -2719,6 +2776,86 @@ export default function App() {
     return created;
   }, [saveMvp5TaskStatus, showToast]);
 
+  const pauseClaudeAutoRunsForSpec = useCallback(
+    async (specId: string) => {
+      const normalizedSpecId = String(specId || '').trim();
+      if (!normalizedSpecId) return { paused: 0, total: 0 };
+
+      const panel = terminalPanelRef.current;
+      if (!panel?.pauseTerminal) throw new Error('终端不支持暂停');
+
+      const terminalIds: string[] = [];
+      for (const [terminalId, run] of claudeAutoRunsRef.current.entries()) {
+        if (run?.specId === normalizedSpecId) terminalIds.push(terminalId);
+      }
+
+      let paused = 0;
+      for (const terminalId of terminalIds) {
+        try {
+          await panel.pauseTerminal(terminalId);
+          paused += 1;
+        } catch (e: any) {
+          console.warn('[pauseClaudeAutoRunsForSpec] pause failed', {
+            specId: normalizedSpecId,
+            terminalId,
+            error: e,
+          });
+        }
+      }
+
+      if (!terminalIds.length) {
+        showToast('当前没有运行中的任务终端', 'info');
+      } else if (paused === terminalIds.length) {
+        showToast(`已暂停 ${paused} 个任务终端`, 'info');
+      } else {
+        showToast(`已暂停 ${paused}/${terminalIds.length} 个任务终端（部分失败）`, 'error');
+      }
+
+      return { paused, total: terminalIds.length };
+    },
+    [showToast],
+  );
+
+  const resumeClaudeAutoRunsForSpec = useCallback(
+    async (specId: string) => {
+      const normalizedSpecId = String(specId || '').trim();
+      if (!normalizedSpecId) return { resumed: 0, total: 0 };
+
+      const panel = terminalPanelRef.current;
+      if (!panel?.resumeTerminal) throw new Error('终端不支持继续');
+
+      const terminalIds: string[] = [];
+      for (const [terminalId, run] of claudeAutoRunsRef.current.entries()) {
+        if (run?.specId === normalizedSpecId) terminalIds.push(terminalId);
+      }
+
+      let resumed = 0;
+      for (const terminalId of terminalIds) {
+        try {
+          await panel.resumeTerminal(terminalId);
+          resumed += 1;
+        } catch (e: any) {
+          console.warn('[resumeClaudeAutoRunsForSpec] resume failed', {
+            specId: normalizedSpecId,
+            terminalId,
+            error: e,
+          });
+        }
+      }
+
+      if (!terminalIds.length) {
+        showToast('当前没有运行中的任务终端', 'info');
+      } else if (resumed === terminalIds.length) {
+        showToast(`已继续 ${resumed} 个任务终端`, 'info');
+      } else {
+        showToast(`已继续 ${resumed}/${terminalIds.length} 个任务终端（部分失败）`, 'error');
+      }
+
+      return { resumed, total: terminalIds.length };
+    },
+    [showToast],
+  );
+
   const outputScrollRef = useRef<OutputScrollEl | null>(null);
   const outputLastScrollTopRef = useRef(0);
   const [outputAutoFollow, setOutputAutoFollow] = useState(true);
@@ -3051,8 +3188,8 @@ export default function App() {
                     : activePing.status === 'ok'
                       ? `连接 ${Math.max(0, Math.round(activePing.latencyMs ?? 0))}ms`
                       : activePing.status === 'unstable'
-                        ? '连接不稳定'
-                        : '连接错误'}
+                        ? `连接不稳定${activePing.error ? `：${String(activePing.error).slice(0, 40)}` : ''}`
+                        : `连接错误${activePing.error ? `：${String(activePing.error).slice(0, 40)}` : ''}`}
                 </span>
               )}
             </div>
@@ -3070,7 +3207,9 @@ export default function App() {
                     ? `${Math.max(0, Math.round(ping.latencyMs ?? 0))}ms`
                     : ping.status === 'unstable'
                       ? '不稳定'
-                      : '错误';
+                      : ping.error
+                        ? `错误：${String(ping.error).slice(0, 36)}`
+                        : '错误';
               const color =
                 ping.status === 'ok'
                   ? 'text-green-400'
@@ -3082,7 +3221,7 @@ export default function App() {
               return (
                 <span key={opt.id} className="text-slate-400">
                   {label}{' '}
-                  <span className={color}>
+                  <span className={color} title={ping.error ? String(ping.error) : undefined}>
                     {text}
                   </span>
                 </span>
@@ -4453,6 +4592,8 @@ export default function App() {
                             }}
                             onToast={(message, tone = 'error') => showToast(message, tone)}
                             onRunPromptInClaudeAutoTerminal={runPromptInClaudeAutoTerminal}
+                            onPauseClaudeAutoTerminals={pauseClaudeAutoRunsForSpec}
+                            onResumeClaudeAutoTerminals={resumeClaudeAutoRunsForSpec}
                           />
                         ) : (
                           <textarea

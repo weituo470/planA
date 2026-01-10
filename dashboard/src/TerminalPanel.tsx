@@ -25,6 +25,8 @@ type TerminalListItem = {
   args?: string[];
   cwd?: string;
   running: boolean;
+  paused?: boolean;
+  pausedAt?: string | null;
   createdAt?: string;
   exitedAt?: string | null;
   exitCode?: number | null;
@@ -147,6 +149,8 @@ export type TerminalPanelHandle = {
   listAssignableCliTerminals: () => AssignableCliTerminal[];
   focusTerminal: (terminalId: string) => void;
   sendTerminalInput: (terminalId: string, input: string) => Promise<void>;
+  pauseTerminal: (terminalId: string) => Promise<void>;
+  resumeTerminal: (terminalId: string) => Promise<void>;
   createClaudeAutoTerminal: () => Promise<{ terminalId: string; title: string }>;
   createClaudeAutoTerminalWithPrompt: (
     prompt: string,
@@ -243,6 +247,20 @@ export function TerminalPanelInner(
       { method: 'POST', body: JSON.stringify({ input }) },
       8000,
     );
+  }, []);
+
+  const pauseTerminal = useCallback(async (terminalId: string) => {
+    const id = String(terminalId || '').trim();
+    if (!id) return;
+    await apiJson(`/terminals/${encodeURIComponent(id)}/pause`, { method: 'POST' }, 8000);
+    setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, paused: true } : t)));
+  }, []);
+
+  const resumeTerminal = useCallback(async (terminalId: string) => {
+    const id = String(terminalId || '').trim();
+    if (!id) return;
+    await apiJson(`/terminals/${encodeURIComponent(id)}/resume`, { method: 'POST' }, 8000);
+    setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, paused: false } : t)));
   }, []);
 
   const fitAndReport = useCallback(
@@ -598,6 +616,8 @@ export function TerminalPanelInner(
         setActiveId(id);
       },
       sendTerminalInput,
+      pauseTerminal,
+      resumeTerminal,
       createClaudeAutoTerminal: async () => {
         const template = pickClaudeAutoTemplate();
         const terminalId = await createTerminal(template, { kind: 'claude' });
@@ -616,15 +636,22 @@ export function TerminalPanelInner(
         });
         // Claude Code 在 Windows 下会把 argv prompt 预填到输入框，但不会自动提交；补一个回车触发执行。
         try {
-          await new Promise((resolve) => window.setTimeout(resolve, 150));
-          await sendTerminalInput(terminalId, '\r');
+          await new Promise((resolve) => window.setTimeout(resolve, 650));
+          await sendTerminalInput(terminalId, '\r\n');
         } catch {
           // ignore
         }
         return { terminalId, title: template.title };
       },
     }),
-    [createTerminal, listAssignableCliTerminals, sendTerminalInput, startCodexAtomicTask],
+    [
+      createTerminal,
+      listAssignableCliTerminals,
+      pauseTerminal,
+      resumeTerminal,
+      sendTerminalInput,
+      startCodexAtomicTask,
+    ],
   );
 
   const refreshWorkspace = useCallback(async () => {
@@ -844,11 +871,23 @@ export function TerminalPanelInner(
       setTabs((prev) =>
         prev.map((t) =>
           t.id === terminalId
-            ? { ...t, running: false, exitCode: Number.isFinite(exitCode) ? exitCode : -1 }
+            ? { ...t, running: false, paused: false, exitCode: Number.isFinite(exitCode) ? exitCode : -1 }
             : t,
         ),
       );
       onTerminalExit?.({ terminalId, exitCode: Number.isFinite(exitCode) ? exitCode : -1 });
+    });
+
+    socket.on('terminal:paused', (payload: any) => {
+      const terminalId = String(payload?.terminalId || '').trim();
+      if (!terminalId) return;
+      setTabs((prev) => prev.map((t) => (t.id === terminalId ? { ...t, paused: true } : t)));
+    });
+
+    socket.on('terminal:resumed', (payload: any) => {
+      const terminalId = String(payload?.terminalId || '').trim();
+      if (!terminalId) return;
+      setTabs((prev) => prev.map((t) => (t.id === terminalId ? { ...t, paused: false } : t)));
     });
 
     socket.on('connect_error', () => setConnected(false));
