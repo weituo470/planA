@@ -27,12 +27,23 @@ type TaskActionSpec = {
   onClick: () => void | Promise<void>;
 };
 
+type TaskCliOption = { value: string; label: string };
+
+type TaskCliSelectSpec = {
+  value: string;
+  options: TaskCliOption[];
+  title?: string;
+  disabled?: boolean;
+  onChange: (value: string) => void | Promise<void>;
+};
+
 type TaskActionsById = Record<
   string,
   {
     start?: TaskActionSpec;
     running?: TaskActionSpec;
     done?: TaskActionSpec;
+    cli?: TaskCliSelectSpec;
   }
 >;
 
@@ -299,7 +310,7 @@ export function TaskDagGraph({
   const { nodes: layoutedNodes, edges: layoutedEdges, bounds } = useMemo(() => {
     const actionsEnabled = Boolean(taskActionsById);
     const nodeWidth = actionsEnabled ? 300 : 260;
-    const nodeHeight = actionsEnabled ? 136 : 104;
+    const nodeHeight = actionsEnabled ? 156 : 104;
     const nodesep = actionsEnabled ? 18 : 16;
     const ranksep = actionsEnabled ? 44 : 40;
 
@@ -399,7 +410,30 @@ export function TaskDagGraph({
               ) : null}
                <div className="flex-1" />
                {actionsEnabled && actions ? (
-                 <div className="mt-1.5 flex items-center gap-2">
+                 <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                   {actions.cli ? (
+                     <select
+                       className="pointer-events-auto h-7 max-w-[220px] rounded border border-slate-700 bg-slate-950/40 px-2 text-[12px] font-light text-slate-100"
+                       value={actions.cli.value}
+                       onChange={(e) => {
+                         e.preventDefault();
+                         e.stopPropagation();
+                         void actions.cli?.onChange(e.target.value);
+                       }}
+                       onClick={(e) => {
+                         e.preventDefault();
+                         e.stopPropagation();
+                       }}
+                       disabled={actions.cli.disabled}
+                       title={actions.cli.title}
+                     >
+                       {actions.cli.options.map((opt) => (
+                         <option key={opt.value} value={opt.value}>
+                           {opt.label}
+                         </option>
+                       ))}
+                     </select>
+                   ) : null}
                    {actions.start ? (
                     <button
                       type="button"

@@ -2639,6 +2639,7 @@ export default function App() {
     taskId: string;
     doneMarker: string;
     failedMarker: string;
+    cliToolId?: string;
   };
 
   const claudeAutoRunsRef = useRef<Map<string, ClaudeAutoRunContext>>(new Map());
@@ -2858,10 +2859,23 @@ export default function App() {
 
     let created: { terminalId: string; title: string };
     try {
-      created = await panel.createClaudeAutoTerminalWithPrompt(normalizedPrompt, {
-        specName: specId,
-        taskId,
-      });
+      const cliToolId = String(context?.cliToolId || '').trim() || 'builtin:claude';
+      if (cliToolId === 'builtin:claude') {
+        created = await panel.createClaudeAutoTerminalWithPrompt(normalizedPrompt, {
+          specName: specId,
+          taskId,
+        });
+      } else if (cliToolId === 'builtin:codex') {
+        created = await panel.createCodexTerminalWithPrompt(normalizedPrompt, {
+          specName: specId,
+          taskId,
+        });
+      } else {
+        created = await panel.createCliToolTerminalWithPrompt(cliToolId, normalizedPrompt, {
+          specName: specId,
+          taskId,
+        });
+      }
     } catch (error) {
       try {
         await saveMvp5TaskStatus(specId, taskId, 'pending');
@@ -2876,6 +2890,7 @@ export default function App() {
       taskId,
       doneMarker: context.doneMarker,
       failedMarker: context.failedMarker,
+      ...(context.cliToolId ? { cliToolId: context.cliToolId } : {}),
     });
     claudeAutoTerminalTailRef.current.set(created.terminalId, '');
 

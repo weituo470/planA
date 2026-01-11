@@ -10,6 +10,11 @@ type ToastType = 'info' | 'error';
 
 type ParallelPolicy = 'serial' | 'conservative' | 'aggressive';
 
+type CliToolInfo = {
+  id: string;
+  label?: string;
+};
+
 const PARALLEL_POLICY_MAX_RUNNING: Record<ParallelPolicy, number> = {
   serial: 1,
   conservative: 3,
@@ -39,6 +44,7 @@ export type DagTask = {
   description: string;
   dependencies: string[];
   scope: string[];
+  cliToolId?: string;
   estimated_complexity?: string;
   status?: 'pending' | 'running' | 'completed';
   done?: boolean;
@@ -99,6 +105,7 @@ function normalizeDagTask(input: any, index: number): DagTask | null {
   const scope = Array.isArray(obj.scope)
     ? obj.scope.map((v: any) => String(v ?? '').trim()).filter(Boolean)
     : [];
+  const cliToolId = typeof obj.cliToolId === 'string' ? obj.cliToolId.trim() : '';
   const estimated_complexity =
     typeof obj.estimated_complexity === 'string' ? obj.estimated_complexity.trim() : undefined;
   const status = normalizeTaskStatus(obj.status);
@@ -111,6 +118,7 @@ function normalizeDagTask(input: any, index: number): DagTask | null {
     description,
     dependencies,
     scope,
+    ...(cliToolId ? { cliToolId } : {}),
     estimated_complexity,
     status: done ? 'completed' : status,
     done,
@@ -503,6 +511,7 @@ export function ManualTaskRunner({
       taskId: string;
       doneMarker: string;
       failedMarker: string;
+      cliToolId?: string;
     },
   ) => Promise<{ terminalId: string; title: string }>;
   onPauseClaudeAutoTerminals?: (specId: string) => Promise<{ paused: number; total: number }>;
@@ -551,6 +560,9 @@ export function ManualTaskRunner({
   }, [chainBusy]);
 
   const [parallelPolicy, setParallelPolicy] = useState<ParallelPolicy>('conservative');
+  const [cliTools, setCliTools] = useState<CliToolInfo[]>([]);
+  const [cliToolsLoading, setCliToolsLoading] = useState(false);
+  const [cliToolsError, setCliToolsError] = useState<string | null>(null);
 
   const [taskDetailsOpenById, setTaskDetailsOpenById] = useState<Record<string, boolean>>({});
   const [taskDocById, setTaskDocById] = useState<
@@ -593,6 +605,33 @@ export function ManualTaskRunner({
       window.removeEventListener('workspace:changed', handler);
     };
   }, []);
+
+  const refreshCliTools = useCallback(async () => {
+    setCliToolsLoading(true);
+    setCliToolsError(null);
+    try {
+      const res = await fetch(`${BRIDGE_URL}/cli-tools`);
+      const data = res.ok ? await res.json() : null;
+      if (!res.ok) throw new Error(String(data?.error || `HTTP ${res.status}`));
+      const list = Array.isArray(data?.tools) ? data.tools : [];
+      const cleaned = list
+        .map((t: any) => ({
+          id: String(t?.id || '').trim(),
+          label: typeof t?.label === 'string' ? t.label.trim() : '',
+        }))
+        .filter((t: any) => t.id);
+      setCliTools(cleaned);
+    } catch (e: any) {
+      setCliTools([]);
+      setCliToolsError(String(e?.message || e || '读取 CLI 工具失败'));
+    } finally {
+      setCliToolsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshCliTools();
+  }, [refreshCliTools]);
 
   const parsed = useMemo(() => parseDagTasksFromTasksContent(tasksContent), [tasksContent]);
 
@@ -678,6 +717,137 @@ export function ManualTaskRunner({
     }
     return map;
   }, [tasks]);
+  const cliOptions = useMemo(() => {
+    const list = [
+      { id: 'builtin:claude', label: 'Claude Code（全自动）' },
+      { id: 'builtin:codex', label: 'Codex' },
+      ...cliTools.map((t) => ({
+        id: String(t?.id || '').trim(),
+        label: String(t?.label || '').trim() || String(t?.id || '').trim(),
+      })),
+    ].filter((t) => t.id);
+    const seen = new Set<string>();
+    return list.filter((item) => {
+      if (seen.has(item.id)) return false;
+      seen.add(item.id);
+      return true;
+    });
+  }, [cliTools]);
+  const defaultCliToolIdInFile = useMemo(() => {
+    const raw = (parsed as any)?.payload?.defaultCliToolId;
+    return typeof raw === 'string' ? raw.trim() : '';
+  }, [parsed]);
+  const effectiveDefaultCliToolId = defaultCliToolIdInFile || 'builtin:claude';
+  const cliLabelById = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const opt of cliOptions) {
+      const id = String(opt?.id || '').trim();
+      if (!id) continue;
+      const label = String(opt?.label || '').trim();
+      map[id] = label || id;
+    }
+    return map;
+  }, [cliOptions]);
+  const taskCliToolIdById = useMemo(() => {
+    const map: Record<string, string | undefined> = {};
+    for (const task of tasks) {
+      const raw = typeof task?.cliToolId === 'string' ? task.cliToolId.trim() : '';
+      if (raw) map[task.id] = raw;
+    }
+    return map;
+  }, [tasks]);
+  const handleSetDefaultCliToolId = useCallback(
+    async (nextToolIdRaw: string) => {
+      if (disabled) return;
+      const nextToolId = String(nextToolIdRaw || '').trim();
+      if (!nextToolId) return;
+      if (nextToolId === effectiveDefaultCliToolId) return;
+
+      const parsedDoc = parseDagTasksFromTasksContent(tasksContent);
+      if (!parsedDoc) {
+        onToast('tasks.md 解析失败：找不到 TASKS_JSON', 'error');
+        return;
+      }
+
+      const payload = parsedDoc.payload;
+      const nextPayload = { ...payload, defaultCliToolId: nextToolId };
+      const nextContent = replaceTasksJsonInContent(tasksContent, nextPayload);
+      if (!nextContent) {
+        onToast('写回 tasks.md 失败', 'error');
+        return;
+      }
+      await onSaveTasksContent(nextContent);
+      onToast(`已设置默认CLI：${cliLabelById[nextToolId] || nextToolId}`, 'info');
+    },
+    [cliLabelById, disabled, effectiveDefaultCliToolId, onSaveTasksContent, onToast, tasksContent],
+  );
+  const defaultCliOptionsForSelect = useMemo(() => {
+    const exists = cliOptions.some((opt) => String(opt?.id || '').trim() === effectiveDefaultCliToolId);
+    if (exists) return cliOptions;
+    if (!effectiveDefaultCliToolId) return cliOptions;
+    return [
+      { id: effectiveDefaultCliToolId, label: `未知（${effectiveDefaultCliToolId}）` },
+      ...cliOptions,
+    ];
+  }, [cliOptions, effectiveDefaultCliToolId]);
+
+  const handleSetTaskCliToolId = useCallback(
+    async (taskIdRaw: string, nextToolIdRaw: string) => {
+      if (disabled) return;
+      const taskId = String(taskIdRaw || '').trim();
+      if (!taskId) return;
+
+      const nextToolId = String(nextToolIdRaw || '').trim();
+      const current = String(taskCliToolIdById?.[taskId] || '').trim();
+      if (nextToolId === current) return;
+
+      const parsedDoc = parseDagTasksFromTasksContent(tasksContent);
+      if (!parsedDoc) {
+        onToast('tasks.md 解析失败：找不到 TASKS_JSON', 'error');
+        return;
+      }
+
+      const payload = parsedDoc.payload;
+      const list = Array.isArray(payload?.tasks) ? payload.tasks : [];
+      const idx = list.findIndex((t: any) => String(t?.id || '').trim() === taskId);
+      if (idx < 0) {
+        onToast(`找不到任务：${taskId}`, 'error');
+        return;
+      }
+
+      const nextTask = { ...(list[idx] || {}) };
+      if (nextToolId) {
+        nextTask.cliToolId = nextToolId;
+      } else {
+        delete nextTask.cliToolId;
+      }
+      list[idx] = nextTask;
+
+      const nextPayload = { ...payload, tasks: list };
+      const nextContent = replaceTasksJsonInContent(tasksContent, nextPayload);
+      if (!nextContent) {
+        onToast('写回 tasks.md 失败', 'error');
+        return;
+      }
+      await onSaveTasksContent(nextContent);
+      const defaultLabel = cliLabelById[effectiveDefaultCliToolId] || effectiveDefaultCliToolId;
+      onToast(
+        nextToolId
+          ? `已设置 ${taskId} CLI：${cliLabelById[nextToolId] || nextToolId}`
+          : `已清除 ${taskId} CLI（默认：${defaultLabel}）`,
+        'info',
+      );
+    },
+    [
+      cliLabelById,
+      disabled,
+      effectiveDefaultCliToolId,
+      onSaveTasksContent,
+      onToast,
+      taskCliToolIdById,
+      tasksContent,
+    ],
+  );
 
   const fetchPromptForTask = useCallback(
     async (task: DagTask) => {
@@ -832,23 +1002,28 @@ export function ManualTaskRunner({
         prompt,
         task.id,
       );
+      const cliToolId =
+        String(taskCliToolIdById?.[task.id] || '').trim() || String(effectiveDefaultCliToolId || '').trim();
       const created = await onRunPromptInClaudeAutoTerminal(promptWithMarkers, {
         specId,
         taskId: task.id,
         doneMarker,
         failedMarker,
+        ...(cliToolId ? { cliToolId } : {}),
       });
       onToast(`已启动：${task.id} · ${created.title || 'Claude Code'} · ${reason}`, 'info');
       return created;
     },
     [
       buildClaudePromptWithMarkers,
+      effectiveDefaultCliToolId,
       fetchPromptForTask,
       onRunPromptInClaudeAutoTerminal,
       onToast,
       parallelPolicy,
       specId,
       statusById,
+      taskCliToolIdById,
       tasks,
     ],
   );
@@ -1183,6 +1358,13 @@ export function ManualTaskRunner({
         start: { label: string; title: string; disabled: boolean; onClick: () => void };
         running: { label: string; title: string; disabled: boolean; onClick: () => void };
         done: { label: string; title: string; disabled: boolean; onClick: () => void };
+        cli?: {
+          value: string;
+          title: string;
+          disabled: boolean;
+          options: { value: string; label: string }[];
+          onChange: (nextValue: string) => void;
+        };
       }
     > = {};
 
@@ -1195,14 +1377,43 @@ export function ManualTaskRunner({
       const resourceBlocked = resourceBlockers.length > 0;
       const resourceBlockedText = resourceBlocked ? formatTaskIdList(resourceBlockers, 3) : null;
       const promptLoading = promptLoadingTaskId === task.id;
+      const defaultCliLabel = cliLabelById[effectiveDefaultCliToolId] || effectiveDefaultCliToolId;
+      const selectedCliToolId = String(taskCliToolIdById?.[task.id] || '').trim();
+      const effectiveCliToolId = selectedCliToolId || effectiveDefaultCliToolId;
+      const effectiveCliLabel = cliLabelById[effectiveCliToolId] || effectiveCliToolId;
+      const cliSelectDisabled =
+        Boolean(disabled) || chainBusy || chainState === 'paused' || status === 'running' || done;
+      const cliOptionsForTask: { value: string; label: string }[] = [
+        { value: '', label: `默认（${defaultCliLabel}）` },
+      ];
+      const seenCliValues = new Set<string>(['']);
+      for (const opt of cliOptions) {
+        const id = String(opt?.id || '').trim();
+        if (!id || seenCliValues.has(id)) continue;
+        seenCliValues.add(id);
+        cliOptionsForTask.push({ value: id, label: String(opt?.label || '').trim() || id });
+      }
+      if (selectedCliToolId && !seenCliValues.has(selectedCliToolId)) {
+        cliOptionsForTask.splice(1, 0, {
+          value: selectedCliToolId,
+          label: `未知（${selectedCliToolId}）`,
+        });
+      }
 
       const startTitle = blocked
         ? `前置任务未完成：${missingDeps.join(', ')}`
         : resourceBlocked
           ? `文件占用冲突（运行中）：${resourceBlockedText?.text ?? resourceBlockers.join(', ')}`
-          : '启动 Claude Code（全自动）并执行任务';
+          : `启动 ${effectiveCliLabel} 并执行任务`;
 
       map[task.id] = {
+        cli: {
+          value: selectedCliToolId,
+          title: selectedCliToolId ? `当前：${effectiveCliLabel}` : `默认：${defaultCliLabel}`,
+          disabled: cliSelectDisabled,
+          options: cliOptionsForTask,
+          onChange: (nextValue) => void handleSetTaskCliToolId(task.id, nextValue),
+        },
         start: {
           label: promptLoading ? '生成中…' : '开始',
           title: startTitle,
@@ -1238,17 +1449,22 @@ export function ManualTaskRunner({
 
     return map;
   }, [
+    cliLabelById,
+    cliOptions,
     disabled,
     doneById,
     handleGeneratePrompt,
     handleMarkDone,
     handleMarkRunning,
     handleStartClaudeAuto,
+    handleSetTaskCliToolId,
     chainBusy,
     chainState,
+    effectiveDefaultCliToolId,
     promptLoadingTaskId,
     resourceBlockedById,
     statusById,
+    taskCliToolIdById,
     tasks,
   ]);
 
@@ -1369,6 +1585,25 @@ export function ManualTaskRunner({
                 try {
                   const current = chainStateRef.current;
                   if (current === 'idle') {
+                    const cwd = String(workspace?.effectiveCwd || '').trim();
+                    if (!cwd) throw new Error('CLI 根目录未加载');
+                    const listRes = await fetch(`${BRIDGE_URL}/fs/list?path=${encodeURIComponent(cwd)}`);
+                    const listData = await listRes.json().catch(() => null);
+                    if (!listRes.ok) {
+                      throw new Error(String(listData?.error || '目录检查失败'));
+                    }
+                    const entries = Array.isArray(listData?.entries) ? listData.entries : [];
+                    if (entries.length > 0) {
+                      const names = entries
+                        .map((e: any) => String(e?.name || e?.path || '').trim())
+                        .filter(Boolean);
+                      const shown = names.slice(0, 6).join(', ');
+                      const rest = Math.max(0, names.length - 6);
+                      const ok = window.confirm(
+                        `警告：CLI 根目录非空\\n路径：${cwd}\\n已有 ${names.length} 项：${shown}${rest > 0 ? ` 等${rest}项` : ''}\\n\\n仍要开始整个任务链吗？`,
+                      );
+                      if (!ok) return;
+                    }
                     chainStateRef.current = 'running';
                     pausedRef.current = false;
                     setChainState('running');
@@ -1410,6 +1645,22 @@ export function ManualTaskRunner({
                     ? '继续'
                     : '开始'}
             </Button>
+            <div className="flex items-center gap-2 text-xs text-slate-400">
+              <span>默认CLI</span>
+              <select
+                className="h-8 max-w-[220px] rounded border border-slate-700 bg-slate-950 px-2 text-xs text-slate-100"
+                value={effectiveDefaultCliToolId}
+                onChange={(e) => void handleSetDefaultCliToolId(e.target.value)}
+                disabled={Boolean(disabled) || chainBusy || chainState !== 'idle'}
+                title="任务未指定 CLI 时，使用此默认值"
+              >
+                {defaultCliOptionsForSelect.map((opt) => (
+                  <option key={opt.id} value={opt.id}>
+                    {opt.label || opt.id}
+                  </option>
+                ))}
+              </select>
+            </div>
             <div className="flex items-center gap-2 text-xs text-slate-400">
               <span>并行策略</span>
               <select

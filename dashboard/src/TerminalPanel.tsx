@@ -205,6 +205,15 @@ export type TerminalPanelHandle = {
     prompt: string,
     meta?: { specName?: string; taskId?: string },
   ) => Promise<{ terminalId: string; title: string }>;
+  createCodexTerminalWithPrompt: (
+    prompt: string,
+    meta?: { specName?: string; taskId?: string },
+  ) => Promise<{ terminalId: string; title: string }>;
+  createCliToolTerminalWithPrompt: (
+    toolId: string,
+    prompt: string,
+    meta?: { specName?: string; taskId?: string },
+  ) => Promise<{ terminalId: string; title: string }>;
 };
 
 export function TerminalPanelInner(
@@ -733,14 +742,78 @@ export function TerminalPanelInner(
         await sendTerminalInput(terminalId, '\r');
         return { terminalId, title: template.title };
       },
+      createCodexTerminalWithPrompt: async (prompt: string, meta) => {
+        const initialPrompt = String(prompt || '').trim();
+        if (!initialPrompt) throw new Error('Prompt 不能为空');
+        const base = pickCodexTemplate();
+        const taskPrefix = meta?.taskId ? `${String(meta.taskId).trim()} · ` : '';
+        const template = { ...base, title: `${taskPrefix}${base.title}` };
+        const terminalId = await createTerminal(template, {
+          kind: 'codex',
+          ...(meta?.specName ? { specName: meta.specName } : {}),
+          ...(meta?.taskId ? { taskId: meta.taskId } : {}),
+        });
+        await new Promise((resolve) => window.setTimeout(resolve, 900));
+        await sendTerminalInput(terminalId, initialPrompt);
+        await sendTerminalInput(terminalId, '\r');
+        return { terminalId, title: template.title };
+      },
+      createCliToolTerminalWithPrompt: async (rawToolId: string, prompt: string, meta) => {
+        const toolId = String(rawToolId || '').trim();
+        if (!toolId) throw new Error('toolId 不能为空');
+        const initialPrompt = String(prompt || '').trim();
+        if (!initialPrompt) throw new Error('Prompt 不能为空');
+
+        const taskPrefix = meta?.taskId ? `${String(meta.taskId).trim()} · ` : '';
+        const tool = cliTools.find((t) => String(t?.id || '').trim() === toolId);
+        const title = `${taskPrefix}${tool?.label || toolId}`;
+
+        const size = getPreferredSize();
+        const data = await apiJson<{ id: string; pid: number; title: string }>(
+          '/terminals',
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              toolId,
+              title,
+              ...(desiredTerminalCwd ? { cwd: desiredTerminalCwd } : {}),
+              cols: size.cols,
+              rows: size.rows,
+            }),
+          },
+          15000,
+        );
+        addOrUpdateTab({
+          id: data.id,
+          pid: data.pid,
+          title: data.title || title,
+          ...(tool?.command ? { command: tool.command } : {}),
+          ...(Array.isArray(tool?.args) ? { args: tool.args } : {}),
+          ...(desiredTerminalCwd ? { cwd: desiredTerminalCwd } : {}),
+          running: true,
+          createdAt: new Date().toISOString(),
+          kind: 'custom',
+          ...(meta?.specName ? { specName: meta.specName } : {}),
+          ...(meta?.taskId ? { taskId: meta.taskId } : {}),
+        });
+        setActiveId(data.id);
+        await new Promise((resolve) => window.setTimeout(resolve, 900));
+        await sendTerminalInput(data.id, initialPrompt);
+        await sendTerminalInput(data.id, '\r');
+        return { terminalId: data.id, title: data.title || title };
+      },
     }),
     [
+      addOrUpdateTab,
       createTerminal,
+      desiredTerminalCwd,
+      getPreferredSize,
       listAssignableCliTerminals,
       pauseTerminal,
       resumeTerminal,
       sendTerminalInput,
       startCodexAtomicTask,
+      cliTools,
     ],
   );
 
