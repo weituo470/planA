@@ -1095,10 +1095,23 @@ function registerMvp5Routes(app, ctx) {
     
       const runId = nanoid(8);
       const marker = `__MVP5_TASK_DONE__${runId}__`;
-    
+
       const codexExecutable = (process.env.CODEX_COMMAND || 'codex').trim() || 'codex';
       // 固定使用非交互 exec，并强制 approval_policy=never，避免 CLI 卡在确认提示。
-      const args = ['-a', 'never', 'exec', '-s', sandbox, '--skip-git-repo-check'];
+      // 注意：Codex CLI 在本机 config.toml 中可能配置了 mcp_servers（claude-code / chrome-devtools）。
+      // 在 exec 模式下启动 MCP 可能导致进程无法退出，从而卡住 Worker；这里强制禁用 MCP。
+      const args = [
+        '-c',
+        'mcp_servers.claude-code.enabled=false',
+        '-c',
+        'mcp_servers.chrome-devtools.enabled=false',
+        '-a',
+        'never',
+        'exec',
+        '-s',
+        sandbox,
+        '--skip-git-repo-check',
+      ];
       if (model) {
         args.push('-m', model);
       }

@@ -16,6 +16,7 @@ import ReactFlow, {
 import dagre from 'dagre';
 
 import type { TaskGraph } from './types';
+import { getTestSessionId, postTestLogEvent } from '../../lib/test-logger';
 
 type TaskStatus = 'pending' | 'running' | 'completed' | 'failed';
 type TaskVisualStatus = TaskStatus | 'blocked' | 'ready';
@@ -207,6 +208,7 @@ function computeDagBounds(nodes: Node[]): TaskDagBounds | null {
 }
 
 export function TaskDagGraph({
+  specId,
   graph,
   taskStatusById,
   resourceBlockedById,
@@ -215,6 +217,7 @@ export function TaskDagGraph({
   className = '',
   height = 460,
 }: {
+  specId?: string;
   graph: TaskGraph;
   taskStatusById?: Record<string, TaskStatus | undefined>;
   resourceBlockedById?: Record<string, string[] | undefined>;
@@ -238,8 +241,16 @@ export function TaskDagGraph({
     if (now - last < 2500) return;
     lastHardResetAtRef.current = now;
     console.warn('[TaskDagGraph] force remount', { reason });
+    void postTestLogEvent({
+      level: 'warn',
+      source: 'dashboard',
+      action: 'dag.render.hard_reset',
+      message: `force remount: ${reason}`,
+      specId,
+      data: { sessionId: getTestSessionId(), reason },
+    }).catch((e: any) => console.error('[testlog] dag.render.hard_reset failed', e));
     setFlowKey((prev) => prev + 1);
-  }, []);
+  }, [specId]);
 
   const statusKey = useMemo(() => {
     const list = (graph?.tasks ?? []).map((t) => `${t.id}:${taskStatusById?.[t.id] ?? 'pending'}`);
@@ -667,6 +678,14 @@ export function TaskDagGraph({
           } else {
             console.error('[TaskDagGraph] render anomaly', payload);
           }
+          void postTestLogEvent({
+            level: issue === '节点全部在视口外' ? 'warn' : 'error',
+            source: 'dashboard',
+            action: issue === '节点全部在视口外' ? 'dag.render.offscreen' : 'dag.render.anomaly',
+            message: issue,
+            specId,
+            data: { sessionId: getTestSessionId(), ...payload },
+          }).catch((e: any) => console.error('[testlog] dag.render.anomaly failed', e));
         }
 
         // “节点全部在视口外”属于可恢复问题：自动 fitView，不再作为错误提示。

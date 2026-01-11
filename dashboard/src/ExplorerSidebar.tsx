@@ -8,6 +8,7 @@ import {
 } from 'react';
 
 import { Button } from './components/ui/button';
+import { withTestSessionHeaders } from './lib/test-logger';
 
 const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
 
@@ -45,8 +46,8 @@ async function apiJson<T>(
     const res = await fetch(`${BRIDGE_URL}${path}`, {
       ...init,
       headers: {
+        ...withTestSessionHeaders(init?.headers),
         'content-type': 'application/json',
-        ...(init?.headers ?? {}),
       },
       signal: controller.signal,
     });

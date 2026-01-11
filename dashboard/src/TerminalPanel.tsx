@@ -14,6 +14,7 @@ import { Terminal } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 
 import { Button } from './components/ui/button';
+import { getTestSessionId, postTestLogEvent, withTestSessionHeaders } from './lib/test-logger';
 
 const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
 const TERMINAL_SPACES_STORAGE_KEY = 'mvp5:terminalSpaces';
@@ -137,8 +138,8 @@ async function apiJson<T>(
       ...init,
       cache: 'no-store',
       headers: {
+        ...withTestSessionHeaders(init?.headers),
         'content-type': 'application/json',
-        ...(init?.headers ?? {}),
       },
       signal: controller.signal,
     });
@@ -338,6 +339,20 @@ export function TerminalPanelInner(
   }, []);
 
   const sendTerminalInput = useCallback(async (terminalId: string, input: string) => {
+    const payload = String(input ?? '');
+    if (payload) {
+      void postTestLogEvent({
+        level: 'debug',
+        source: 'dashboard',
+        action: 'terminal.input',
+        message: 'programmatic input',
+        data: {
+          sessionId: getTestSessionId(),
+          terminalId,
+          len: payload.length,
+        },
+      }).catch((e: any) => console.error('[testlog] terminal.input failed', e));
+    }
     const socket = socketRef.current;
     if (socket?.connected) {
       socket.emit('terminal:input', { terminalId, input });
@@ -355,6 +370,13 @@ export function TerminalPanelInner(
     if (!id) return;
     await apiJson(`/terminals/${encodeURIComponent(id)}/pause`, { method: 'POST' }, 8000);
     setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, paused: true } : t)));
+    void postTestLogEvent({
+      level: 'info',
+      source: 'dashboard',
+      action: 'terminal.pause',
+      message: 'pause requested',
+      data: { sessionId: getTestSessionId(), terminalId: id },
+    }).catch((e: any) => console.error('[testlog] terminal.pause failed', e));
   }, []);
 
   const resumeTerminal = useCallback(async (terminalId: string) => {
@@ -362,6 +384,13 @@ export function TerminalPanelInner(
     if (!id) return;
     await apiJson(`/terminals/${encodeURIComponent(id)}/resume`, { method: 'POST' }, 8000);
     setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, paused: false } : t)));
+    void postTestLogEvent({
+      level: 'info',
+      source: 'dashboard',
+      action: 'terminal.resume',
+      message: 'resume requested',
+      data: { sessionId: getTestSessionId(), terminalId: id },
+    }).catch((e: any) => console.error('[testlog] terminal.resume failed', e));
   }, []);
 
   const fitAndReport = useCallback(
@@ -545,6 +574,13 @@ export function TerminalPanelInner(
 
   const closeTab = useCallback(
     async (terminalId: string) => {
+      void postTestLogEvent({
+        level: 'info',
+        source: 'dashboard',
+        action: 'terminal.close',
+        message: 'close terminal tab',
+        data: { sessionId: getTestSessionId(), terminalId: String(terminalId || '').trim() },
+      }).catch((e: any) => console.error('[testlog] terminal.close failed', e));
       setTabs((prev) => prev.filter((t) => t.id !== terminalId));
       disposeController(terminalId);
       try {
@@ -605,6 +641,20 @@ export function TerminalPanelInner(
         ...(meta ?? {}),
       });
       setActiveId(data.id);
+      void postTestLogEvent({
+        level: 'info',
+        source: 'dashboard',
+        action: 'terminal.create',
+        message: 'create terminal',
+        data: {
+          sessionId: getTestSessionId(),
+          terminalId: data.id,
+          title: String(data.title || template.title || '').trim(),
+          kind: meta?.kind ?? null,
+          specName: meta?.specName ?? null,
+          taskId: meta?.taskId ?? null,
+        },
+      }).catch((e: any) => console.error('[testlog] terminal.create failed', e));
       return data.id;
     },
     [addOrUpdateTab, desiredTerminalCwd, getPreferredSize],
@@ -961,8 +1011,26 @@ export function TerminalPanelInner(
     const socket = socketIo(BRIDGE_URL);
     socketRef.current = socket;
 
-    socket.on('connect', () => setConnected(true));
-    socket.on('disconnect', () => setConnected(false));
+    socket.on('connect', () => {
+      setConnected(true);
+      void postTestLogEvent({
+        level: 'info',
+        source: 'dashboard',
+        action: 'terminal.socket.connect',
+        message: 'socket connected',
+        data: { sessionId: getTestSessionId() },
+      }).catch((e: any) => console.error('[testlog] socket connect failed', e));
+    });
+    socket.on('disconnect', () => {
+      setConnected(false);
+      void postTestLogEvent({
+        level: 'warn',
+        source: 'dashboard',
+        action: 'terminal.socket.disconnect',
+        message: 'socket disconnected',
+        data: { sessionId: getTestSessionId() },
+      }).catch((e: any) => console.error('[testlog] socket disconnect failed', e));
+    });
 
     socket.on('state:init', (payload: any) => {
       const remote = Array.isArray(payload?.terminals) ? payload.terminals : [];
@@ -1003,6 +1071,13 @@ export function TerminalPanelInner(
       const id = String(terminal?.id || '').trim();
       if (!id) return;
       mergeRemoteTerminals([terminal]);
+      void postTestLogEvent({
+        level: 'info',
+        source: 'dashboard',
+        action: 'terminal.created',
+        message: 'terminal created',
+        data: { sessionId: getTestSessionId(), terminalId: id, title: String(terminal?.title || '').trim() },
+      }).catch((e: any) => console.error('[testlog] terminal.created failed', e));
     });
 
     socket.on('terminal:data', (payload: any) => {
@@ -1039,21 +1114,55 @@ export function TerminalPanelInner(
         ),
       );
       onTerminalExit?.({ terminalId, exitCode: Number.isFinite(exitCode) ? exitCode : -1 });
+      void postTestLogEvent({
+        level: exitCode === 0 ? 'info' : 'warn',
+        source: 'dashboard',
+        action: 'terminal.exit',
+        message: 'terminal exited',
+        data: {
+          sessionId: getTestSessionId(),
+          terminalId,
+          exitCode: Number.isFinite(exitCode) ? exitCode : -1,
+        },
+      }).catch((e: any) => console.error('[testlog] terminal.exit failed', e));
     });
 
     socket.on('terminal:paused', (payload: any) => {
       const terminalId = String(payload?.terminalId || '').trim();
       if (!terminalId) return;
       setTabs((prev) => prev.map((t) => (t.id === terminalId ? { ...t, paused: true } : t)));
+      void postTestLogEvent({
+        level: 'info',
+        source: 'dashboard',
+        action: 'terminal.paused',
+        message: 'terminal paused',
+        data: { sessionId: getTestSessionId(), terminalId },
+      }).catch((e: any) => console.error('[testlog] terminal.paused failed', e));
     });
 
     socket.on('terminal:resumed', (payload: any) => {
       const terminalId = String(payload?.terminalId || '').trim();
       if (!terminalId) return;
       setTabs((prev) => prev.map((t) => (t.id === terminalId ? { ...t, paused: false } : t)));
+      void postTestLogEvent({
+        level: 'info',
+        source: 'dashboard',
+        action: 'terminal.resumed',
+        message: 'terminal resumed',
+        data: { sessionId: getTestSessionId(), terminalId },
+      }).catch((e: any) => console.error('[testlog] terminal.resumed failed', e));
     });
 
-    socket.on('connect_error', () => setConnected(false));
+    socket.on('connect_error', () => {
+      setConnected(false);
+      void postTestLogEvent({
+        level: 'error',
+        source: 'dashboard',
+        action: 'terminal.socket.connect_error',
+        message: 'socket connect_error',
+        data: { sessionId: getTestSessionId() },
+      }).catch((e: any) => console.error('[testlog] socket connect_error failed', e));
+    });
 
     return () => {
       try {

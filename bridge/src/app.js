@@ -53,6 +53,8 @@ const WATCH_DIRS =
 const MAX_DIFF_CHARS = 8000;
 const SPEC_ROOT = path.join(ROOT_DIR, 'workflow', 'specs');
 const DEFAULT_TESTCLI_DIR = path.join(os.homedir(), 'testcli');
+const LOGS_DIR = path.join(REPO_DIR, 'logs');
+const TEST_LOG_DIR = path.join(LOGS_DIR, 'test-sessions');
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(SPEC_ROOT, { recursive: true });
@@ -61,10 +63,16 @@ try {
 } catch {
   // ignore
 }
+try {
+  fs.mkdirSync(TEST_LOG_DIR, { recursive: true });
+} catch {
+  // ignore
+}
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
+app.use(testLogRequestMiddleware);
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -6816,6 +6824,257 @@ function emitEvent(type, payload) {
   return event;
 }
 
+// ========= Test logging (for manual QA/debug) =========
+const TEST_LOG_BUFFER_LIMIT = 800;
+
+const testLogBuffers = new Map(); // sessionId -> entry[]
+
+function normalizeTestLogLevel(value) {
+  const raw = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (raw === 'warn' || raw === 'warning') return 'warn';
+  if (raw === 'error' || raw === 'fatal') return 'error';
+  if (raw === 'debug' || raw === 'trace') return 'debug';
+  return 'info';
+}
+
+function normalizeTestSessionId(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const safe = trimmed.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80);
+  return safe ? safe : null;
+}
+
+function sha256Short(text) {
+  try {
+    return crypto.createHash('sha256').update(String(text || ''), 'utf8').digest('hex').slice(0, 12);
+  } catch {
+    return null;
+  }
+}
+
+function summarizeTextForLog(text) {
+  const raw = typeof text === 'string' ? text : '';
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (trimmed.length <= 160) return trimmed;
+  return { len: trimmed.length, sha256: sha256Short(trimmed) };
+}
+
+function summarizeLargeTextForLog(text) {
+  const raw = typeof text === 'string' ? text : '';
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (trimmed.length <= 2000) return trimmed;
+  const head = trimmed.slice(0, 800);
+  const tail = trimmed.slice(-800);
+  return { len: trimmed.length, sha256: sha256Short(trimmed), head, tail };
+}
+
+function summarizeRequestBodyForLog(body) {
+  if (!body || typeof body !== 'object') return null;
+  const out = {};
+
+  const specId = typeof body.specId === 'string' ? body.specId.trim() : '';
+  const taskId = typeof body.taskId === 'string' ? body.taskId.trim() : '';
+  const toolId = typeof body.toolId === 'string' ? body.toolId.trim() : '';
+  const title = typeof body.title === 'string' ? body.title.trim() : '';
+
+  if (specId) out.specId = specId;
+  if (taskId) out.taskId = taskId;
+  if (toolId) out.toolId = toolId;
+  if (title) out.title = title.length <= 120 ? title : { len: title.length, sha256: sha256Short(title) };
+
+  if (typeof body.command === 'string') out.command = summarizeTextForLog(body.command);
+  if (Array.isArray(body.args)) out.argsCount = body.args.length;
+  if (typeof body.cwd === 'string') out.cwd = summarizeTextForLog(body.cwd);
+  if (typeof body.input === 'string') out.input = summarizeLargeTextForLog(body.input);
+  if (typeof body.prompt === 'string') out.prompt = summarizeLargeTextForLog(body.prompt);
+  if (typeof body.tasksContent === 'string') {
+    out.tasksContent = summarizeLargeTextForLog(body.tasksContent);
+  }
+
+  const keys = Object.keys(body);
+  out.keys = keys.length <= 30 ? keys : keys.slice(0, 30).concat([`...+${keys.length - 30}`]);
+  return out;
+}
+
+function getTestLogFilePath(sessionId) {
+  const safe = normalizeTestSessionId(sessionId);
+  if (!safe) return null;
+  return path.join(TEST_LOG_DIR, `${safe}.jsonl`);
+}
+
+function pushTestLogToMemory(entry) {
+  const sessionId = String(entry?.sessionId || '').trim();
+  if (!sessionId) return;
+  const buf = testLogBuffers.get(sessionId) || [];
+  buf.push(entry);
+  if (buf.length > TEST_LOG_BUFFER_LIMIT) {
+    buf.splice(0, buf.length - TEST_LOG_BUFFER_LIMIT);
+  }
+  testLogBuffers.set(sessionId, buf);
+}
+
+function appendTestLogEvent(input, meta) {
+  const sessionId =
+    normalizeTestSessionId(input?.sessionId) ||
+    normalizeTestSessionId(meta?.sessionId) ||
+    null;
+  if (!sessionId) {
+    const error = new Error('sessionId is required');
+    error.status = 400;
+    throw error;
+  }
+
+  const entry = {
+    ts: new Date().toISOString(),
+    level: normalizeTestLogLevel(input?.level),
+    sessionId,
+    source: typeof input?.source === 'string' && input.source.trim() ? input.source.trim() : 'dashboard',
+    action: typeof input?.action === 'string' && input.action.trim() ? input.action.trim() : 'unknown',
+    message: typeof input?.message === 'string' ? input.message : '',
+    specId: typeof input?.specId === 'string' && input.specId.trim() ? input.specId.trim() : undefined,
+    taskId: typeof input?.taskId === 'string' && input.taskId.trim() ? input.taskId.trim() : undefined,
+    data: input?.data && typeof input.data === 'object' ? input.data : undefined,
+    meta: meta && typeof meta === 'object' ? meta : undefined,
+  };
+
+  pushTestLogToMemory(entry);
+
+  const filePath = getTestLogFilePath(sessionId);
+  if (filePath) {
+    fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, (err) => {
+      if (err) {
+        console.error('Failed to append test log:', err.message);
+      }
+    });
+  }
+
+  return entry;
+}
+
+function readTestLogTail(sessionId, limit = 200) {
+  const safe = normalizeTestSessionId(sessionId);
+  if (!safe) return [];
+  const max = Math.max(1, Math.min(2000, Number(limit) || 200));
+
+  const buf = testLogBuffers.get(safe);
+  if (Array.isArray(buf) && buf.length) {
+    return buf.slice(-max);
+  }
+
+  const filePath = getTestLogFilePath(safe);
+  if (!filePath || !fs.existsSync(filePath)) return [];
+
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const stat = fs.fstatSync(fd);
+      const size = Number(stat.size || 0);
+      const maxBytes = Math.min(1024 * 1024, Math.max(64 * 1024, max * 2048));
+      const start = Math.max(0, size - maxBytes);
+      const length = Math.max(0, size - start);
+      const buffer = Buffer.alloc(length);
+      fs.readSync(fd, buffer, 0, length, start);
+      let text = buffer.toString('utf8');
+      if (start > 0) {
+        const firstNewline = text.indexOf('\n');
+        text = firstNewline >= 0 ? text.slice(firstNewline + 1) : '';
+      }
+      const lines = text.split('\n').filter(Boolean);
+      const sliced = lines.slice(-max);
+      const items = [];
+      for (const line of sliced) {
+        try {
+          items.push(JSON.parse(line));
+        } catch {
+          // ignore bad lines
+        }
+      }
+      return items;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return [];
+  }
+}
+
+function listTestLogSessions(limit = 200) {
+  try {
+    if (!fs.existsSync(TEST_LOG_DIR)) return [];
+    const entries = fs.readdirSync(TEST_LOG_DIR, { withFileTypes: true });
+    const files = entries
+      .filter((e) => e.isFile() && String(e.name || '').toLowerCase().endsWith('.jsonl'))
+      .map((e) => e.name);
+    const sessions = [];
+    for (const name of files) {
+      const id = name.replace(/\.jsonl$/i, '');
+      const filePath = path.join(TEST_LOG_DIR, name);
+      try {
+        const st = fs.statSync(filePath);
+        sessions.push({
+          sessionId: id,
+          sizeBytes: Number(st.size || 0),
+          updatedAt: st.mtime ? st.mtime.toISOString() : null,
+        });
+      } catch {
+        // ignore
+      }
+    }
+    sessions.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+    return sessions.slice(0, Math.max(1, Math.min(2000, Number(limit) || 200)));
+  } catch {
+    return [];
+  }
+}
+
+function testLogRequestMiddleware(req, res, next) {
+  const rawHeader = req.headers['x-test-session-id'];
+  const headerSessionId = Array.isArray(rawHeader) ? rawHeader[0] : rawHeader;
+  const sessionId = normalizeTestSessionId(headerSessionId);
+  if (!sessionId) return next();
+  if (String(req.path || '').startsWith('/test-logs')) return next();
+
+  const startedAt = Date.now();
+  const reqId = nanoid(10);
+  res.on('finish', () => {
+    try {
+      const durationMs = Date.now() - startedAt;
+      const status = Number(res.statusCode || 0);
+      const level = status >= 500 ? 'error' : status >= 400 ? 'warn' : 'info';
+      const bodySummary = summarizeRequestBodyForLog(req.body);
+      appendTestLogEvent(
+        {
+          sessionId,
+          level,
+          source: 'bridge',
+          action: 'http.request',
+          message: `${req.method} ${req.path} -> ${status}`,
+          data: {
+            reqId,
+            method: req.method,
+            path: req.path,
+            status,
+            durationMs,
+            query: req.query && typeof req.query === 'object' ? req.query : undefined,
+            body: bodySummary,
+          },
+        },
+        {
+          sessionId,
+          ip: req.ip,
+          ua: req.headers['user-agent'] || null,
+        },
+      );
+    } catch (e) {
+      console.error('Failed to record http test log:', e?.message || e);
+    }
+  });
+  return next();
+}
+
 function isTextFile(buffer) {
   const sample = buffer.subarray(0, 8000);
   for (const byte of sample) {
@@ -7474,6 +7733,8 @@ const routesContext = {
   ROOT_DIR,
   REPO_DIR,
   DOCS_DIR,
+  LOGS_DIR,
+  TEST_LOG_DIR,
   SPEC_ROOT,
   SPEC_ARTIFACTS,
   LLM_PROVIDERS,
@@ -7490,6 +7751,11 @@ const routesContext = {
   mvp5ExecutionRunners,
   fileSnapshots,
   appendEvent,
+  appendTestLogEvent,
+  getTestLogFilePath,
+  listTestLogSessions,
+  normalizeTestSessionId,
+  readTestLogTail,
   appendFlowRunStageAttempt,
   appendFlowRunStageAttemptToRun,
   applyEventToState,

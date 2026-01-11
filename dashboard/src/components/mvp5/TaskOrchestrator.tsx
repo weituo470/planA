@@ -11,6 +11,7 @@ import type {
   ExecutionPlan,
   ExecutionState,
 } from './types';
+import { withTestSessionHeaders } from '../../lib/test-logger';
 
 const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
 
@@ -236,7 +237,7 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
     try {
       const response = await fetch(`${BRIDGE_URL}/api/mvp5/analyze-dependencies`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: withTestSessionHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           specId,
           tasksContent,
@@ -273,7 +274,7 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
     try {
       const response = await fetch(`${BRIDGE_URL}/api/mvp5/execution-plans`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: withTestSessionHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           specId,
           analysisId: analysis.analysisId,
@@ -306,6 +307,7 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
     try {
       const response = await fetch(`${BRIDGE_URL}/api/mvp5/execution-plans/${plan.planId}/start`, {
         method: 'POST',
+        headers: withTestSessionHeaders(),
       });
 
       if (!response.ok) {
@@ -342,7 +344,9 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
     let cancelled = false;
     const poll = async () => {
       try {
-        const response = await fetch(`${BRIDGE_URL}/api/mvp5/execution/${executionState.executionId}/status`);
+        const response = await fetch(`${BRIDGE_URL}/api/mvp5/execution/${executionState.executionId}/status`, {
+          headers: withTestSessionHeaders(),
+        });
         if (!response.ok) return;
         const data: ExecutionState = await response.json();
         if (cancelled) return;
@@ -377,7 +381,7 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
     try {
       const response = await fetch(
         `${BRIDGE_URL}/api/mvp5/execution/${executionState.executionId}/retry/${taskId}`,
-        { method: 'POST' }
+        { method: 'POST', headers: withTestSessionHeaders() }
       );
 
       if (!response.ok) {
@@ -505,7 +509,7 @@ export function TaskOrchestrator({ specId, tasksContent, className = '' }: TaskO
         <div className="mt-3">
           {activeTab === 'dag' ? (
             analysis ? (
-              <TaskDagGraph graph={analysis.graph} taskStatusById={taskStatusById} />
+              <TaskDagGraph specId={specId} graph={analysis.graph} taskStatusById={taskStatusById} />
             ) : (
               <EmptyState text="还没有编排结果（先点“编排任务”）" />
             )

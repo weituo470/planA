@@ -951,6 +951,73 @@ function registerCoreRoutes(app, ctx) {
         logs: state.logs,
       });
     });
+
+    app.get('/test-logs/sessions', (req, res) => {
+      const limitRaw = typeof req.query?.limit === 'string' ? req.query.limit.trim() : '';
+      const limit = Number(limitRaw || 200);
+      return res.json({ ok: true, sessions: listTestLogSessions(limit) });
+    });
+
+    app.post('/test-logs/event', (req, res) => {
+      try {
+        const fromBody = normalizeTestSessionId(req.body?.sessionId);
+        const headerRaw = req.headers['x-test-session-id'];
+        const headerValue = Array.isArray(headerRaw) ? headerRaw[0] : headerRaw;
+        const fromHeader = normalizeTestSessionId(headerValue);
+        const sessionId = fromBody || fromHeader;
+        if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
+
+        const entry = appendTestLogEvent(
+          {
+            sessionId,
+            level: req.body?.level,
+            source: req.body?.source,
+            action: req.body?.action,
+            message: req.body?.message,
+            specId: req.body?.specId,
+            taskId: req.body?.taskId,
+            data: req.body?.data,
+          },
+          {
+            sessionId,
+            ip: req.ip,
+            ua: req.headers['user-agent'] || null,
+            route: req.path,
+          },
+        );
+        return res.json({ ok: true, entry });
+      } catch (error) {
+        return res.status(error?.status || 400).json({ error: error?.message || 'Failed to append test log' });
+      }
+    });
+
+    app.get('/test-logs/tail', (req, res) => {
+      const fromQuery = typeof req.query?.sessionId === 'string' ? req.query.sessionId.trim() : '';
+      const headerRaw = req.headers['x-test-session-id'];
+      const headerValue = Array.isArray(headerRaw) ? headerRaw[0] : headerRaw;
+      const fromHeader = normalizeTestSessionId(headerValue);
+      const sessionId = normalizeTestSessionId(fromQuery) || fromHeader;
+      if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
+      const limitRaw = typeof req.query?.limit === 'string' ? req.query.limit.trim() : '';
+      const limit = Number(limitRaw || 200);
+      return res.json({ ok: true, sessionId, entries: readTestLogTail(sessionId, limit) });
+    });
+
+    app.get('/test-logs/download', (req, res) => {
+      const raw = typeof req.query?.sessionId === 'string' ? req.query.sessionId.trim() : '';
+      const headerRaw = req.headers['x-test-session-id'];
+      const headerValue = Array.isArray(headerRaw) ? headerRaw[0] : headerRaw;
+      const sessionId = normalizeTestSessionId(raw) || normalizeTestSessionId(headerValue);
+      if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
+
+      const filePath = getTestLogFilePath(sessionId);
+      if (!filePath || !fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'Log file not found' });
+      }
+      res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${sessionId}.jsonl"`);
+      return res.sendFile(filePath);
+    });
     
     app.get('/specs', (req, res) => {
       res.json({ specs: listSpecs() });
@@ -2058,9 +2125,19 @@ function registerCoreRoutes(app, ctx) {
       const doc = buildCodexRunDoc(specName, hit, { sandbox, model });
       const runDocPathForPrompt = normalizePathForPrompt(doc.runDocPath);
       const prompt = `请按任务文档（绝对路径）${runDocPathForPrompt} 实现该原子任务，完成后自检并用简短要点总结变更与验证结果。`;
-    
+
       const codexExecutable = (process.env.CODEX_COMMAND || 'codex').trim() || 'codex';
-      const codexArgs = ['-a', 'never', '-s', sandbox];
+      // exec 模式下禁用 MCP，避免进程在 Windows 上无法退出导致“自动启动失败/卡住”。
+      const codexArgs = [
+        '-c',
+        'mcp_servers.claude-code.enabled=false',
+        '-c',
+        'mcp_servers.chrome-devtools.enabled=false',
+        '-a',
+        'never',
+        '-s',
+        sandbox,
+      ];
       if (model) codexArgs.push('-m', model);
       codexArgs.push(
         '-C',
@@ -2149,8 +2226,9 @@ function registerCoreRoutes(app, ctx) {
       const doc = buildCodexRunDoc(specName, hit, { sandbox, model });
       const runDocPathForPrompt = normalizePathForPrompt(doc.runDocPath);
       const prompt = `请按任务文档（绝对路径）${runDocPathForPrompt} 实现该原子任务。需要进一步信息时，请在终端中直接向我提问。`;
-    
+
       const codexExecutable = (process.env.CODEX_COMMAND || 'codex').trim() || 'codex';
+      // 终端模式属于长会话；这里不强制禁用 MCP（按用户本机 codex 配置决定是否启用）。
       const codexArgs = ['-a', 'never', '-s', sandbox, '--add-dir', SPEC_ROOT];
       if (model) codexArgs.push('-m', model);
       codexArgs.push('-C', projectDir, prompt);

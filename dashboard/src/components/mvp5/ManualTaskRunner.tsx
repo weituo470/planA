@@ -3,6 +3,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '../ui/button';
 import { TaskDagGraph } from './TaskDagGraph';
 import type { TaskGraph } from './types';
+import {
+  fetchTestLogTail,
+  getTestLogDownloadUrl,
+  getTestSessionId,
+  postTestLogEvent,
+  resetTestSessionId,
+  withTestSessionHeaders,
+} from '../../lib/test-logger';
 
 const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
 
@@ -14,6 +22,8 @@ type CliToolInfo = {
   id: string;
   label?: string;
 };
+
+type TestLogLevelFilter = 'all' | 'debug' | 'info' | 'warn' | 'error';
 
 const PARALLEL_POLICY_MAX_RUNNING: Record<ParallelPolicy, number> = {
   serial: 1,
@@ -517,6 +527,19 @@ export function ManualTaskRunner({
   onPauseClaudeAutoTerminals?: (specId: string) => Promise<{ paused: number; total: number }>;
   onResumeClaudeAutoTerminals?: (specId: string) => Promise<{ resumed: number; total: number }>;
 }) {
+  const [testSessionId, setTestSessionId] = useState(() => getTestSessionId());
+  const [testLogState, setTestLogState] = useState<{
+    loading: boolean;
+    error: string | null;
+    entries: any[];
+  }>({ loading: false, error: null, entries: [] });
+  const testLogDetailsRef = useRef<HTMLDetailsElement | null>(null);
+  const testLogInFlightRef = useRef(false);
+  const [testLogOpen, setTestLogOpen] = useState(false);
+  const [testLogAutoRefresh, setTestLogAutoRefresh] = useState(false);
+  const [testLogLevel, setTestLogLevel] = useState<TestLogLevelFilter>('all');
+  const [testLogKeyword, setTestLogKeyword] = useState('');
+
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [promptForTask, setPromptForTask] = useState<{
     taskId: string;
@@ -579,6 +602,90 @@ export function ManualTaskRunner({
     setTaskDocById({});
   }, []);
 
+  const refreshTestLog = useCallback(async () => {
+    if (testLogInFlightRef.current) return;
+    testLogInFlightRef.current = true;
+    setTestLogState((prev) => ({ ...prev, loading: true, error: null }));
+    try {
+      const entries = await fetchTestLogTail({ sessionId: testSessionId, limit: 400 });
+      setTestLogState({ loading: false, error: null, entries });
+    } catch (e: any) {
+      setTestLogState((prev) => ({
+        ...prev,
+        loading: false,
+        error: String(e?.message || e || '读取测试日志失败'),
+      }));
+    } finally {
+      testLogInFlightRef.current = false;
+    }
+  }, [testSessionId]);
+
+  const filteredTestLogEntries = useMemo(() => {
+    const keyword = String(testLogKeyword || '').trim().toLowerCase();
+    const levelFilter = testLogLevel;
+    const list = Array.isArray(testLogState.entries) ? testLogState.entries : [];
+    return list.filter((entry) => {
+      const level = String((entry as any)?.level || '').trim().toLowerCase();
+      if (levelFilter !== 'all' && level !== levelFilter) return false;
+      if (!keyword) return true;
+      try {
+        return JSON.stringify(entry).toLowerCase().includes(keyword);
+      } catch {
+        return false;
+      }
+    });
+  }, [testLogKeyword, testLogLevel, testLogState.entries]);
+
+  const testLogText = useMemo(() => {
+    if (!filteredTestLogEntries.length) return '';
+    return filteredTestLogEntries.map((entry) => JSON.stringify(entry)).join('\n');
+  }, [filteredTestLogEntries]);
+
+  useEffect(() => {
+    if (!testLogOpen) return;
+    if (!testLogAutoRefresh) return;
+    void refreshTestLog();
+    const timer = window.setInterval(() => void refreshTestLog(), 2000);
+    return () => window.clearInterval(timer);
+  }, [refreshTestLog, testLogAutoRefresh, testLogOpen]);
+
+  const handleResetTestSession = useCallback(() => {
+    const prev = String(testSessionId || '').trim();
+    const next = resetTestSessionId();
+    setTestSessionId(next);
+    setTestLogState({ loading: false, error: null, entries: [] });
+    void postTestLogEvent({
+      level: 'info',
+      source: 'dashboard',
+      action: 'test.session.reset',
+      message: 'reset test session',
+      specId,
+      data: { prev, next },
+    }).catch((e: any) => console.error('[testlog] session reset failed', e));
+  }, [specId, testSessionId]);
+
+  useEffect(() => {
+    const handler = (event: any) => {
+      const next = String(event?.detail?.sessionId || '').trim();
+      if (!next) return;
+      setTestSessionId(next);
+      setTestLogState({ loading: false, error: null, entries: [] });
+    };
+    window.addEventListener('mvp5:testSession:changed', handler as any);
+    return () => window.removeEventListener('mvp5:testSession:changed', handler as any);
+  }, []);
+
+  useEffect(() => {
+    void postTestLogEvent({
+      level: 'info',
+      source: 'dashboard',
+      action: 'mvp5.page.open',
+      message: 'ManualTaskRunner mounted',
+      specId,
+      data: { sessionId: testSessionId },
+    }).catch((e: any) => console.error('[testlog] page open failed', e));
+  }, [specId, testSessionId]);
+
   const autoContinueInitializedRef = useRef(false);
   const prevCompletedRef = useRef<Set<string>>(new Set());
   const autoContinueInFlightRef = useRef(false);
@@ -588,13 +695,30 @@ export function ManualTaskRunner({
     let cancelled = false;
     const load = async () => {
       try {
-        const res = await fetch(`${BRIDGE_URL}/workspace`);
-        if (!res.ok) return;
+        const res = await fetch(`${BRIDGE_URL}/workspace`, { headers: withTestSessionHeaders() });
+        if (!res.ok) {
+          void postTestLogEvent({
+            level: 'warn',
+            source: 'dashboard',
+            action: 'workspace.load_failed',
+            message: `HTTP ${res.status}`,
+            specId,
+            data: { sessionId: testSessionId },
+          }).catch((e: any) => console.error('[testlog] workspace.load_failed failed', e));
+          return;
+        }
         const data = (await res.json()) as WorkspaceInfo;
         if (cancelled) return;
         setWorkspace(data);
-      } catch {
-        // ignore
+      } catch (e: any) {
+        void postTestLogEvent({
+          level: 'warn',
+          source: 'dashboard',
+          action: 'workspace.load_error',
+          message: String(e?.message || e || 'workspace load error'),
+          specId,
+          data: { sessionId: testSessionId },
+        }).catch((err: any) => console.error('[testlog] workspace.load_error failed', err));
       }
     };
     void load();
@@ -604,13 +728,13 @@ export function ManualTaskRunner({
       cancelled = true;
       window.removeEventListener('workspace:changed', handler);
     };
-  }, []);
+  }, [specId, testSessionId]);
 
   const refreshCliTools = useCallback(async () => {
     setCliToolsLoading(true);
     setCliToolsError(null);
     try {
-      const res = await fetch(`${BRIDGE_URL}/cli-tools`);
+      const res = await fetch(`${BRIDGE_URL}/cli-tools`, { headers: withTestSessionHeaders() });
       const data = res.ok ? await res.json() : null;
       if (!res.ok) throw new Error(String(data?.error || `HTTP ${res.status}`));
       const list = Array.isArray(data?.tools) ? data.tools : [];
@@ -623,11 +747,20 @@ export function ManualTaskRunner({
       setCliTools(cleaned);
     } catch (e: any) {
       setCliTools([]);
-      setCliToolsError(String(e?.message || e || '读取 CLI 工具失败'));
+      const message = String(e?.message || e || '读取 CLI 工具失败');
+      setCliToolsError(message);
+      void postTestLogEvent({
+        level: 'warn',
+        source: 'dashboard',
+        action: 'cli-tools.load_failed',
+        message,
+        specId,
+        data: { sessionId: testSessionId },
+      }).catch((err: any) => console.error('[testlog] cli-tools.load_failed failed', err));
     } finally {
       setCliToolsLoading(false);
     }
-  }, []);
+  }, [specId, testSessionId]);
 
   useEffect(() => {
     void refreshCliTools();
@@ -777,9 +910,26 @@ export function ManualTaskRunner({
         return;
       }
       await onSaveTasksContent(nextContent);
+      void postTestLogEvent({
+        level: 'info',
+        source: 'dashboard',
+        action: 'dag.default_cli.set',
+        message: 'default cli changed',
+        specId,
+        data: { sessionId: testSessionId, prev: effectiveDefaultCliToolId, next: nextToolId },
+      }).catch((e: any) => console.error('[testlog] dag.default_cli.set failed', e));
       onToast(`已设置默认CLI：${cliLabelById[nextToolId] || nextToolId}`, 'info');
     },
-    [cliLabelById, disabled, effectiveDefaultCliToolId, onSaveTasksContent, onToast, tasksContent],
+    [
+      cliLabelById,
+      disabled,
+      effectiveDefaultCliToolId,
+      onSaveTasksContent,
+      onToast,
+      specId,
+      tasksContent,
+      testSessionId,
+    ],
   );
   const defaultCliOptionsForSelect = useMemo(() => {
     const exists = cliOptions.some((opt) => String(opt?.id || '').trim() === effectiveDefaultCliToolId);
@@ -830,6 +980,21 @@ export function ManualTaskRunner({
         return;
       }
       await onSaveTasksContent(nextContent);
+      void postTestLogEvent({
+        level: 'info',
+        source: 'dashboard',
+        action: 'dag.task_cli.set',
+        message: nextToolId ? 'task cli changed' : 'task cli cleared',
+        specId,
+        taskId,
+        data: {
+          sessionId: testSessionId,
+          taskId,
+          prev: current || null,
+          next: nextToolId || null,
+          defaultCliToolId: effectiveDefaultCliToolId,
+        },
+      }).catch((e: any) => console.error('[testlog] dag.task_cli.set failed', e));
       const defaultLabel = cliLabelById[effectiveDefaultCliToolId] || effectiveDefaultCliToolId;
       onToast(
         nextToolId
@@ -844,8 +1009,10 @@ export function ManualTaskRunner({
       effectiveDefaultCliToolId,
       onSaveTasksContent,
       onToast,
+      specId,
       taskCliToolIdById,
       tasksContent,
+      testSessionId,
     ],
   );
 
@@ -865,7 +1032,7 @@ export function ManualTaskRunner({
       };
       const res = await fetch(`${BRIDGE_URL}/api/mvp5/task-prompt`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...withTestSessionHeaders() },
         body: JSON.stringify(body),
       });
       const data = (await res.json()) as PromptResponse;
@@ -888,7 +1055,7 @@ export function ManualTaskRunner({
       };
       const res = await fetch(`${BRIDGE_URL}/api/mvp5/task-prompt?includeDoc=1`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...withTestSessionHeaders() },
         body: JSON.stringify(body),
       });
       const data = (await res.json()) as PromptResponse;
@@ -920,7 +1087,7 @@ export function ManualTaskRunner({
       };
       const res = await fetch(`${BRIDGE_URL}/api/mvp5/single-agent-prompt`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...withTestSessionHeaders() },
         body: JSON.stringify(body),
       });
       const data = (await res.json()) as SingleAgentPromptResponse;
@@ -1570,6 +1737,97 @@ export function ManualTaskRunner({
         </div>
       </details>
 
+      <details
+        ref={testLogDetailsRef}
+        className="mb-3 rounded-md border border-slate-800 bg-slate-950/40 px-3 py-2"
+        onToggle={(e) => {
+          const open = e.currentTarget.open;
+          setTestLogOpen(open);
+          void postTestLogEvent({
+            level: 'info',
+            source: 'dashboard',
+            action: open ? 'testlog.panel.open' : 'testlog.panel.close',
+            message: open ? 'open test log panel' : 'close test log panel',
+            specId,
+            data: { sessionId: testSessionId },
+          }).catch((err: any) => console.error('[testlog] testlog.panel.toggle failed', err));
+          if (!open) return;
+          void refreshTestLog();
+        }}
+      >
+        <summary className="cursor-pointer select-none text-xs font-semibold text-slate-200">
+          测试日志（testSessionId：<span className="font-mono text-slate-100">{testSessionId}</span>）
+        </summary>
+        <div className="mt-2">
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <div className="text-xs text-slate-500">
+              落盘：
+              <span className="ml-1 font-mono text-slate-300">{`logs/test-sessions/${testSessionId}.jsonl`}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={testLogState.loading}
+                onClick={() => void refreshTestLog()}
+              >
+                {testLogState.loading ? '刷新中…' : '刷新'}
+              </Button>
+              <Button size="sm" variant="ghost" onClick={handleResetTestSession}>
+                重置会话
+              </Button>
+              <a href={getTestLogDownloadUrl(testSessionId)} target="_blank" rel="noreferrer">
+                <Button size="sm" variant="ghost">
+                  下载.jsonl
+                </Button>
+              </a>
+            </div>
+          </div>
+
+          <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+            <span>筛选</span>
+            <select
+              className="h-8 rounded border border-slate-700 bg-slate-950 px-2 text-xs text-slate-100"
+              value={testLogLevel}
+              onChange={(e) => setTestLogLevel(e.target.value as TestLogLevelFilter)}
+            >
+              <option value="all">全部</option>
+              <option value="debug">debug</option>
+              <option value="info">info</option>
+              <option value="warn">warn</option>
+              <option value="error">error</option>
+            </select>
+            <input
+              className="h-8 w-[220px] rounded border border-slate-700 bg-slate-950 px-2 text-xs text-slate-100 placeholder:text-slate-600"
+              value={testLogKeyword}
+              onChange={(e) => setTestLogKeyword(e.target.value)}
+              placeholder="关键字（action/message）"
+            />
+            <label className="inline-flex items-center gap-1">
+              <input
+                type="checkbox"
+                checked={testLogAutoRefresh}
+                onChange={(e) => setTestLogAutoRefresh(e.target.checked)}
+              />
+              <span>自动刷新(2s)</span>
+            </label>
+            <div className="ml-auto text-slate-500">
+              显示 {filteredTestLogEntries.length}/{testLogState.entries.length}
+            </div>
+          </div>
+
+          {testLogState.error ? (
+            <div className="mb-2 rounded border border-red-900/40 bg-red-950/20 px-2 py-1 text-xs text-red-200">
+              读取失败：{testLogState.error}
+            </div>
+          ) : null}
+
+          <pre className="max-h-[360px] overflow-auto whitespace-pre-wrap break-words rounded border border-slate-800 bg-slate-950 px-2 py-2 text-xs text-slate-100">
+            {testLogText || '暂无日志（打开面板后会自动拉取 tail）'}
+          </pre>
+        </div>
+      </details>
+
       <div className="mb-3 rounded-md border border-slate-800 bg-slate-950/40 px-2 py-2">
         <div className="flex items-center justify-between gap-2 px-1">
           <div className="text-xs font-semibold text-slate-200">DAG 图（依赖关系）</div>
@@ -1584,10 +1842,20 @@ export function ManualTaskRunner({
                 setChainBusy(true);
                 try {
                   const current = chainStateRef.current;
+                  void postTestLogEvent({
+                    level: 'info',
+                    source: 'dashboard',
+                    action: 'dag.chain.toggle',
+                    message: `chain toggle: ${current}`,
+                    specId,
+                    data: { sessionId: testSessionId, current },
+                  }).catch((err: any) => console.error('[testlog] dag.chain.toggle failed', err));
                   if (current === 'idle') {
                     const cwd = String(workspace?.effectiveCwd || '').trim();
                     if (!cwd) throw new Error('CLI 根目录未加载');
-                    const listRes = await fetch(`${BRIDGE_URL}/fs/list?path=${encodeURIComponent(cwd)}`);
+                    const listRes = await fetch(`${BRIDGE_URL}/fs/list?path=${encodeURIComponent(cwd)}`, {
+                      headers: withTestSessionHeaders(),
+                    });
                     const listData = await listRes.json().catch(() => null);
                     if (!listRes.ok) {
                       throw new Error(String(listData?.error || '目录检查失败'));
@@ -1600,13 +1868,38 @@ export function ManualTaskRunner({
                       const shown = names.slice(0, 6).join(', ');
                       const rest = Math.max(0, names.length - 6);
                       const ok = window.confirm(
-                        `警告：CLI 根目录非空\\n路径：${cwd}\\n已有 ${names.length} 项：${shown}${rest > 0 ? ` 等${rest}项` : ''}\\n\\n仍要开始整个任务链吗？`,
+                        `警告：CLI 根目录非空\n路径：${cwd}\n已有 ${names.length} 项：${shown}${rest > 0 ? ` 等${rest}项` : ''}\n\n仍要开始整个任务链吗？`,
+                      );
+                      void postTestLogEvent({
+                        level: ok ? 'warn' : 'info',
+                        source: 'dashboard',
+                        action: 'dag.chain.start.cwd_non_empty',
+                        message: ok
+                          ? 'confirmed start with non-empty cwd'
+                          : 'aborted start with non-empty cwd',
+                        specId,
+                        data: { sessionId: testSessionId, cwd, count: names.length, shown, rest },
+                      }).catch((err: any) =>
+                        console.error('[testlog] dag.chain.start.cwd_non_empty failed', err),
                       );
                       if (!ok) return;
                     }
                     chainStateRef.current = 'running';
                     pausedRef.current = false;
                     setChainState('running');
+                    void postTestLogEvent({
+                      level: 'info',
+                      source: 'dashboard',
+                      action: 'dag.chain.start',
+                      message: 'chain started',
+                      specId,
+                      data: {
+                        sessionId: testSessionId,
+                        cwd: String(workspace?.effectiveCwd || '').trim(),
+                        defaultCliToolId: effectiveDefaultCliToolId,
+                        parallelPolicy,
+                      },
+                    }).catch((err: any) => console.error('[testlog] dag.chain.start failed', err));
                     void autoStartAllReadyTasks('global-start', { force: true });
                     return;
                   }
@@ -1616,17 +1909,42 @@ export function ManualTaskRunner({
                     setChainState('paused');
                     autoContinueQueuedRef.current = false;
                     if (!onPauseClaudeAutoTerminals) throw new Error('终端不支持暂停');
-                    await onPauseClaudeAutoTerminals(specId);
+                    const result = await onPauseClaudeAutoTerminals(specId);
+                    void postTestLogEvent({
+                      level: 'info',
+                      source: 'dashboard',
+                      action: 'dag.chain.pause',
+                      message: 'chain paused',
+                      specId,
+                      data: { sessionId: testSessionId, ...result },
+                    }).catch((err: any) => console.error('[testlog] dag.chain.pause failed', err));
                     return;
                   }
                   chainStateRef.current = 'running';
                   pausedRef.current = false;
                   setChainState('running');
                   if (!onResumeClaudeAutoTerminals) throw new Error('终端不支持继续');
-                  await onResumeClaudeAutoTerminals(specId);
+                  const result = await onResumeClaudeAutoTerminals(specId);
+                  void postTestLogEvent({
+                    level: 'info',
+                    source: 'dashboard',
+                    action: 'dag.chain.resume',
+                    message: 'chain resumed',
+                    specId,
+                    data: { sessionId: testSessionId, ...result },
+                  }).catch((err: any) => console.error('[testlog] dag.chain.resume failed', err));
                   void autoStartAllReadyTasks('global-resume', { force: true });
                 } catch (e: any) {
-                  onToast(String(e?.message || e || '操作失败'), 'error');
+                  const message = String(e?.message || e || '操作失败');
+                  void postTestLogEvent({
+                    level: 'error',
+                    source: 'dashboard',
+                    action: 'dag.chain.error',
+                    message,
+                    specId,
+                    data: { sessionId: testSessionId },
+                  }).catch((err: any) => console.error('[testlog] dag.chain.error failed', err));
+                  onToast(message, 'error');
                 } finally {
                   chainBusyRef.current = false;
                   setChainBusy(false);
@@ -1702,6 +2020,7 @@ export function ManualTaskRunner({
         {dagExpanded ? (
           <div className="mt-2">
             <TaskDagGraph
+              specId={specId}
               graph={taskGraph}
               taskStatusById={taskStatusByIdForDag}
               resourceBlockedById={resourceBlockedById}

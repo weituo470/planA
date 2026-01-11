@@ -5,6 +5,7 @@ import { Button } from './components/ui/button';
 import { ExplorerSidebar } from './ExplorerSidebar';
 import { TerminalPanel, type TerminalPanelHandle, type AssignableCliTerminal } from './TerminalPanel';
 import { ManualTaskRunner, parseDagTasksFromTasksContent, replaceTasksJsonInContent } from './components/mvp5';
+import { withTestSessionHeaders } from './lib/test-logger';
 import type {
   ClarificationQuestion,
   LlmInfo,
@@ -377,8 +378,8 @@ async function apiJson<T>(path: string, init?: RequestInit, timeoutMsOverride?: 
       ...init,
       cache: 'no-store',
       headers: {
+        ...withTestSessionHeaders(init?.headers),
         'Content-Type': 'application/json',
-        ...(init?.headers ?? {}),
       },
       signal: controller.signal,
     });
@@ -456,8 +457,8 @@ async function apiNdjsonStream<T>(
       ...init,
       cache: 'no-store',
       headers: {
+        ...withTestSessionHeaders(init?.headers),
         'Content-Type': 'application/json',
-        ...(init?.headers ?? {}),
       },
       signal: controller.signal,
     });
