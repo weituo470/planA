@@ -7103,6 +7103,7 @@ function createTerminalSession(options) {
     running: true,
     paused: false,
     pausedAt: null,
+    pausedPids: null,
     createdAt: new Date().toISOString(),
     exitedAt: null,
     exitCode: null,
@@ -7142,6 +7143,7 @@ function createTerminalSession(options) {
     session.running = false;
     session.paused = false;
     session.pausedAt = null;
+    session.pausedPids = null;
     session.exitedAt = new Date().toISOString();
     session.exitCode = typeof exitCode === 'number' ? exitCode : null;
     io.emit('terminal:exit', {
@@ -7203,23 +7205,83 @@ function pauseTerminalSession(session) {
   try {
     if (process.platform === 'win32') {
       const { execFileSync } = require('child_process');
-      execFileSync(
+      const script = [
+        "$ErrorActionPreference='Stop'",
+        'Add-Type -TypeDefinition \'using System; using System.Runtime.InteropServices; public static class ProcessSuspendResume { [DllImport("ntdll.dll")] public static extern int NtSuspendProcess(IntPtr processHandle); [DllImport("ntdll.dll")] public static extern int NtResumeProcess(IntPtr processHandle); }\' -ErrorAction Stop',
+        'function Suspend-Pid([int]$TargetPid) { $p = [System.Diagnostics.Process]::GetProcessById($TargetPid); [ProcessSuspendResume]::NtSuspendProcess($p.Handle) | Out-Null }',
+        'function Resume-Pid([int]$TargetPid) { $p = [System.Diagnostics.Process]::GetProcessById($TargetPid); [ProcessSuspendResume]::NtResumeProcess($p.Handle) | Out-Null }',
+        'function Get-Descendants([int]$RootPid, $ChildrenByParent) {',
+        '  $queue = New-Object System.Collections.Generic.Queue[int]',
+        '  $seen = New-Object System.Collections.Generic.HashSet[int]',
+        '  $result = New-Object System.Collections.Generic.List[int]',
+        '  $queue.Enqueue($RootPid) | Out-Null',
+        '  $seen.Add($RootPid) | Out-Null',
+        '  while ($queue.Count -gt 0) {',
+        '    $cur = $queue.Dequeue()',
+        '    $key = [string]$cur',
+        '    if ($ChildrenByParent.ContainsKey($key)) {',
+        '      foreach ($child in $ChildrenByParent[$key]) {',
+        '        $cid = [int]$child',
+        '        if ($seen.Add($cid)) {',
+        '          $result.Add($cid) | Out-Null',
+        '          $queue.Enqueue($cid) | Out-Null',
+        '        }',
+        '      }',
+        '    }',
+        '  }',
+        '  return $result',
+        '}',
+        '$procs = Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId',
+        '$map = @{}',
+        'foreach ($p in $procs) {',
+        '  $ppid = [string]([int]$p.ParentProcessId)',
+        '  if (-not $map.ContainsKey($ppid)) { $map[$ppid] = @() }',
+        '  $map[$ppid] += [int]$p.ProcessId',
+        '}',
+        `$root = ${pid}`,
+        '$desc = @(Get-Descendants -RootPid $root -ChildrenByParent $map)',
+        '$pids = @($desc + $root) | Sort-Object -Unique',
+        '$toSuspend = $pids | Sort-Object -Descending',
+        '$paused = @()',
+        'try {',
+        '  foreach ($p in $toSuspend) {',
+        '    Suspend-Pid -TargetPid ([int]$p)',
+        '    $paused += $p',
+        '  }',
+        '} catch {',
+        '  foreach ($p in ($paused | Sort-Object)) {',
+        "    try { Resume-Pid -TargetPid ([int]$p) } catch { }",
+        '  }',
+        '  throw',
+        '}',
+        '$pids | ConvertTo-Json -Compress',
+      ].join(';');
+
+      const stdout = execFileSync(
         'powershell.exe',
-        [
-          '-NoProfile',
-          '-NonInteractive',
-          '-ExecutionPolicy',
-          'Bypass',
-          '-Command',
-          `Suspend-Process -Id ${pid} -ErrorAction Stop`,
-        ],
-        { stdio: 'ignore' },
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+        { encoding: 'utf8' },
       );
+      const text = String(stdout || '').trim();
+      const parsed = text ? JSON.parse(text) : null;
+      const pausedPids = Array.isArray(parsed)
+        ? Array.from(new Set(parsed.map((v) => Number(v)).filter((n) => Number.isFinite(n) && n > 0)))
+        : [];
+      if (!pausedPids.length) throw new Error('Pause returned empty pid list');
+      session.pausedPids = pausedPids;
+      emitEvent('log:append', {
+        source: 'terminal',
+        message: `[terminal] paused ${session.id} pid=${pid} pids=${pausedPids.join(',')}`,
+      });
     } else {
-      process.kill(pid, 'SIGSTOP');
+      try {
+        process.kill(-pid, 'SIGSTOP');
+      } catch {
+        process.kill(pid, 'SIGSTOP');
+      }
     }
   } catch (e) {
-    const error = new Error(`Failed to pause terminal: ${e?.message || e}`);
+    const error = new Error(`Failed to pause terminal: ${e?.message || e}`);    
     error.status = 500;
     throw error;
   }
@@ -7253,30 +7315,48 @@ function resumeTerminalSession(session) {
   try {
     if (process.platform === 'win32') {
       const { execFileSync } = require('child_process');
+      const pausedPids =
+        Array.isArray(session.pausedPids) && session.pausedPids.length
+          ? session.pausedPids.map((v) => Number(v)).filter((n) => Number.isFinite(n) && n > 0)
+          : [pid];
+      const pidsJson = JSON.stringify(Array.from(new Set(pausedPids)));
+      const script = [
+        "$ErrorActionPreference='Stop'",
+        'Add-Type -TypeDefinition \'using System; using System.Runtime.InteropServices; public static class ProcessSuspendResume { [DllImport("ntdll.dll")] public static extern int NtSuspendProcess(IntPtr processHandle); [DllImport("ntdll.dll")] public static extern int NtResumeProcess(IntPtr processHandle); }\' -ErrorAction Stop',
+        'function Resume-Pid([int]$TargetPid) { $p = [System.Diagnostics.Process]::GetProcessById($TargetPid); [ProcessSuspendResume]::NtResumeProcess($p.Handle) | Out-Null }',
+        `$pids = '${pidsJson}' | ConvertFrom-Json`,
+        '$toResume = $pids | Sort-Object -Descending',
+        'foreach ($p in $toResume) {',
+          '  try {',
+        '    Resume-Pid -TargetPid ([int]$p)',
+          '  } catch {',
+        "    if ($_.Exception.Message -match 'Process.*not found' -or $_.Exception.Message -match 'cannot find' -or $_.Exception.Message -match 'cannot find a process') { continue }",
+          '    throw',
+          '  }',
+        '}',
+      ].join(';');
       execFileSync(
         'powershell.exe',
-        [
-          '-NoProfile',
-          '-NonInteractive',
-          '-ExecutionPolicy',
-          'Bypass',
-          '-Command',
-          `Resume-Process -Id ${pid} -ErrorAction Stop`,
-        ],
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
         { stdio: 'ignore' },
       );
     } else {
-      process.kill(pid, 'SIGCONT');
+      try {
+        process.kill(-pid, 'SIGCONT');
+      } catch {
+        process.kill(pid, 'SIGCONT');
+      }
     }
   } catch (e) {
-    const error = new Error(`Failed to resume terminal: ${e?.message || e}`);
+    const error = new Error(`Failed to resume terminal: ${e?.message || e}`);   
     error.status = 500;
     throw error;
   }
 
   session.paused = false;
   session.pausedAt = null;
-  io.emit('terminal:resumed', { terminalId: session.id, pid: session.pid });
+  session.pausedPids = null;
+  io.emit('terminal:resumed', { terminalId: session.id, pid: session.pid });    
   return session;
 }
 
@@ -7448,6 +7528,7 @@ const routesContext = {
   createNdjsonStream,
   createSpecTemplates,
   createTerminalSession,
+  terminalSessions,
   describeLlmConfig,
   detectDagScopeConflicts,
   emitDiff,
