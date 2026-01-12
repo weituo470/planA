@@ -344,6 +344,18 @@ function registerCoreRoutes(app, ctx) {
           exitCode: session.exitCode,
         },
         buffer: session.buffer,
+        autoResponder: session.autoResponder
+          ? {
+              enabled: session.autoResponder.enabled === true,
+              mode: session.autoResponder.mode || null,
+              idleMs: session.autoResponder.idleMs || null,
+              cooldownMs: session.autoResponder.cooldownMs || null,
+              maxActions: session.autoResponder.maxActions || null,
+              attempts: session.autoResponder.attempts || 0,
+              lastActionAt: session.autoResponder.lastActionAt || 0,
+            }
+          : null,
+        autoEvents: Array.isArray(session.autoEvents) ? session.autoEvents : [],
       });
     });
     
@@ -352,7 +364,10 @@ function registerCoreRoutes(app, ctx) {
         return res.status(409).json({ error: 'Blocked by approval' });
       }
       try {
-        const session = createTerminalSession(req.body || {});
+        const session = createTerminalSession({
+          ...(req.body || {}),
+          testSessionId: req.testSessionId,
+        });
         return res.json({
           id: session.id,
           pid: session.pid,
@@ -2313,6 +2328,7 @@ function registerCoreRoutes(app, ctx) {
           cwd: projectDir,
           cols: req.body?.cols,
           rows: req.body?.rows,
+          testSessionId: req.testSessionId,
         });
       } catch (error) {
         return res.status(error?.status || 500).json({ error: error?.message || 'Failed to start terminal' });

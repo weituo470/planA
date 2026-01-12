@@ -1670,6 +1670,7 @@ function registerMvp5Routes(app, ctx) {
       projectDir,
       sandbox = 'workspace-write',
       model = null,
+      testSessionId = null,
     }) {
       const state = executionStates.get(executionId);
       const plan = executionPlans.get(planId);
@@ -1711,6 +1712,8 @@ function registerMvp5Routes(app, ctx) {
           command: 'cmd.exe',
           args: [],
           cwd: projectDir,
+          testSessionId,
+          autoContinue: true,
         });
     
         const worker = {
@@ -1731,6 +1734,7 @@ function registerMvp5Routes(app, ctx) {
         projectDir,
         sandbox,
         model,
+        testSessionId,
         worktree: {
           enabled: true,
           gitTop,
@@ -1826,6 +1830,7 @@ function registerMvp5Routes(app, ctx) {
           projectDir,
           sandbox,
           model,
+          testSessionId: req.testSessionId,
         });
     
         if (!runner) {
@@ -1910,6 +1915,7 @@ function registerMvp5Routes(app, ctx) {
               projectDir: normalizeTerminalCwd(''),
               sandbox: normalizeCodexSandbox(req.body?.sandbox ?? req.query?.sandbox),
               model: normalizeCodexModel(req.body?.model ?? req.query?.model),
+              testSessionId: req.testSessionId,
             });
           }
         }

@@ -7250,6 +7250,7 @@ function testLogRequestMiddleware(req, res, next) {
   const headerSessionId = Array.isArray(rawHeader) ? rawHeader[0] : rawHeader;
   const sessionId = normalizeTestSessionId(headerSessionId);
   if (!sessionId) return next();
+  req.testSessionId = sessionId;
   if (String(req.path || '').startsWith('/test-logs')) return next();
 
   const startedAt = Date.now();
@@ -7374,6 +7375,243 @@ let ptyProcess = null;
 
 const terminalSessions = new Map();
 const TERMINAL_BUFFER_LIMIT = 120;
+
+const AUTO_RESPONDER_DEFAULTS = {
+  enabled: false,
+  mode: 'prompt', // 'prompt' | 'idle'
+  idleMs: 1800,
+  cooldownMs: 1800,
+  maxActions: 12,
+  continueKeyword: '继续',
+};
+
+function stripAnsi(input) {
+  const text = typeof input === 'string' ? input : '';
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/\x1b\][^\u0007]*\u0007/g, '');
+}
+
+function normalizeAutoResponderOptions(value, fallback) {
+  const base = fallback && typeof fallback === 'object' ? fallback : AUTO_RESPONDER_DEFAULTS;
+  const obj = value && typeof value === 'object' ? value : null;
+  const enabled = obj?.enabled === true;
+  const modeRaw = typeof obj?.mode === 'string' ? obj.mode.trim().toLowerCase() : '';
+  const mode = modeRaw === 'idle' ? 'idle' : 'prompt';
+  const idleMs = Number.isFinite(Number(obj?.idleMs)) ? Math.max(300, Math.floor(Number(obj.idleMs))) : base.idleMs;
+  const cooldownMs = Number.isFinite(Number(obj?.cooldownMs))
+    ? Math.max(100, Math.floor(Number(obj.cooldownMs)))
+    : base.cooldownMs;
+  const maxActions = Number.isFinite(Number(obj?.maxActions))
+    ? Math.max(1, Math.min(200, Math.floor(Number(obj.maxActions))))
+    : base.maxActions;
+  const continueKeyword =
+    typeof obj?.continueKeyword === 'string' && obj.continueKeyword.trim()
+      ? obj.continueKeyword.trim().slice(0, 12)
+      : base.continueKeyword;
+  return { enabled, mode, idleMs, cooldownMs, maxActions, continueKeyword };
+}
+
+function isClaudeBypassTerminal(command, args) {
+  const cmd = String(command || '').toLowerCase();
+  const argv = Array.isArray(args) ? args.map((v) => String(v || '').toLowerCase()) : [];
+  if (!cmd.includes('cmd.exe') && !cmd.includes('powershell') && !cmd.includes('pwsh')) return false;
+  if (!argv.includes('claude')) return false;
+  return argv.includes('--permission-mode') && argv.includes('bypasspermissions');
+}
+
+function captureTerminalSnippet(session, { maxChars = 5000, maxItems = 80 } = {}) {
+  const buf = Array.isArray(session?.buffer) ? session.buffer : [];
+  const slice = buf.slice(Math.max(0, buf.length - maxItems));
+  const raw = slice.map((it) => String(it?.data || '')).join('');
+  const cleaned = stripAnsi(raw).replace(/\r/g, '');
+  const clipped = cleaned.length > maxChars ? cleaned.slice(-maxChars) : cleaned;
+  return {
+    len: cleaned.length,
+    sha256: sha256Short(cleaned) || sha256Short(raw),
+    snippet: clipped,
+  };
+}
+
+function inferAutoResponderActionFromOutput(text) {
+  const out = typeof text === 'string' ? text : '';
+  const cleaned = stripAnsi(out);
+  const tail = cleaned.slice(-9000);
+  const lower = tail.toLowerCase();
+
+  const llmErrorSignals = [
+    'llm call failed',
+    'unexpected token',
+    'not valid json',
+    'model_not_found',
+    'rate limit',
+    '429',
+    '502',
+    '503',
+    '504',
+  ];
+
+  const promptSignals = [
+    'enter to select',
+    'press enter',
+    '↑/↓',
+    '↑/↓ to navigate',
+    'esc to cancel',
+    'enter to continue',
+    'type something',
+    '是否允许',
+    '越界修改',
+    '输入“继续”',
+    '输入\"继续\"',
+  ];
+
+  if (llmErrorSignals.some((s) => lower.includes(s))) {
+    if (tail.includes('继续') || lower.includes('continue')) {
+      return { kind: 'continue', reason: 'llm_error_recovery' };
+    }
+    // LLM error but no explicit continue hint -> still press enter to proceed/flush prompt.
+    return { kind: 'enter', reason: 'llm_error_enter' };
+  }
+
+  if (promptSignals.some((s) => tail.includes(s) || lower.includes(String(s).toLowerCase()))) {
+    // Prefer continue when prompt explicitly mentions it.
+    if (tail.includes('继续') || lower.includes("type 'continue'")) {
+      return { kind: 'continue', reason: 'prompt_continue' };
+    }
+    return { kind: 'enter', reason: 'prompt_enter' };
+  }
+
+  return null;
+}
+
+function logAutoResponderEvent(session, entry) {
+  const e = entry && typeof entry === 'object' ? entry : {};
+  const payload = {
+    ts: new Date().toISOString(),
+    terminalId: session?.id || null,
+    pid: session?.pid || null,
+    title: session?.title || null,
+    cwd: session?.cwd || null,
+    action: e.action || null,
+    reason: e.reason || null,
+    attempt: typeof e.attempt === 'number' ? e.attempt : e.attempt === 0 ? 0 : e.attempt || null,
+    snippet: e.snippet || null,
+  };
+
+  if (session && Array.isArray(session.autoEvents)) {
+    session.autoEvents.push(payload);
+    if (session.autoEvents.length > 80) {
+      session.autoEvents.splice(0, session.autoEvents.length - 80);
+    }
+  }
+
+  emitEvent('log:append', {
+    source: 'auto-responder',
+    message: `[auto] terminal=${payload.terminalId} action=${payload.action} reason=${payload.reason} attempt=${payload.attempt}`,
+  });
+
+  const testSessionId = normalizeTestSessionId(session?.testSessionId);
+  if (testSessionId) {
+    try {
+      appendTestLogEvent(
+        {
+          sessionId: testSessionId,
+          level: 'info',
+          source: 'bridge',
+          action: 'terminal.auto_input',
+          message: 'auto terminal input',
+          data: payload,
+        },
+        {
+          sessionId: testSessionId,
+        },
+      );
+    } catch (error) {
+      emitEvent('log:append', {
+        source: 'auto-responder',
+        message: `[auto] failed to write test log: ${error?.message || String(error)}`,
+      });
+    }
+  }
+}
+
+function disposeAutoResponder(session) {
+  if (!session) return;
+  if (session.autoResponderTimer) {
+    try {
+      clearInterval(session.autoResponderTimer);
+    } catch {
+      // ignore
+    }
+    session.autoResponderTimer = null;
+  }
+}
+
+function tickAutoResponder(session) {
+  if (!session?.autoResponder?.enabled) return;
+  if (!session.running) return;
+  if (session.paused) return;
+
+  const now = Date.now();
+  const lastOutputAt = Number(session.lastOutputAt || 0);
+  if (lastOutputAt && now - lastOutputAt < session.autoResponder.idleMs) return;
+
+  const lastActionAt = Number(session.autoResponder.lastActionAt || 0);
+  if (lastActionAt && now - lastActionAt < session.autoResponder.cooldownMs) return;
+
+  const attempts = Number(session.autoResponder.attempts || 0);
+  if (attempts >= session.autoResponder.maxActions) {
+    session.autoResponder.enabled = false;
+    const snippet = captureTerminalSnippet(session, { maxChars: 5000 });
+    logAutoResponderEvent(session, {
+      action: 'stop',
+      reason: 'max_actions_reached',
+      attempt: attempts,
+      snippet,
+    });
+    return;
+  }
+
+  const lastHandledSeq = Number(session.autoResponder.lastHandledSeq || 0);
+  const latestSeq = Number(session.seq || 0);
+  if (attempts > 0 && latestSeq <= lastHandledSeq) return;
+
+  const buf = Array.isArray(session.buffer) ? session.buffer : [];
+  const sinceText = buf
+    .filter((it) => Number(it?.seq || 0) > lastHandledSeq)
+    .map((it) => String(it?.data || ''))
+    .join('');
+  const decision = inferAutoResponderActionFromOutput(sinceText);
+
+  if (!decision && session.autoResponder.mode !== 'idle') return;
+
+  const snippet = captureTerminalSnippet(session, { maxChars: 9000 });
+  const action = decision?.kind || 'enter';
+  const reason = decision?.reason || 'idle_timeout';
+  const input = action === 'continue' ? `${session.autoResponder.continueKeyword}\r` : '\r';
+
+  try {
+    writeTerminalInput(session, input);
+  } catch (error) {
+    logAutoResponderEvent(session, {
+      action: 'error',
+      reason: `write_failed:${error?.message || String(error)}`,
+      attempt: attempts + 1,
+      snippet,
+    });
+    session.autoResponder.enabled = false;
+    return;
+  }
+
+  session.autoResponder.attempts = attempts + 1;
+  session.autoResponder.lastActionAt = now;
+  session.autoResponder.lastHandledSeq = latestSeq;
+  logAutoResponderEvent(session, {
+    action,
+    reason,
+    attempt: attempts + 1,
+    snippet,
+  });
+}
 
 const DEFAULT_WORKSPACE_CONFIG = { defaultCwd: null };
 
@@ -7543,6 +7781,13 @@ function createTerminalSession(options) {
   const cwd = normalizeTerminalCwd(options?.cwd);
   const cols = normalizeTerminalSize(options?.cols, 120);
   const rows = normalizeTerminalSize(options?.rows, 30);
+  const testSessionId = normalizeTestSessionId(options?.testSessionId);
+
+  const explicitAutoResponder = options?.autoResponder && typeof options.autoResponder === 'object'
+    ? normalizeAutoResponderOptions(options.autoResponder, AUTO_RESPONDER_DEFAULTS)
+    : null;
+  const inferredAutoResponderEnabled = isClaudeBypassTerminal(command, args) || options?.autoContinue === true;
+  const autoResponder = explicitAutoResponder || { ...AUTO_RESPONDER_DEFAULTS, enabled: inferredAutoResponderEnabled };
 
   const mergedEnv = { ...process.env };
   if (tool?.env && typeof tool.env === 'object') {
@@ -7574,6 +7819,7 @@ function createTerminalSession(options) {
     args,
     cwd,
     pid: proc.pid,
+    testSessionId,
     running: true,
     paused: false,
     pausedAt: null,
@@ -7583,6 +7829,15 @@ function createTerminalSession(options) {
     exitCode: null,
     seq: 0,
     buffer: [],
+    lastOutputAt: Date.now(),
+    autoResponder: {
+      ...autoResponder,
+      attempts: 0,
+      lastActionAt: 0,
+      lastHandledSeq: 0,
+    },
+    autoResponderTimer: null,
+    autoEvents: [],
     proc,
   };
 
@@ -7610,6 +7865,7 @@ function createTerminalSession(options) {
     if (session.buffer.length > TERMINAL_BUFFER_LIMIT) {
       session.buffer.splice(0, session.buffer.length - TERMINAL_BUFFER_LIMIT);
     }
+    session.lastOutputAt = Date.now();
     io.emit('terminal:data', { terminalId: id, seq: item.seq, data });
   });
 
@@ -7620,11 +7876,22 @@ function createTerminalSession(options) {
     session.pausedPids = null;
     session.exitedAt = new Date().toISOString();
     session.exitCode = typeof exitCode === 'number' ? exitCode : null;
+    disposeAutoResponder(session);
     io.emit('terminal:exit', {
       terminalId: id,
       exitCode: session.exitCode ?? -1,
     });
   });
+
+  if (session.autoResponder?.enabled) {
+    session.autoResponderTimer = setInterval(() => tickAutoResponder(session), 450);
+    logAutoResponderEvent(session, {
+      action: 'start',
+      reason: 'enabled',
+      attempt: 0,
+      snippet: captureTerminalSnippet(session, { maxChars: 1200 }),
+    });
+  }
 
   return session;
 }
@@ -7648,6 +7915,10 @@ function resizeTerminal(session, cols, rows) {
 }
 
 function killTerminal(session) {
+  if (session?.autoResponder?.enabled) {
+    session.autoResponder.enabled = false;
+  }
+  disposeAutoResponder(session);
   if (!session?.proc) return;
   try {
     session.proc.kill();
