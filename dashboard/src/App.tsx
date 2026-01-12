@@ -2641,6 +2641,9 @@ export default function App() {
     doneMarker: string;
     failedMarker: string;
     cliToolId?: string;
+    runningDetected?: boolean;
+    promptSubmitted?: boolean;
+    promptSubmittedAtMs?: number;
   };
 
   const claudeAutoRunsRef = useRef<Map<string, ClaudeAutoRunContext>>(new Map());
@@ -2813,6 +2816,29 @@ export default function App() {
       const nextTail = `${prevTail}${String(event?.data ?? '')}`.slice(-8000);
       claudeAutoTerminalTailRef.current.set(terminalId, nextTail);
 
+      if (
+        run.cliToolId === 'builtin:codex' &&
+        run.runningDetected !== true &&
+        run.promptSubmitted === true
+      ) {
+        const plainChunk = stripAnsi(String(event?.data ?? '')).trim();
+        const plainTail = stripAnsi(nextTail);
+        const looksLikeRunning =
+          /\bWorking\b\s*(\(|…|\.{3})/i.test(plainChunk) ||
+          /\bWorking\b\s*(\(|…|\.{3})/i.test(plainTail);
+        if (looksLikeRunning) {
+          console.info('[codex] running detected', {
+            specId: run.specId,
+            taskId: run.taskId,
+            terminalId,
+          });
+          run.runningDetected = true;
+          void saveMvp5TaskStatus(run.specId, run.taskId, 'running')
+            .then(() => showToast(`已检测到 Codex 输出，标记进行中：${run.taskId}`, 'info'))
+            .catch((e: any) => showToast(humanizeError(e)));
+        }
+      }
+
       if (run.doneMarker && nextTail.includes(run.doneMarker)) {
         claudeAutoRunsRef.current.delete(terminalId);
         claudeAutoTerminalTailRef.current.delete(terminalId);
@@ -2872,12 +2898,16 @@ export default function App() {
     const taskId = String(context?.taskId || '').trim();
     if (!specId || !taskId) throw new Error('任务上下文缺失');
 
-    // 先写回任务状态，避免出现“终端已启动但任务仍显示可开始”的不一致。
-    await saveMvp5TaskStatus(specId, taskId, 'running');
+    const cliToolId = String(context?.cliToolId || '').trim() || 'builtin:claude';
+    const deferRunningUntilOutput = cliToolId === 'builtin:codex';
+    // Codex：避免“提示词已写入但未提交(回车)”造成误判；检测到 CLI 输出进入 Working 后再标记进行中。
+    // Claude Code/其他工具：保持原逻辑，先标记运行中以避免任务状态与终端启动不同步。
+    if (!deferRunningUntilOutput) {
+      await saveMvp5TaskStatus(specId, taskId, 'running');
+    }
 
     let created: { terminalId: string; title: string };
     try {
-      const cliToolId = String(context?.cliToolId || '').trim() || 'builtin:claude';
       if (cliToolId === 'builtin:claude') {
         created = await panel.createClaudeAutoTerminalWithPrompt(normalizedPrompt, {
           specName: specId,
@@ -2903,16 +2933,83 @@ export default function App() {
       throw error;
     }
 
-    claudeAutoRunsRef.current.set(created.terminalId, {
+    const runCtx: ClaudeAutoRunContext = {
       specId,
       taskId,
       doneMarker: context.doneMarker,
       failedMarker: context.failedMarker,
       ...(context.cliToolId ? { cliToolId: context.cliToolId } : {}),
-    });
+      runningDetected: deferRunningUntilOutput ? false : true,
+      promptSubmitted: deferRunningUntilOutput ? false : true,
+    };
+    claudeAutoRunsRef.current.set(created.terminalId, runCtx);
     claudeAutoTerminalTailRef.current.set(created.terminalId, '');
 
     panel.focusTerminal(created.terminalId);
+
+    if (deferRunningUntilOutput) {
+      try {
+        // 清掉 Codex 启动阶段输出，避免把初始化 UI 当作“任务进行中”信号
+        claudeAutoTerminalTailRef.current.set(created.terminalId, '');
+        console.info('[codex] submit prompt', {
+          specId,
+          taskId,
+          terminalId: created.terminalId,
+          promptLength: normalizedPrompt.length,
+        });
+        // Codex 在 Windows 下启动到可接收输入需要一点时间；过早写入会出现“提示词已粘贴但不触发执行”的现象。
+        await new Promise((resolve) => window.setTimeout(resolve, 900));
+        await panel.sendTerminalInput(created.terminalId, normalizedPrompt);
+        runCtx.promptSubmitted = true;
+        runCtx.promptSubmittedAtMs = Date.now();
+        // 先发一次回车，再做兜底重试（若未检测到输出则补一次）
+        await new Promise((resolve) => window.setTimeout(resolve, 120));
+        await panel.sendTerminalInput(created.terminalId, '\r\n');
+
+        const scheduleRetry = (delayMs: number) => {
+          window.setTimeout(() => {
+            const current = claudeAutoRunsRef.current.get(created.terminalId);
+            if (!current) return;
+            if (current.cliToolId !== 'builtin:codex') return;
+            if (current.runningDetected === true) return;
+            if (current.promptSubmitted !== true) return;
+            const panelNow = terminalPanelRef.current;
+            if (!panelNow?.sendTerminalInput) return;
+            void panelNow
+              .sendTerminalInput(created.terminalId, '\r\n')
+              .then(() =>
+                console.info('[codex] retry submit (no output yet)', {
+                  specId,
+                  taskId,
+                  terminalId: created.terminalId,
+                  delayMs,
+                }),
+              )
+              .catch((error) =>
+                console.warn('[codex] retry submit failed', {
+                  specId,
+                  taskId,
+                  terminalId: created.terminalId,
+                  delayMs,
+                  error,
+                }),
+              );
+          }, delayMs);
+        };
+        scheduleRetry(900);
+      } catch (e) {
+        console.error('[codex] submit prompt failed', {
+          specId,
+          taskId,
+          terminalId: created.terminalId,
+          error: e,
+        });
+        claudeAutoRunsRef.current.delete(created.terminalId);
+        claudeAutoTerminalTailRef.current.delete(created.terminalId);
+        throw e;
+      }
+    }
+
     return created;
   }, [saveMvp5TaskStatus, showToast]);
 
@@ -2922,7 +3019,7 @@ export default function App() {
       if (!normalizedSpecId) return { paused: 0, total: 0 };
 
       const panel = terminalPanelRef.current;
-      if (!panel?.pauseTerminal) throw new Error('终端不支持暂停');
+      if (!panel?.sendTerminalInput) throw new Error('终端不支持输入');
 
       const terminalIds: string[] = [];
       for (const [terminalId, run] of claudeAutoRunsRef.current.entries()) {
@@ -2930,25 +3027,27 @@ export default function App() {
       }
 
       let paused = 0;
-      for (const terminalId of terminalIds) {
-        try {
-          await panel.pauseTerminal(terminalId);
-          paused += 1;
-        } catch (e: any) {
-          console.warn('[pauseClaudeAutoRunsForSpec] pause failed', {
-            specId: normalizedSpecId,
-            terminalId,
-            error: e,
-          });
-        }
-      }
+      await Promise.all(
+        terminalIds.map(async (terminalId) => {
+          try {
+            await panel.sendTerminalInput(terminalId, '\x1b'); // ESC
+            paused += 1;
+          } catch (e: any) {
+            console.warn('[pauseClaudeAutoRunsForSpec] pause failed', {
+              specId: normalizedSpecId,
+              terminalId,
+              error: e,
+            });
+          }
+        }),
+      );
 
       if (!terminalIds.length) {
         showToast('当前没有运行中的任务终端', 'info');
       } else if (paused === terminalIds.length) {
-        showToast(`已暂停 ${paused} 个任务终端`, 'info');
+        showToast(`已发送暂停(ESC) 到 ${paused} 个任务终端`, 'info');
       } else {
-        showToast(`已暂停 ${paused}/${terminalIds.length} 个任务终端（部分失败）`, 'error');
+        showToast(`已发送暂停(ESC) 到 ${paused}/${terminalIds.length} 个任务终端（部分失败）`, 'error');
       }
 
       return { paused, total: terminalIds.length };
@@ -2962,7 +3061,7 @@ export default function App() {
       if (!normalizedSpecId) return { resumed: 0, total: 0 };
 
       const panel = terminalPanelRef.current;
-      if (!panel?.resumeTerminal) throw new Error('终端不支持继续');
+      if (!panel?.sendTerminalInput) throw new Error('终端不支持输入');
 
       const terminalIds: string[] = [];
       for (const [terminalId, run] of claudeAutoRunsRef.current.entries()) {
@@ -2970,25 +3069,27 @@ export default function App() {
       }
 
       let resumed = 0;
-      for (const terminalId of terminalIds) {
-        try {
-          await panel.resumeTerminal(terminalId);
-          resumed += 1;
-        } catch (e: any) {
-          console.warn('[resumeClaudeAutoRunsForSpec] resume failed', {
-            specId: normalizedSpecId,
-            terminalId,
-            error: e,
-          });
-        }
-      }
+      await Promise.all(
+        terminalIds.map(async (terminalId) => {
+          try {
+            await panel.sendTerminalInput(terminalId, '继续\r');
+            resumed += 1;
+          } catch (e: any) {
+            console.warn('[resumeClaudeAutoRunsForSpec] resume failed', {
+              specId: normalizedSpecId,
+              terminalId,
+              error: e,
+            });
+          }
+        }),
+      );
 
       if (!terminalIds.length) {
         showToast('当前没有运行中的任务终端', 'info');
       } else if (resumed === terminalIds.length) {
-        showToast(`已继续 ${resumed} 个任务终端`, 'info');
+        showToast(`已发送继续(继续+回车) 到 ${resumed} 个任务终端`, 'info');
       } else {
-        showToast(`已继续 ${resumed}/${terminalIds.length} 个任务终端（部分失败）`, 'error');
+        showToast(`已发送继续(继续+回车) 到 ${resumed}/${terminalIds.length} 个任务终端（部分失败）`, 'error');
       }
 
       return { resumed, total: terminalIds.length };

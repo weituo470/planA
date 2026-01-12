@@ -797,15 +797,13 @@ export function TerminalPanelInner(
         if (!initialPrompt) throw new Error('Prompt 不能为空');
         const base = pickCodexTemplate();
         const taskPrefix = meta?.taskId ? `${String(meta.taskId).trim()} · ` : '';
+        // Codex CLI 支持把 PROMPT 作为 argv 直接启动（可避免“已粘贴但未回车提交”的不确定性）。
         const template = { ...base, title: `${taskPrefix}${base.title}` };
         const terminalId = await createTerminal(template, {
           kind: 'codex',
           ...(meta?.specName ? { specName: meta.specName } : {}),
           ...(meta?.taskId ? { taskId: meta.taskId } : {}),
         });
-        await new Promise((resolve) => window.setTimeout(resolve, 900));
-        await sendTerminalInput(terminalId, initialPrompt);
-        await sendTerminalInput(terminalId, '\r');
         return { terminalId, title: template.title };
       },
       createCliToolTerminalWithPrompt: async (rawToolId: string, prompt: string, meta) => {
@@ -883,7 +881,14 @@ export function TerminalPanelInner(
     void refreshWorkspace();
   }, [refreshWorkspace]);
 
-  const saveWorkspaceCwd = useCallback(async () => {
+  const saveWorkspaceCwd = useCallback(async (nextCwd?: string) => {
+    const value = String(typeof nextCwd === 'string' ? nextCwd : cwdDraft)
+      .replace(/\r?\n/g, ' ')
+      .trim();
+    if (!value) {
+      setCwdError('默认目录不能为空');
+      return;
+    }
     try {
       setCwdSaving(true);
       setCwdError(null);
@@ -896,11 +901,12 @@ export function TerminalPanelInner(
         '/workspace',
         {
           method: 'POST',
-          body: JSON.stringify({ defaultCwd: cwdDraft }),
+          body: JSON.stringify({ defaultCwd: value }),
         },
         12000,
       );
       if (data?.error) throw new Error(String(data.error));
+      setCwdDraft(value);
       await refreshWorkspace();
       window.dispatchEvent(new CustomEvent('workspace:changed'));
     } catch (e: any) {
@@ -945,6 +951,7 @@ export function TerminalPanelInner(
       if (data?.error) throw new Error(String(data.error));
       if (data?.path) {
         setCwdDraft(data.path);
+        await saveWorkspaceCwd(data.path);
       }
       setCwdFolderName('');
     } catch (e: any) {
@@ -952,7 +959,7 @@ export function TerminalPanelInner(
     } finally {
       setCwdMkdirLoading(false);
     }
-  }, [cwdFolderName, desiredCwd]);
+  }, [cwdFolderName, desiredCwd, saveWorkspaceCwd]);
 
   const loadDirListing = useCallback(async (dirPath?: string | null) => {
     try {
@@ -1509,6 +1516,9 @@ export function TerminalPanelInner(
           className="h-8 w-[460px] max-w-full rounded-md border border-slate-700 bg-slate-950 px-2 font-mono text-xs text-slate-100 outline-none focus:ring-2 focus:ring-cyan-500"
           value={cwdDraft}
           onChange={(e) => setCwdDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') void saveWorkspaceCwd();
+          }}
           placeholder="例如：D:\\path\\to\\project"
         />
         <Button
@@ -1521,14 +1531,6 @@ export function TerminalPanelInner(
           disabled={cwdSaving}
         >
           选择目录
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => void saveWorkspaceCwd()}
-          disabled={cwdSaving}
-        >
-          保存
         </Button>
         <Button
           variant="outline"
@@ -1617,6 +1619,7 @@ export function TerminalPanelInner(
                         setSpaceDraftCwd(pickerListing.path);
                       } else {
                         setCwdDraft(pickerListing.path);
+                        void saveWorkspaceCwd(pickerListing.path);
                       }
                       setPickerOpen(false);
                     }}

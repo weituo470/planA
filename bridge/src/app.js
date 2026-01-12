@@ -7702,9 +7702,22 @@ function resolveExistingDirectory(value) {
 
 function getDefaultWorkspaceCwd() {
   const cfg = readWorkspaceConfig();
+  const planADir =
+    process.platform === 'win32'
+      ? (() => {
+          try {
+            const resolved = path.resolve('C:\\planA');
+            fs.mkdirSync(resolved, { recursive: true });
+            return resolveExistingDirectory(resolved);
+          } catch {
+            return null;
+          }
+        })()
+      : null;
   const candidates = [
     resolveExistingDirectory(cfg?.defaultCwd),
     resolveExistingDirectory(process.env.WORKFLOW_DEFAULT_CWD || ''),
+    planADir,
     resolveExistingDirectory(REPO_DIR),
     resolveExistingDirectory(DEFAULT_TESTCLI_DIR),
   ].filter(Boolean);

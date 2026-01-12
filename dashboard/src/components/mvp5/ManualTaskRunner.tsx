@@ -624,6 +624,7 @@ export function ManualTaskRunner({
     runDocPathAbs?: string;
   } | null>(null);
   const [promptLoadingTaskId, setPromptLoadingTaskId] = useState<string | null>(null);
+  const [launchingTaskIds, setLaunchingTaskIds] = useState<Record<string, boolean>>({});
   const [singleAgentPrompt, setSingleAgentPrompt] = useState<{
     loading: boolean;
     error: string | null;
@@ -923,16 +924,42 @@ export function ManualTaskRunner({
     });
   }, [disabled, onSaveTasksContent, onToast, parsed, specId, tasksContent, testSessionId]);
 
+  useEffect(() => {
+    const ids = Object.keys(launchingTaskIds).filter((id) => launchingTaskIds[id] === true);
+    if (!ids.length) return;
+    setLaunchingTaskIds((prev) => {
+      let changed = false;
+      const next: Record<string, boolean> = { ...prev };
+      for (const id of ids) {
+        const done = doneById.get(id) === true;
+        const status = statusById.get(id) ?? (done ? 'completed' : 'pending');
+        if (done || status !== 'pending') {
+          delete next[id];
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [doneById, launchingTaskIds, statusById]);
+
   const [nowMs, setNowMs] = useState(() => Date.now());
   const hasStarted = useMemo(() => tasks.some((t) => parseIsoMs(t.startedAt) != null), [tasks]);
   const hasRunningTask = useMemo(
-    () => tasks.some((t) => (statusById.get(t.id) ?? 'pending') === 'running'),
-    [statusById, tasks],
+    () =>
+      tasks.some((t) => (statusById.get(t.id) ?? 'pending') === 'running') ||
+      Object.keys(launchingTaskIds).some((id) => launchingTaskIds[id] === true),
+    [launchingTaskIds, statusById, tasks],
   );
   const allDone = useMemo(
     () => tasks.length > 0 && tasks.every((t) => doneById.get(t.id) === true),
     [doneById, tasks],
   );
+  const chainUiState = useMemo(() => {
+    if (chainState !== 'idle') return chainState;
+    if (hasRunningTask) return 'running';
+    if (hasStarted && !allDone) return 'paused';
+    return 'idle';
+  }, [allDone, chainState, hasRunningTask, hasStarted]);
 
   useEffect(() => {
     if (!hasStarted) return;
@@ -960,7 +987,10 @@ export function ManualTaskRunner({
   }, [allDone, chainState, hasRunningTask, hasStarted, nowMs, tasks]);
 
   const resourceBlockedById = useMemo(() => {
-    const runningTasks = tasks.filter((t) => (statusById.get(t.id) ?? 'pending') === 'running');
+    const runningTasks = tasks.filter((t) => {
+      const status = statusById.get(t.id) ?? 'pending';
+      return status === 'running' || launchingTaskIds[t.id] === true;
+    });
     const map: Record<string, string[]> = {};
     for (const task of tasks) {
       const status = statusById.get(task.id) ?? (getTaskDone(task) ? 'completed' : 'pending');
@@ -980,24 +1010,27 @@ export function ManualTaskRunner({
       if (blockers.length) map[task.id] = blockers;
     }
     return map;
-  }, [doneById, statusById, tasks]);
+  }, [doneById, launchingTaskIds, statusById, tasks]);
 
   const taskGraph = useMemo(() => buildTaskGraphFromDagTasks(tasks), [tasks]);
   const taskStatusByIdForDag = useMemo(() => {
-    const map: Record<string, 'pending' | 'running' | 'completed' | 'failed'> = {};
+    const map: Record<string, 'pending' | 'launching' | 'running' | 'completed' | 'failed'> = {};
     for (const task of tasks) {
       const status = task.status ?? (getTaskDone(task) ? 'completed' : 'pending');
+      const isLaunching = status === 'pending' && launchingTaskIds[task.id] === true;
       map[task.id] =
-        status === 'running'
-          ? 'running'
-          : status === 'completed'
-            ? 'completed'
-            : status === 'failed'
-              ? 'failed'
-              : 'pending';
+        isLaunching
+          ? 'launching'
+          : status === 'running'
+            ? 'running'
+            : status === 'completed'
+              ? 'completed'
+              : status === 'failed'
+                ? 'failed'
+                : 'pending';
     }
     return map;
-  }, [tasks]);
+  }, [launchingTaskIds, tasks]);
   const cliOptions = useMemo(() => {
     const list = [
       { id: 'builtin:claude', label: 'Claude Code（全自动）' },
@@ -1279,9 +1312,12 @@ export function ManualTaskRunner({
       const taskScope = task.scope ?? [];
       const taskGlobalLock = scopeHitsGlobalLock(taskScope);
       const maxRunning = PARALLEL_POLICY_MAX_RUNNING[parallelPolicy];
-      const runningTasks = tasks.filter(
-        (t) => t.id !== task.id && (statusById.get(t.id) ?? 'pending') === 'running',
-      );
+      const runningTasks = tasks.filter((t) => {
+        if (t.id === task.id) return false;
+        const status = statusById.get(t.id) ?? (doneById.get(t.id) ? 'completed' : 'pending');
+        if (status === 'running') return true;
+        return launchingTaskIds[t.id] === true;
+      });
       const cliToolId =
         String(taskCliToolIdById?.[task.id] || '').trim() ||
         String(effectiveDefaultCliToolId || '').trim();
@@ -1422,6 +1458,9 @@ export function ManualTaskRunner({
         failedMarker,
         ...(cliToolId ? { cliToolId } : {}),
       });
+      if (cliToolId === 'builtin:codex') {
+        setLaunchingTaskIds((prev) => ({ ...prev, [task.id]: true }));
+      }
       void postTestLogEvent({
         level: 'info',
         source: 'dashboard',
@@ -1445,11 +1484,14 @@ export function ManualTaskRunner({
     },
     [
       buildClaudePromptWithMarkers,
+      doneById,
       effectiveDefaultCliToolId,
       fetchPromptForTask,
+      launchingTaskIds,
       onRunPromptInClaudeAutoTerminal,
       onToast,
       parallelPolicy,
+      setLaunchingTaskIds,
       specId,
       statusById,
       taskCliToolIdById,
@@ -1479,12 +1521,16 @@ export function ManualTaskRunner({
           if (done) return false;
           const status = statusById.get(task.id) ?? 'pending';
           if (status !== 'pending') return false;
+          if (launchingTaskIds[task.id] === true) return false;
           const missingDeps = (task.dependencies || []).filter((depId) => !doneById.get(depId));
           return missingDeps.length === 0;
         });
         if (!readyTasks.length) return;
 
-        const runningTasks = tasks.filter((t) => (statusById.get(t.id) ?? 'pending') === 'running');
+        const runningTasks = tasks.filter((t) => {
+          const status = statusById.get(t.id) ?? 'pending';
+          return status === 'running' || launchingTaskIds[t.id] === true;
+        });
         const runningCount = runningTasks.length;
         const maxRunning = PARALLEL_POLICY_MAX_RUNNING[parallelPolicy];
         if (runningCount >= maxRunning) return;
@@ -1545,6 +1591,7 @@ export function ManualTaskRunner({
     [
       disabled,
       doneById,
+      launchingTaskIds,
       onRunPromptInClaudeAutoTerminal,
       onToast,
       parallelPolicy,
@@ -1719,9 +1766,11 @@ export function ManualTaskRunner({
       }
       const taskScope = task.scope ?? [];
       const taskGlobalLock = scopeHitsGlobalLock(taskScope);
-      const runningTasks = tasks.filter(
-        (t) => t.id !== task.id && (statusById.get(t.id) ?? 'pending') === 'running',
-      );
+      const runningTasks = tasks.filter((t) => {
+        if (t.id === task.id) return false;
+        const status = statusById.get(t.id) ?? (doneById.get(t.id) ? 'completed' : 'pending');
+        return status === 'running' || launchingTaskIds[t.id] === true;
+      });
       const runningGlobalLockIds = runningTasks
         .filter((t) => scopeHitsGlobalLock(t.scope ?? []))
         .map((t) => t.id);
@@ -1778,7 +1827,7 @@ export function ManualTaskRunner({
       await onSaveTasksContent(nextContent);
       onToast(`已标记进行中：${task.id}`, 'info');
     },
-    [disabled, doneById, onSaveTasksContent, onToast, statusById, tasks, tasksContent],
+    [disabled, doneById, launchingTaskIds, onSaveTasksContent, onToast, statusById, tasks, tasksContent],
   );
 
   const taskActionsByIdForDag = useMemo(() => {
@@ -1801,6 +1850,7 @@ export function ManualTaskRunner({
     for (const task of tasks) {
       const done = doneById.get(task.id) === true;
       const status = statusById.get(task.id) ?? (done ? 'completed' : 'pending');
+      const isLaunching = launchingTaskIds[task.id] === true;
       const missingDeps = (task.dependencies || []).filter((depId) => !doneById.get(depId));
       const blocked = missingDeps.length > 0;
       const resourceBlockers = resourceBlockedById?.[task.id] ?? [];
@@ -1812,7 +1862,12 @@ export function ManualTaskRunner({
       const effectiveCliToolId = selectedCliToolId || effectiveDefaultCliToolId;
       const effectiveCliLabel = cliLabelById[effectiveCliToolId] || effectiveCliToolId;
       const cliSelectDisabled =
-        Boolean(disabled) || chainBusy || chainState === 'paused' || status === 'running' || done;
+        Boolean(disabled) ||
+        chainBusy ||
+        chainState === 'paused' ||
+        status === 'running' ||
+        isLaunching ||
+        done;
       const cliOptionsForTask: { value: string; label: string }[] = [
         { value: '', label: `默认（${defaultCliLabel}）` },
       ];
@@ -1830,11 +1885,13 @@ export function ManualTaskRunner({
         });
       }
 
-      const startTitle = blocked
-        ? `前置任务未完成：${missingDeps.join(', ')}`
-        : resourceBlocked
-          ? `文件占用冲突（运行中）：${resourceBlockedText?.text ?? resourceBlockers.join(', ')}`
-          : `启动 ${effectiveCliLabel} 并执行任务`;
+      const startTitle = isLaunching
+        ? `已启动 ${effectiveCliLabel}，等待 CLI 输出确认…`
+        : blocked
+          ? `前置任务未完成：${missingDeps.join(', ')}`
+          : resourceBlocked
+            ? `文件占用冲突（运行中）：${resourceBlockedText?.text ?? resourceBlockers.join(', ')}`
+            : `启动 ${effectiveCliLabel} 并执行任务`;
 
       map[task.id] = {
         cli: {
@@ -1845,7 +1902,7 @@ export function ManualTaskRunner({
           onChange: (nextValue) => void handleSetTaskCliToolId(task.id, nextValue),
         },
         start: {
-          label: promptLoading ? '生成中…' : '开始',
+          label: promptLoading ? '生成中…' : isLaunching ? '启动中…' : '开始',
           title: startTitle,
           disabled:
             Boolean(disabled) ||
@@ -1855,17 +1912,21 @@ export function ManualTaskRunner({
             chainBusy ||
             blocked ||
             resourceBlocked ||
-            status === 'running',
+            status === 'running' ||
+            isLaunching,
           onClick: () => void handleStartClaudeAuto(task),
         },
         running: {
           label: '进行中',
-          title: blocked
+          title: isLaunching
+            ? '启动中（等待输出确认）'
+            : blocked
             ? `被阻塞：${missingDeps.join(', ')}`
             : resourceBlocked
               ? `文件占用冲突（运行中）：${resourceBlockedText?.text ?? resourceBlockers.join(', ')}`
               : '标记进行中',
-          disabled: Boolean(disabled) || done || blocked || resourceBlocked || status === 'running',
+          disabled:
+            Boolean(disabled) || done || blocked || resourceBlocked || status === 'running' || isLaunching,
           onClick: () => void handleMarkRunning(task),
         },
         done: {
@@ -1891,6 +1952,7 @@ export function ManualTaskRunner({
     chainBusy,
     chainState,
     effectiveDefaultCliToolId,
+    launchingTaskIds,
     promptLoadingTaskId,
     resourceBlockedById,
     statusById,
@@ -2097,21 +2159,38 @@ export function ManualTaskRunner({
           <div className="flex items-center gap-3">
             <Button
               size="sm"
-              variant={chainState === 'running' ? 'outline' : 'default'}
-              disabled={Boolean(disabled) || chainBusy || (!onRunPromptInClaudeAutoTerminal && chainState === 'idle')}
+              variant={chainUiState === 'running' ? 'outline' : 'default'}
+              disabled={Boolean(disabled) || chainBusy || (!onRunPromptInClaudeAutoTerminal && chainUiState === 'idle')}
               onClick={async () => {
                 if (chainBusyRef.current) return;
                 chainBusyRef.current = true;
                 setChainBusy(true);
                 try {
-                  const current = chainStateRef.current;
+                  const rawState = chainStateRef.current;
+                  const inferredState =
+                    rawState !== 'idle'
+                      ? rawState
+                      : hasRunningTask
+                        ? 'running'
+                        : hasStarted && !allDone
+                          ? 'paused'
+                          : 'idle';
+                  const current = inferredState;
                   void postTestLogEvent({
                     level: 'info',
                     source: 'dashboard',
                     action: 'dag.chain.toggle',
-                    message: `chain toggle: ${current}`,
+                    message: `chain toggle: ${current} (raw=${rawState}, inferred=${inferredState})`,
                     specId,
-                    data: { sessionId: testSessionId, current },
+                    data: {
+                      sessionId: testSessionId,
+                      current,
+                      rawState,
+                      inferredState,
+                      hasStarted,
+                      hasRunningTask,
+                      allDone,
+                    },
                   }).catch((err: any) => console.error('[testlog] dag.chain.toggle failed', err));
                   if (current === 'idle') {
                     const cwd = String(workspace?.effectiveCwd || '').trim();
@@ -2215,14 +2294,14 @@ export function ManualTaskRunner({
               }}
             >
               {chainBusy
-                ? chainState === 'running'
+                ? chainUiState === 'running'
                   ? '暂停中…'
-                  : chainState === 'paused'
+                  : chainUiState === 'paused'
                     ? '继续中…'
                     : '启动中…'
-                : chainState === 'running'
+                : chainUiState === 'running'
                   ? '暂停'
-                  : chainState === 'paused'
+                  : chainUiState === 'paused'
                     ? '继续'
                     : '开始'}
             </Button>
@@ -2232,7 +2311,7 @@ export function ManualTaskRunner({
                 className="h-8 max-w-[220px] rounded border border-slate-700 bg-slate-950 px-2 text-xs text-slate-100"
                 value={effectiveDefaultCliToolId}
                 onChange={(e) => void handleSetDefaultCliToolId(e.target.value)}
-                disabled={Boolean(disabled) || chainBusy || chainState !== 'idle'}
+                disabled={Boolean(disabled) || chainBusy || chainUiState !== 'idle'}
                 title="任务未指定 CLI 时，使用此默认值"
               >
                 {defaultCliOptionsForSelect.map((opt) => (
@@ -2321,6 +2400,8 @@ export function ManualTaskRunner({
          {tasks.map((task) => {
            const done = doneById.get(task.id) === true;
            const status = statusById.get(task.id) ?? (done ? 'completed' : 'pending');
+           const isLaunching = launchingTaskIds[task.id] === true && status === 'pending';
+           const effectiveStatus = isLaunching ? 'launching' : status;
             const missingDeps = (task.dependencies || []).filter((depId) => !doneById.get(depId));
             const blocked = missingDeps.length > 0;
             const blockedInfo = blocked ? formatTaskIdList(missingDeps, 3) : null;
@@ -2329,7 +2410,7 @@ export function ManualTaskRunner({
             const resourceBlockedInfo = resourceBlocked
               ? formatTaskIdList(resourceBlockers, 3)
               : null;
-            const ready = !blocked && !resourceBlocked && status === 'pending';
+            const ready = !blocked && !resourceBlocked && effectiveStatus === 'pending';
             const showPrompt = promptForTask?.taskId === task.id;
             const detailsOpen = taskDetailsOpenById[task.id] === true;
             const docState = taskDocById[task.id];
@@ -2345,10 +2426,12 @@ export function ManualTaskRunner({
                 <div className="flex items-center gap-2 text-xs">
                   <span
                     className={`h-2 w-2 rounded-full ${
-                      status === 'completed'
+                      effectiveStatus === 'completed'
                         ? 'bg-green-400'
-                        : status === 'running'
+                        : effectiveStatus === 'running'
                           ? 'bg-blue-300'
+                          : effectiveStatus === 'launching'
+                            ? 'bg-blue-300'
                           : blocked || resourceBlocked
                             ? 'bg-amber-300'
                             : ready
@@ -2359,10 +2442,12 @@ export function ManualTaskRunner({
                   />
                   <span
                     className={`${
-                      status === 'completed'
+                      effectiveStatus === 'completed'
                         ? 'text-green-400'
-                        : status === 'running'
+                        : effectiveStatus === 'running'
                           ? 'text-blue-300'
+                          : effectiveStatus === 'launching'
+                            ? 'text-blue-300'
                           : blocked || resourceBlocked
                             ? 'text-amber-300'
                             : ready
@@ -2377,10 +2462,12 @@ export function ManualTaskRunner({
                           : undefined
                     }
                   >
-                    {status === 'completed'
+                    {effectiveStatus === 'completed'
                       ? '已完成'
-                      : status === 'running'
+                      : effectiveStatus === 'running'
                         ? '进行中'
+                        : effectiveStatus === 'launching'
+                          ? '启动中'
                          : blocked
                            ? `被阻塞：${blockedInfo?.text ?? missingDeps.join(', ')}`
                            : resourceBlocked

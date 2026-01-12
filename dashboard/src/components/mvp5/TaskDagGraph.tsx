@@ -18,7 +18,7 @@ import dagre from 'dagre';
 import type { TaskGraph } from './types';
 import { getTestSessionId, postTestLogEvent } from '../../lib/test-logger';
 
-type TaskStatus = 'pending' | 'running' | 'completed' | 'failed';
+type TaskStatus = 'pending' | 'launching' | 'running' | 'completed' | 'failed';
 type TaskVisualStatus = TaskStatus | 'blocked' | 'ready';
 
 type TaskActionSpec = {
@@ -80,14 +80,20 @@ function layoutDag(
 }
 
 function nodeColorByRisk(risk: string | undefined) {
-  if (risk === 'high') return 'rgba(239, 68, 68, 0.14)';
-  if (risk === 'medium') return 'rgba(245, 158, 11, 0.14)';
-  return 'rgba(15, 23, 42, 0.86)';
+  const base = 'rgba(2, 6, 23, 1)';
+  if (risk === 'high') {
+    return `linear-gradient(0deg, rgba(239, 68, 68, 0.18), rgba(239, 68, 68, 0.18)), ${base}`;
+  }
+  if (risk === 'medium') {
+    return `linear-gradient(0deg, rgba(245, 158, 11, 0.18), rgba(245, 158, 11, 0.18)), ${base}`;
+  }
+  return base;
 }
 
 function nodeBorderByStatus(status: TaskVisualStatus) {
   if (status === 'completed') return '#4ade80';
   if (status === 'running') return '#60a5fa';
+  if (status === 'launching') return '#93c5fd';
   if (status === 'failed') return '#f87171';
   if (status === 'blocked') return '#fbbf24';
   if (status === 'ready') return '#a855f7';
@@ -97,6 +103,7 @@ function nodeBorderByStatus(status: TaskVisualStatus) {
 function statusLabel(status: TaskVisualStatus) {
   if (status === 'completed') return '已完成';
   if (status === 'running') return '进行中';
+  if (status === 'launching') return '启动中';
   if (status === 'failed') return '失败';
   if (status === 'blocked') return '阻塞';
   if (status === 'ready') return '可开始';
@@ -106,6 +113,7 @@ function statusLabel(status: TaskVisualStatus) {
 function statusBadgeClass(status: TaskVisualStatus) {
   if (status === 'completed') return 'bg-green-500/15 text-green-300 ring-1 ring-green-500/30';
   if (status === 'running') return 'bg-blue-500/15 text-blue-300 ring-1 ring-blue-500/30';
+  if (status === 'launching') return 'bg-blue-500/10 text-blue-200 ring-1 ring-blue-400/20';
   if (status === 'failed') return 'bg-red-500/15 text-red-300 ring-1 ring-red-500/30';
   if (status === 'blocked') return 'bg-amber-500/15 text-amber-300 ring-1 ring-amber-500/30';
   if (status === 'ready') return 'bg-purple-500/15 text-purple-300 ring-1 ring-purple-500/30';
@@ -362,9 +370,9 @@ export function TaskDagGraph({
                     <div className="flex min-w-0 items-start gap-2">
                       <span
                         className="mt-0.5 shrink-0 rounded bg-slate-950/40 px-1.5 py-0.5 text-xs font-normal text-slate-300 ring-1 ring-slate-700/70"
-                        title={`序号 #${idx + 1}`}
+                        title={`序号 #${idx}`}
                       >
-                        #{idx + 1}
+                        #{idx}
                       </span>
                       <div
                         className="min-w-0 text-base font-medium leading-6 text-slate-100"
@@ -550,11 +558,13 @@ export function TaskDagGraph({
         const isFlowing =
           !isConflict &&
           sourceStatus === 'completed' &&
-          (targetVisualStatus === 'ready' || targetVisualStatus === 'running');
+          (targetVisualStatus === 'ready' ||
+            targetVisualStatus === 'running' ||
+            targetVisualStatus === 'launching');
 
-        const stroke = isConflict ? '#f59e0b' : isBlocking ? '#fbbf24' : '#ffffff';
-        const opacity = isConflict ? 0.95 : isBlocking ? 0.95 : isSatisfied ? 0.55 : 0.72;
-        const strokeWidth = isBlocking ? 2.5 : isFlowing ? 2.75 : 2;
+        const stroke = isConflict ? '#f59e0b' : isBlocking ? '#94a3b8' : '#cbd5e1';
+        const opacity = isConflict ? 0.95 : isBlocking ? 0.88 : isSatisfied ? 0.55 : 0.75;
+        const strokeWidth = isBlocking ? 2.25 : isFlowing ? 2.75 : 2;
         return {
           id: `${from}->${to}:${idx}`,
           source: from,
@@ -710,7 +720,7 @@ export function TaskDagGraph({
   return (
     <div
       ref={wrapperRef}
-      className={`relative w-full overflow-hidden rounded border border-slate-800 bg-slate-950 ${className} [&_.react-flow__attribution]:bg-transparent [&_.react-flow__attribution]:text-slate-500 [&_.react-flow__controls-button]:border-slate-700 [&_.react-flow__controls-button]:bg-slate-950 [&_.react-flow__controls-button]:text-slate-200 [&_.react-flow__controls-button:hover]:bg-slate-900 [&_.react-flow__minimap]:border-slate-700 [&_.react-flow__minimap]:bg-slate-950`}
+      className={`relative w-full overflow-hidden rounded border border-slate-800 bg-slate-950 ${className} [&_.react-flow__attribution]:bg-transparent [&_.react-flow__attribution]:text-slate-500 [&_.react-flow__controls-button]:border-slate-700 [&_.react-flow__controls-button]:bg-slate-950 [&_.react-flow__controls-button]:text-slate-200 [&_.react-flow__controls-button:hover]:bg-slate-900 [&_.react-flow__minimap]:border-slate-700 [&_.react-flow__minimap]:bg-slate-950 [&_.react-flow__edges]:z-0 [&_.react-flow__nodes]:z-10 [&_.react-flow__handle]:h-2.5 [&_.react-flow__handle]:w-2.5 [&_.react-flow__handle]:rounded-full [&_.react-flow__handle]:border-2 [&_.react-flow__handle]:border-slate-400/70 [&_.react-flow__handle]:bg-slate-950 [&_.react-flow__handle]:shadow-[0_0_10px_rgba(148,163,184,0.35)]`}
       style={{ height }}
     >
       {renderIssue ? (
