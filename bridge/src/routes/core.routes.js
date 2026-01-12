@@ -552,7 +552,11 @@ function registerCoreRoutes(app, ctx) {
         const latencyMs = Date.now() - startedAt;
         return res.json({ ok: true, model, providerId: cfg.providerId, latencyMs });
       } catch (error) {
-        return res.json({ ok: false, error: error?.message || String(error) });
+        return res.json({
+          ok: false,
+          error: error?.message || String(error),
+          context: error?.llmContext || null,
+        });
       }
     });
     
@@ -870,7 +874,10 @@ function registerCoreRoutes(app, ctx) {
         });
       } catch (error) {
         console.error('[opus45] promptopt chat error:', error?.message || error);
-        return res.status(500).json({ error: error?.message || 'Opus chat failed' });
+        return res.status(500).json({
+          error: error?.message || 'Opus chat failed',
+          context: error?.llmContext || null,
+        });
       }
     });
     
@@ -1514,6 +1521,63 @@ function registerCoreRoutes(app, ctx) {
       return res.json({ ok: true, status });
     });
     
+    function autoStartTasksAtomize(specName, options = {}) {
+      const name = sanitizeSpecName(specName);
+      if (!name) return null;
+    
+      const existing = atomizeJobs.get(name);
+      if (existing && existing.running) return getAtomizeStatus(existing);
+    
+      const now = new Date().toISOString();
+      const job = existing || {
+        specName: name,
+        running: false,
+        total: 0,
+        completed: 0,
+        logs: [],
+        error: null,
+        startedAt: now,
+        updatedAt: now,
+      };
+    
+      const batchSize = normalizeAtomizeBatchSize(options?.batchSize);
+      const resetAtomic = options?.resetAtomic === true;
+      const flowRunReason =
+        typeof options?.flowRunReason === 'string' && options.flowRunReason.trim()
+          ? options.flowRunReason.trim()
+          : 'atomize_auto';
+    
+      job.running = true;
+      job.error = null;
+      job.startedAt = now;
+      job.updatedAt = now;
+      if (resetAtomic) job.logs = [];
+    
+      atomizeJobs.set(name, job);
+      logAtomize(
+        job,
+        `任务生成后自动启动原子化${resetAtomic ? '｜重置 tasks_atomic' : ''}${
+          batchSize ? `｜分段：${batchSize}条` : ''
+        }`,
+      );
+    
+      setImmediate(() => {
+        runAtomizeJob(name, job, {
+          batchSize,
+          resetAtomic,
+          forceNewFlowRun: false,
+          flowRunReason,
+          iterationReason: '',
+        }).catch((error) => {
+          job.running = false;
+          job.error = error?.message || String(error);
+          logAtomize(job, `原子化启动失败：${job.error}`);
+        });
+      });
+    
+      return getAtomizeStatus(job);
+    }
+    
     app.post('/specs/:name/confirm', async (req, res) => {
       const specName = sanitizeSpecName(req.params.name);
       const artifact = req.body?.artifact;
@@ -1777,6 +1841,7 @@ function registerCoreRoutes(app, ctx) {
             stream?.write({ type: 'stage', stage: 'tasks', state: 'end' });
             writeSpecFile(specName, 'tasks', content);
             status.lastError = null;
+            autoStartTasksAtomize(specName, { resetAtomic: true, flowRunReason: 'atomize_auto_after_tasks' });
           }
         } else {
           const now = new Date().toISOString();
@@ -1830,6 +1895,7 @@ function registerCoreRoutes(app, ctx) {
             stream?.write({ type: 'stage', stage: 'tasks', state: 'end' });
             writeSpecFile(specName, 'tasks', content);
             status.lastError = null;
+            autoStartTasksAtomize(specName, { resetAtomic: true, flowRunReason: 'atomize_auto_after_tasks' });
           }
         }
       }

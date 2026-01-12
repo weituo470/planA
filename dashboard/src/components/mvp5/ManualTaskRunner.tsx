@@ -229,6 +229,51 @@ function extractTasksJsonBlockFromMarkdown(markdown: string) {
   };
 }
 
+function ensureDagTask0LogsTask(tasks: DagTask[]) {
+  const list = Array.isArray(tasks) ? tasks.slice() : [];
+  if (!list.length) return list;
+
+  let task0: DagTask | null = null;
+  const rest: DagTask[] = [];
+  for (const task of list) {
+    if (task.id === 'task_0') {
+      task0 = task;
+    } else {
+      rest.push(task);
+    }
+  }
+
+  const normalizedTask0: DagTask = task0
+    ? { ...task0, id: 'task_0', dependencies: [] }
+    : {
+        id: 'task_0',
+        title: '初始化 task_logs（协作日志）',
+        description: '创建 task_logs/ 目录，用于记录各任务工作报告（task_*.md）并降低并发冲突。',
+        dependencies: [],
+        scope: [],
+        status: 'pending',
+        done: false,
+      };
+
+  const withDeps = rest.map((task) => {
+    const deps = Array.isArray(task.dependencies) ? task.dependencies : [];
+    const next = Array.from(
+      new Set(
+        deps
+          .map((v) => String(v || '').trim())
+          .filter(Boolean)
+          .filter((depId) => depId !== task.id && depId !== 'task_0')
+          .concat(['task_0']),
+      ),
+    );
+    return next.length === deps.length && deps.every((d, idx) => d === next[idx])
+      ? task
+      : { ...task, dependencies: next };
+  });
+
+  return [normalizedTask0, ...withDeps];
+}
+
 export function parseDagTasksFromTasksContent(tasksContent: string) {
   const raw = String(tasksContent ?? '').trim();
   if (!raw) return null;
@@ -238,7 +283,11 @@ export function parseDagTasksFromTasksContent(tasksContent: string) {
     const tasks = (direct as any).tasks
       .map((t: any, idx: number) => normalizeDagTask(t, idx))
       .filter(Boolean) as DagTask[];
-    return { mode: 'direct-json' as const, payload: direct as any, tasks };
+    return {
+      mode: 'direct-json' as const,
+      payload: direct as any,
+      tasks: ensureDagTask0LogsTask(tasks),
+    };
   }
 
   const block = extractTasksJsonBlockFromMarkdown(raw);
@@ -249,7 +298,12 @@ export function parseDagTasksFromTasksContent(tasksContent: string) {
     .map((t: any, idx: number) => normalizeDagTask(t, idx))
     .filter(Boolean) as DagTask[];
 
-  return { mode: 'markdown' as const, payload: payload as any, block, tasks };
+  return {
+    mode: 'markdown' as const,
+    payload: payload as any,
+    block,
+    tasks: ensureDagTask0LogsTask(tasks),
+  };
 }
 
 export function replaceTasksJsonInContent(tasksContent: string, nextPayload: any) {

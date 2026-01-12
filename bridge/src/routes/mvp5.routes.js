@@ -1,6 +1,13 @@
 const fs = require('fs');
 const path = require('path');
 const { normalizeCodexSandbox, normalizeCodexModel } = require('../lib/codex-options');
+const {
+  assertGitTopClean,
+  createTaskWorktree,
+  commitAllChanges,
+  cleanupTaskWorktree,
+  resolveCurrentBranch,
+} = require('../lib/worktree-manager');
 
 function registerMvp5Routes(app, ctx) {
   // NOTE: 临时用 with(ctx) 保持等价重构，后续可逐步迁移到 controllers/services。
@@ -87,7 +94,108 @@ function registerMvp5Routes(app, ctx) {
       }
       return lines.join('\n');
     }
-    
+
+    function extractAtomicPathTokenFromTitle(title) {
+      const text = String(title || '').trim();
+      const match = /^(创建|修改|删除)\s+(.+)$/.exec(text);
+      if (!match) return null;
+      const rest = String(match[2] || '').trim();
+      if (!rest) return null;
+      const firstToken = rest.split(/\s+/)[0] || '';
+      const beforePipe = firstToken.split(/[｜|]/)[0] || '';
+      const token = beforePipe.replace(/[：:，,。;；]+$/g, '').trim();
+      return token || null;
+    }
+
+    function normalizeAtomicScopePath(value) {
+      return String(value || '')
+        .trim()
+        .replace(/\\/g, '/')
+        .replace(/\/+/g, '/')
+        .replace(/^\/+/, '')
+        .replace(/^\.\//, '')
+        .replace(/\/$/, '');
+    }
+
+    function looksLikeCoarseScope(value) {
+      const normalized = normalizeAtomicScopePath(value).toLowerCase();
+      if (!normalized) return true;
+      if (normalized === '.' || normalized === '/' || normalized === './') return true;
+      const coarseRoots = new Set([
+        'src',
+        'dashboard',
+        'bridge',
+        'workflow',
+        'docs',
+        'task',
+        'specs',
+      ]);
+      if (coarseRoots.has(normalized)) return true;
+      const hasSlash = normalized.includes('/');
+      const hasExt = /\.[a-z0-9]{1,8}$/i.test(normalized.split('/').pop() || '');
+      if (!hasSlash && !hasExt) return true;
+      return false;
+    }
+
+    function mergeTaskScopesPreferAtomic(existingScope, atomicFilePaths, limit = 32) {
+      const existing = Array.isArray(existingScope)
+        ? existingScope.map((v) => String(v ?? '').trim()).filter(Boolean)
+        : [];
+      const derived = Array.isArray(atomicFilePaths)
+        ? atomicFilePaths.map((v) => String(v ?? '').trim()).filter(Boolean)
+        : [];
+      if (derived.length === 0) return existing.slice(0, limit);
+
+      const existingCoarse = existing.length === 0 || existing.some((p) => looksLikeCoarseScope(p));
+
+      const keepExisting = existingCoarse
+        ? existing.filter((p) => {
+            const normalized = normalizeAtomicScopePath(p);
+            const base = normalized.split('/').pop() || '';
+            return /\.[a-z0-9]{1,8}$/i.test(base);
+          })
+        : existing;
+
+      const map = new Map();
+      for (const item of [...keepExisting, ...derived]) {
+        const normalized = normalizeScopePathForConflict(item);
+        if (!normalized) continue;
+        if (!map.has(normalized)) map.set(normalized, item);
+        if (map.size >= limit) break;
+      }
+      return Array.from(map.values());
+    }
+
+    function formatMvp5TasksAtomicHintsForPrompt(dagTasks, filesByTaskId, options = {}) {
+      const tasks = Array.isArray(dagTasks) ? dagTasks : [];
+      const maxTasks = Math.min(25, Math.max(1, Number(options?.maxTasks ?? 25)));
+      const maxFilesPerTask = Math.min(12, Math.max(3, Number(options?.maxFilesPerTask ?? 8)));
+      if (!filesByTaskId || typeof filesByTaskId.get !== 'function') return '（无）';
+
+      const lines = [];
+      lines.push('（来自 tasks_atomic.md 的文件级提示：用于评估并发风险/写入冲突；编排仍以 tasks.md 的 task 为单位）');
+
+      let any = false;
+      for (const task of tasks.slice(0, maxTasks)) {
+        const taskId = String(task?.id || '').trim();
+        if (!taskId) continue;
+        const files = filesByTaskId.get(taskId) || [];
+        if (!Array.isArray(files) || files.length === 0) continue;
+        any = true;
+        const uniq = Array.from(
+          new Set(files.map((v) => normalizeAtomicScopePath(v)).filter(Boolean)),
+        );
+        const shown = uniq.slice(0, maxFilesPerTask);
+        const rest = Math.max(0, uniq.length - shown.length);
+        lines.push(
+          `- ${taskId}：${uniq.length} 个文件${shown.length ? `：${shown.join(', ')}` : ''}${rest ? ` …等${rest}个` : ''}`,
+        );
+      }
+
+      if (!any) return '（无）';
+      return lines.join('\n');
+    }
+
     async function generateMvp5PlanWithModel({
       specId,
       tasks,
@@ -95,6 +203,7 @@ function registerMvp5Routes(app, ctx) {
       maxCliConcurrencyLimit,
       cliAvailability,
       preferredModelId,
+      tasksAtomicHints,
     }) {
       const normalizedModel = LLM_MODEL_ALIASES[preferredModelId] || preferredModelId;
       const cfg = getLlmConfigForModel(normalizedModel);
@@ -114,6 +223,7 @@ function registerMvp5Routes(app, ctx) {
         cliAvailability: formatMvp5CliAvailability(cliAvailability),
         tasks: formatMvp5TasksForPrompt(tasks),
         dependencies: formatMvp5DependenciesForPrompt(dag),
+        tasksAtomicHints: String(tasksAtomicHints || '').trim(),
         summary: `tasks=${Array.isArray(dag?.tasks) ? dag.tasks.length : 0}, edges=${Array.isArray(dag?.edges) ? dag.edges.length : 0}`,
       };
     
@@ -193,9 +303,15 @@ function registerMvp5Routes(app, ctx) {
           });
         }
     
+        const hadTask0 = dagTasks.some((t) => String(t?.id || '').trim() === 'task_0');
+        dagTasks = ensureDagTask0LogsTask(dagTasks);
+
         const warnings = [];
         if (usedLegacyAtomic) {
           warnings.push('提示：当前分析使用 legacy atomicTasks 输入，建议改用 tasks.md 的 TASKS_JSON。');
+        }
+        if (!hadTask0) {
+          warnings.push('已自动注入 task_0（初始化 task_logs）并将其设为所有任务的前置依赖。');
         }
         if (dagTasks.length > 25) {
           warnings.push(`任务数量为 ${dagTasks.length}，建议 ≤ 25（参照 docs/任务编排.md）。`);
@@ -231,6 +347,41 @@ function registerMvp5Routes(app, ctx) {
           );
         }
     
+        // 如果存在 tasks_atomic.md，则优先用其中的文件级路径来细化每个 task 的 scope（用于冲突预警与编排参考）。
+        const filesByTaskId = new Map();
+        try {
+          const specName = sanitizeSpecName(specId);
+          if (specName) {
+            const atomicPath = resolveSpecFile(specName, 'tasks_atomic');
+            if (atomicPath && fs.existsSync(atomicPath)) {
+              const atomicContent = fs.readFileSync(atomicPath, 'utf8');
+              const atomicParsed = parseTasksAtomicMarkdown(atomicContent);
+              for (const item of Array.isArray(atomicParsed) ? atomicParsed : []) {
+                const originalIndex = Number(item?.originalIndex);
+                if (!Number.isFinite(originalIndex) || originalIndex <= 0) continue;
+                const taskId = `task_${Math.floor(originalIndex)}`;
+                const token = extractAtomicPathTokenFromTitle(item?.title);
+                if (!token) continue;
+                const normalized = normalizeAtomicScopePath(token);
+                if (!normalized) continue;
+                if (!filesByTaskId.has(taskId)) filesByTaskId.set(taskId, []);
+                filesByTaskId.get(taskId).push(normalized);
+              }
+              if (filesByTaskId.size > 0) {
+                dagTasks = dagTasks.map((t) => {
+                  const taskId = String(t?.id || '').trim();
+                  const derived = filesByTaskId.get(taskId) || [];
+                  const scope = mergeTaskScopesPreferAtomic(t?.scope, derived, 32);
+                  return { ...t, scope };
+                });
+              }
+            }
+          }
+        } catch (error) {
+          // 原子化提示是增强项：失败不阻断依赖分析，但在 warnings 暴露原因。
+          warnings.push(`读取 tasks_atomic.md 失败：${error?.message || String(error)}`);
+        }
+
         const scopeConflicts = detectDagScopeConflicts(dagTasks);
         warnings.push(...scopeConflicts.warnings);
     
@@ -276,6 +427,10 @@ function registerMvp5Routes(app, ctx) {
     
         if (wantLlmPlan) {
           try {
+            const tasksAtomicHints = formatMvp5TasksAtomicHintsForPrompt(dagTasks, filesByTaskId, {
+              maxTasks: 25,
+              maxFilesPerTask: 8,
+            });
             const modelPlan = await generateMvp5PlanWithModel({
               specId,
               tasks: tasksForDag.map((t) => ({
@@ -289,6 +444,7 @@ function registerMvp5Routes(app, ctx) {
               maxCliConcurrencyLimit: maxCliConcurrency,
               cliAvailability,
               preferredModelId: preferredPlanModel,
+              tasksAtomicHints,
             });
     
             if (modelPlan?.ok && modelPlan.result) {
@@ -312,6 +468,7 @@ function registerMvp5Routes(app, ctx) {
           } catch (error) {
             // LLM plan is best-effort; fall back to heuristic recommendations.
             console.warn('[MVP5] LLM plan generation skipped:', error?.message || error);
+            warnings.push(`模型方案生成失败（${preferredPlanModel}）：${error?.message || String(error)}`);
           }
         }
     
@@ -349,7 +506,7 @@ function registerMvp5Routes(app, ctx) {
         res.json(result);
       } catch (error) {
         console.error('[MVP5] 依赖分析错误:', error);
-        res.status(500).json({ error: error.message });
+        res.status(error?.status || 500).json({ error: error.message });
       }
     });
     
@@ -402,6 +559,8 @@ function registerMvp5Routes(app, ctx) {
           });
         }
     
+        dagTasks = ensureDagTask0LogsTask(dagTasks);
+
         const task = dagTasks.find((t) => String(t?.id || '').trim() === taskId) || null;
         if (!task) {
           return res.status(404).json({ error: `Task not found: ${taskId}` });
@@ -526,6 +685,8 @@ function registerMvp5Routes(app, ctx) {
           });
         }
     
+        dagTasks = ensureDagTask0LogsTask(dagTasks);
+
         // 确保存在“收尾”任务：避免仅在“任务迭代”后才出现。
         const looksLikeSummaryTask = (task) => {
           const title = String(task?.title || '').trim();
@@ -546,7 +707,7 @@ function registerMvp5Routes(app, ctx) {
         const baseIds = baseTasks.map((t) => String(t?.id || '').trim()).filter(Boolean);
         const defaultTitle = '最终修复与调试（收尾）';
         const defaultDescription =
-          '输入：已完成的各模块交付物；输出：最终回归验证、修复残留问题、补齐必要日志/说明；验收：关键构建/健康检查通过，主要链路无明显异常。';
+          '输入：已完成的各模块交付物与 requirements 用户故事；输出：最终回归验证（含关键用户故事端到端检查，可使用浏览器/MCP）、修复残留问题、补齐必要日志/说明；验收：关键构建/健康检查通过，用户故事链路可复现通过。';
         const ensureUniqueTaskId = (preferred) => {
           const baseId = String(preferred || '').trim() || `task_${baseIds.length + 1}`;
           let id = baseId;
@@ -816,7 +977,7 @@ function registerMvp5Routes(app, ctx) {
         res.json(plan);
       } catch (error) {
         console.error('[MVP5] 创建执行计划错误:', error);
-        res.status(500).json({ error: error.message });
+        res.status(error?.status || 500).json({ error: error.message });
       }
     });
     
@@ -889,6 +1050,58 @@ function registerMvp5Routes(app, ctx) {
       if (options.model) lines.push(`- Model: ${options.model}`);
       if (options.sandbox) lines.push(`- Sandbox: ${options.sandbox}`);
       if (options.projectDir) lines.push(`- ProjectDir: ${normalizePathForPrompt(options.projectDir)}`);
+      if (options.worktree?.branch) lines.push(`- WorktreeBranch: ${String(options.worktree.branch).trim()}`);
+      if (options.worktree?.baseRef) lines.push(`- WorktreeBaseRef: ${String(options.worktree.baseRef).trim()}`);
+      if (options.worktree?.worktreeDir) {
+        lines.push(`- WorktreeDir: ${normalizePathForPrompt(options.worktree.worktreeDir)}`);
+      }
+
+      const taskLogsDir = path.join(baseDir, 'task_logs');
+      lines.push(`- TaskLogsDir: ${normalizePathForPrompt(taskLogsDir)}`);
+
+      lines.push('');
+      lines.push('## task_logs（开工前必读）');
+      lines.push('- 说明：此目录包含其它任务的工作报告（task_*.md），用于理解整体关系并减少并发冲突。');
+      lines.push(`- 位置：${normalizePathForPrompt(taskLogsDir)}`);
+      try {
+        if (fs.existsSync(taskLogsDir)) {
+          const reportFiles = fs
+            .readdirSync(taskLogsDir)
+            .filter((name) => String(name || '').toLowerCase().endsWith('.md'))
+            .filter((name) => String(name || '').trim() !== 'README.md')
+            .filter((name) => String(name || '').trim() !== `${taskId}.md`)
+            .sort((a, b) => String(a || '').localeCompare(String(b || ''), 'en'));
+          if (!reportFiles.length) {
+            lines.push('- 当前暂无其它任务报告');
+          } else {
+            lines.push(`- 已存在 ${reportFiles.length} 份报告：${reportFiles.join(', ')}`);
+            const maxFiles = 10;
+            for (const fileName of reportFiles.slice(0, maxFiles)) {
+              let content = '';
+              try {
+                content = fs.readFileSync(path.join(taskLogsDir, fileName), 'utf8');
+              } catch {
+                content = '';
+              }
+              const snippet = content ? truncateText(content, 1200).trimEnd() : '';
+              lines.push('');
+              lines.push(`### ${fileName}（截断）`);
+              lines.push('```markdown');
+              lines.push(snippet || '（读取失败或为空）');
+              lines.push('```');
+            }
+            if (reportFiles.length > maxFiles) {
+              lines.push('');
+              lines.push(`- （其余 ${reportFiles.length - maxFiles} 份报告已省略展示）`);
+            }
+          }
+        } else {
+          lines.push('- 当前暂无其它任务报告（task_logs 目录不存在）');
+        }
+      } catch {
+        lines.push('- 当前暂无其它任务报告（task_logs 读取异常）');
+      }
+
       lines.push('');
       lines.push('## Spec 快照（只读引用）');
       lines.push(
@@ -1043,7 +1256,7 @@ function registerMvp5Routes(app, ctx) {
       const plan = executionPlans.get(runner.planId);
       if (!state || !plan) return;
     
-      const { taskId, phaseIndex, runDocPathRel } = worker.current;
+      const { taskId, phaseIndex, runDocPathRel, worktree } = worker.current;
       const taskState = state.tasks?.[taskId];
       if (taskState) {
         taskState.completedAt = finishedAt;
@@ -1064,7 +1277,132 @@ function registerMvp5Routes(app, ctx) {
         state.status = 'failed';
         plan.status = 'failed';
       }
-    
+
+      if (worktree?.worktreeDir && worktree?.gitTop) {
+        const taskMeta = runner.tasksById?.get(taskId) || null;
+        const title = String(taskMeta?.title || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+        const label = title ? `${taskId} ${title}` : taskId;
+        const exitSuffix = exitCode === 0 ? '' : ` (exit ${exitCode})`;
+        const commitMessage = `chore: mvp5 ${runner.specName} ${label}${exitSuffix}`;
+        let commitError = null;
+        let commitResult = null;
+        let worktreeRemoved = false;
+
+        try {
+          const result = commitAllChanges(worktree.worktreeDir, commitMessage);
+          commitResult = result;
+          if (taskState) {
+            taskState.gitCommitted = Boolean(result?.committed);
+            if (result?.committed) taskState.gitCommitMessage = commitMessage;
+          }
+          emitEvent('log:append', {
+            source: 'git',
+            message: `[worktree] commit task=${taskId} branch=${worktree.branch} committed=${result?.committed ? 'yes' : 'no'}`,
+          });
+        } catch (error) {
+          commitError = error;
+          const message = error?.message || String(error);
+          if (taskState) {
+            taskState.status = 'failed';
+            taskState.error = taskState.error
+              ? `${taskState.error}; git commit 失败：${message}`
+              : `git commit 失败：${message}`;
+          }
+          state.failures = Array.isArray(state.failures) ? state.failures : [];
+          state.failures.push({
+            taskId,
+            phaseId: plan.phases?.[phaseIndex]?.phaseId || String(phaseIndex),
+            error: `git commit 失败：${message}`,
+            canRetry: true,
+            downstreamAffected: [],
+          });
+          state.status = 'failed';
+          plan.status = 'failed';
+          emitEvent('log:append', {
+            source: 'git',
+            message: `[worktree] commit failed task=${taskId} branch=${worktree.branch} err=${message}`,
+          });
+        }
+
+        if (!commitError) {
+          try {
+            cleanupTaskWorktree({ gitTop: worktree.gitTop, worktreeDir: worktree.worktreeDir });
+            worktreeRemoved = true;
+            emitEvent('log:append', {
+              source: 'git',
+              message: `[worktree] removed task=${taskId} dir=${normalizePathForPrompt(worktree.worktreeDir)}`,
+            });
+          } catch (error) {
+            emitEvent('log:append', {
+              source: 'git',
+              message: `[worktree] remove failed task=${taskId} err=${error?.message || String(error)}`,
+            });
+          }
+        } else {
+          emitEvent('log:append', {
+            source: 'git',
+            message: `[worktree] preserved task=${taskId} dir=${normalizePathForPrompt(worktree.worktreeDir)}`,
+          });
+        }
+
+        if (runner?.taskLogs?.dir) {
+          try {
+            const reportDir = runner.taskLogs.dir;
+            fs.mkdirSync(reportDir, { recursive: true });
+            const reportPath = path.join(reportDir, `${taskId}.md`);
+
+            const reportLines = [];
+            const fullTitle = String(taskMeta?.title || '').trim();
+            reportLines.push(`# ${taskId}${fullTitle ? `｜${fullTitle}` : ''}`);
+            reportLines.push('');
+            reportLines.push(`- Spec: ${runner.specName}`);
+            reportLines.push(`- Execution: ${runner.executionId}`);
+            reportLines.push(`- PhaseIndex: ${phaseIndex}`);
+            reportLines.push(`- StartedAt: ${taskState?.startedAt || ''}`);
+            reportLines.push(`- CompletedAt: ${finishedAt}`);
+            reportLines.push(`- Status: ${exitCode === 0 ? 'completed' : 'failed'} (exit ${exitCode})`);
+            if (runDocPathRel) reportLines.push(`- RunDoc: ${runDocPathRel}`);
+            if (worktree?.branch) reportLines.push(`- WorktreeBranch: ${worktree.branch}`);
+            if (worktree?.baseRef) reportLines.push(`- WorktreeBaseRef: ${worktree.baseRef}`);
+            if (worktree?.worktreeDir) reportLines.push(`- WorktreeDir: ${normalizePathForPrompt(worktree.worktreeDir)}`);
+            reportLines.push(
+              `- WorktreeCleanup: ${commitError ? 'preserved' : worktreeRemoved ? 'removed' : 'unknown'}`,
+            );
+            reportLines.push(`- GitCommitMessage: ${commitMessage}`);
+            reportLines.push(`- GitCommitted: ${commitResult?.committed ? 'yes' : 'no'}`);
+            if (commitError) {
+              reportLines.push(`- GitCommitError: ${commitError?.message || String(commitError)}`);
+            }
+            if (taskState?.error) {
+              reportLines.push(`- TaskError: ${String(taskState.error).trim()}`);
+            }
+
+            if (Array.isArray(commitResult?.staged) && commitResult.staged.length) {
+              reportLines.push('');
+              reportLines.push('## 变更文件（git staged）');
+              for (const file of commitResult.staged.slice(0, 120)) {
+                reportLines.push(`- ${file}`);
+              }
+              if (commitResult.staged.length > 120) {
+                reportLines.push(`- ...(共 ${commitResult.staged.length} 个，已截断)`);
+              }
+            }
+
+            reportLines.push('');
+            fs.writeFileSync(reportPath, reportLines.join('\n'), 'utf8');
+            emitEvent('log:append', {
+              source: 'task_logs',
+              message: `[task_logs] wrote ${normalizePathForPrompt(reportPath)}`,
+            });
+          } catch (error) {
+            emitEvent('log:append', {
+              source: 'task_logs',
+              message: `[task_logs] write failed task=${taskId} err=${error?.message || String(error)}`,
+            });
+          }
+        }
+      }
+
       state.updatedAt = finishedAt;
       worker.busy = false;
       worker.current = null;
@@ -1081,17 +1419,163 @@ function registerMvp5Routes(app, ctx) {
       const task = runner.tasksById.get(taskId) || { id: taskId, title: taskId, description: '' };
       const sandbox = normalizeCodexSandbox(runner.sandbox);
       const model = normalizeCodexModel(runner.model);
-    
+
+      const taskState = state.tasks?.[taskId];
+
+      if (String(taskId || '').trim() === 'task_0') {
+        const startedAt = new Date().toISOString();
+        if (taskState) {
+          taskState.status = 'running';
+          taskState.startedAt = startedAt;
+          taskState.terminalId = worker.terminalId;
+          taskState.error = undefined;
+        }
+        state.updatedAt = startedAt;
+
+        const taskLogsDir =
+          runner?.taskLogs?.dir || path.join(runner.projectDir || REPO_DIR, 'task_logs', runner.specName, runner.executionId);
+        try {
+          fs.mkdirSync(taskLogsDir, { recursive: true });
+
+          const readmePath = path.join(taskLogsDir, 'README.md');
+          if (!fs.existsSync(readmePath)) {
+            fs.writeFileSync(
+              readmePath,
+              [
+                '# task_logs',
+                '',
+                '- 说明：该目录用于记录每个 DAG 任务的简要工作报告（Bridge 自动写入）。',
+                '- 文件命名：task_<id>.md（例如 task_1.md）。',
+                '',
+              ].join('\n'),
+              'utf8',
+            );
+          }
+
+          const reportPath = path.join(taskLogsDir, 'task_0.md');
+          fs.writeFileSync(
+            reportPath,
+            [
+              '# task_0｜初始化 task_logs（协作日志）',
+              '',
+              `- Spec: ${runner.specName}`,
+              `- Execution: ${runner.executionId}`,
+              `- StartedAt: ${startedAt}`,
+              `- TaskLogsDir: ${normalizePathForPrompt(taskLogsDir)}`,
+              '- 说明：后续每个任务完成后，Bridge 会在此目录写入对应 task_*.md 报告，供其它任务开工前阅读。',
+              '',
+            ].join('\n'),
+            'utf8',
+          );
+
+          const finishedAt = new Date().toISOString();
+          if (taskState) {
+            taskState.status = 'completed';
+            taskState.completedAt = finishedAt;
+            taskState.error = undefined;
+          }
+          state.updatedAt = finishedAt;
+          emitEvent('log:append', {
+            source: 'task_logs',
+            message: `[task_logs] task_0 ready dir=${normalizePathForPrompt(taskLogsDir)}`,
+          });
+        } catch (error) {
+          const failedAt = new Date().toISOString();
+          const message = error?.message || String(error);
+          if (taskState) {
+            taskState.status = 'failed';
+            taskState.completedAt = failedAt;
+            taskState.error = `[task_logs] init failed: ${message}`;
+          }
+          state.failures = Array.isArray(state.failures) ? state.failures : [];
+          state.failures.push({
+            taskId,
+            phaseId: plan.phases?.[phaseIndex]?.phaseId || String(phaseIndex),
+            error: `[task_logs] init failed: ${message}`,
+            canRetry: true,
+            downstreamAffected: [],
+          });
+          state.status = 'failed';
+          plan.status = 'failed';
+          state.updatedAt = failedAt;
+          emitEvent('log:append', {
+            source: 'task_logs',
+            message: `[task_logs] task_0 failed err=${message}`,
+          });
+        }
+
+        setTimeout(() => scheduleMvp5Execution(runner), 0);
+        return;
+      }
+
+      let worktree = null;
+      let taskProjectDir = runner.projectDir;
+      try {
+        if (runner.worktree?.enabled) {
+          const worktreeKey = `${runner.specName}-${runner.executionId}-${taskId}`;
+          worktree = createTaskWorktree({
+            repoDir: runner.worktree.gitTop || (runner.projectDir || REPO_DIR),
+            taskId: worktreeKey,
+            sandboxDirName: runner.worktree.sandboxDirName,
+            baseRef: runner.worktree.baseRef,
+          });
+          taskProjectDir = worktree.worktreeDir;
+        }
+      } catch (error) {
+        const failedAt = new Date().toISOString();
+        const message = error?.message || String(error);
+        if (taskState) {
+          taskState.status = 'failed';
+          taskState.startedAt = failedAt;
+          taskState.completedAt = failedAt;
+          taskState.error = `[worktree] create failed: ${message}`;
+        }
+        state.status = 'failed';
+        plan.status = 'failed';
+        state.updatedAt = failedAt;
+        runner.stopped = true;
+        emitEvent('log:append', {
+          source: 'mvp5',
+          message: `[worktree] create failed task=${taskId} err=${message}`,
+        });
+        return;
+      }
+
+      if (worktree?.worktreeDir && runner?.taskLogs?.dir) {
+        try {
+          const srcDir = runner.taskLogs.dir;
+          const destDir = path.join(worktree.worktreeDir, 'task_logs');
+          fs.mkdirSync(destDir, { recursive: true });
+          const files = fs.readdirSync(srcDir).filter((name) => String(name || '').toLowerCase().endsWith('.md'));
+          for (const name of files) {
+            const src = path.join(srcDir, name);
+            const dest = path.join(destDir, name);
+            fs.copyFileSync(src, dest);
+          }
+        } catch (error) {
+          emitEvent('log:append', {
+            source: 'task_logs',
+            message: `[task_logs] sync failed task=${taskId} err=${error?.message || String(error)}`,
+          });
+        }
+      }
+
       const doc = buildMvp5TaskRunDoc(runner.specName, task, {
         sandbox,
         model,
         planId: runner.planId,
         executionId: runner.executionId,
         phaseIndex,
-        projectDir: runner.projectDir,
+        projectDir: taskProjectDir,
+        worktree,
       });
       const runDocPathAbs = normalizePathForPrompt(doc.runDocPath);
-      const prompt = `请按任务文档（绝对路径）${runDocPathAbs} 实现该任务，完成后自检并用简短要点总结变更与验证结果。`;
+      const taskLogsDirForPrompt = normalizePathForPrompt(path.join(taskProjectDir, 'task_logs'));
+      const prompt = [
+        `请按任务文档（绝对路径）${runDocPathAbs} 实现该任务。`,
+        `开工前先阅读 ${taskLogsDirForPrompt} 下已有的 task_*.md 工作报告（如有），理解整体关系并减少冲突。`,
+        '完成后自检并用简短要点总结变更与验证结果。',
+      ].join('\n');
     
       const runId = nanoid(8);
       const marker = `__MVP5_TASK_DONE__${runId}__`;
@@ -1115,29 +1599,30 @@ function registerMvp5Routes(app, ctx) {
       if (model) {
         args.push('-m', model);
       }
-      args.push('-C', runner.projectDir, prompt);
+      args.push('-C', taskProjectDir, prompt);
     
       const cmdLine = [codexExecutable, ...args].map(quoteCmdArgument).join(' ');
       const input = [
-        `cd /d ${quoteCmdArgument(runner.projectDir)}`,
+        `cd /d ${quoteCmdArgument(taskProjectDir)}`,
         cmdLine,
         `echo ${marker}%ERRORLEVEL%`,
         '',
       ].join('\r\n');
     
       const startedAt = new Date().toISOString();
-      const taskState = state.tasks?.[taskId];
       if (taskState) {
         taskState.status = 'running';
         taskState.startedAt = startedAt;
         taskState.terminalId = worker.terminalId;
         taskState.runDocPath = doc.runDocPathRel;
+        if (worktree?.branch) taskState.worktreeBranch = worktree.branch;
+        if (worktree?.worktreeDir) taskState.worktreeDir = normalizePathForPrompt(worktree.worktreeDir);
         taskState.error = undefined;
       }
       state.updatedAt = startedAt;
-    
+
       worker.busy = true;
-      worker.current = { taskId, phaseIndex, marker, runDocPathRel: doc.runDocPathRel };
+      worker.current = { taskId, phaseIndex, marker, runDocPathRel: doc.runDocPathRel, worktree };
     
       try {
         writeTerminalInput(worker.session, input);
@@ -1147,6 +1632,20 @@ function registerMvp5Routes(app, ctx) {
           taskState.status = 'failed';
           taskState.completedAt = failedAt;
           taskState.error = error?.message ? String(error.message) : 'Failed to write terminal input';
+        }
+        if (worktree?.worktreeDir && worktree?.gitTop) {
+          try {
+            cleanupTaskWorktree({ gitTop: worktree.gitTop, worktreeDir: worktree.worktreeDir });
+            emitEvent('log:append', {
+              source: 'git',
+              message: `[worktree] removed (start failed) task=${taskId} dir=${normalizePathForPrompt(worktree.worktreeDir)}`,
+            });
+          } catch (cleanupError) {
+            emitEvent('log:append', {
+              source: 'git',
+              message: `[worktree] remove failed (start failed) task=${taskId} err=${cleanupError?.message || String(cleanupError)}`,
+            });
+          }
         }
         state.failures = Array.isArray(state.failures) ? state.failures : [];
         state.failures.push({
@@ -1177,9 +1676,32 @@ function registerMvp5Routes(app, ctx) {
       const analysis = plan ? analysisResults.get(plan.analysisId) : null;
       if (!state || !plan) return null;
     
-      const tasks = loadDagTasksForSpec(specName) || [];
+      const tasks = ensureDagTask0LogsTask(loadDagTasksForSpec(specName) || []);
       const tasksById = new Map(tasks.map((t) => [t.id, t]));
-    
+
+      // Worktree preflight: ensure base workdir is clean (ignore sandbox dir itself).
+      const repoDir = projectDir || REPO_DIR;
+      const sandboxDirName =
+        String(process.env.ACTION_WORKTREE_DIR || '.action_sandbox').trim() || '.action_sandbox';
+      const baseRefEnv = String(process.env.ACTION_WORKTREE_BASE_REF || '').trim();
+      const preflight = assertGitTopClean(repoDir, { allowedPaths: [`${sandboxDirName}/`] });
+      const gitTop = preflight.gitTop;
+      const baseRef = baseRefEnv || resolveCurrentBranch(gitTop);
+
+      const taskLogsBaseDir = projectDir || REPO_DIR;
+      const taskLogsSpecDir = path.join(taskLogsBaseDir, 'task_logs', String(specName || 'spec'));
+      const taskLogsDir = path.join(taskLogsSpecDir, String(executionId || 'run'));
+      fs.mkdirSync(taskLogsDir, { recursive: true });
+      try {
+        fs.writeFileSync(path.join(taskLogsSpecDir, 'LATEST'), `${executionId}\n`, 'utf8');
+      } catch {
+        // ignore
+      }
+      emitEvent('log:append', {
+        source: 'task_logs',
+        message: `[task_logs] prepared dir=${normalizePathForPrompt(taskLogsDir)}`,
+      });
+
       const maxCliConcurrency = inferMvp5MaxCliConcurrency(plan, analysis);
       const workers = [];
     
@@ -1209,6 +1731,17 @@ function registerMvp5Routes(app, ctx) {
         projectDir,
         sandbox,
         model,
+        worktree: {
+          enabled: true,
+          gitTop,
+          baseRef,
+          sandboxDirName,
+        },
+        taskLogs: {
+          baseDir: taskLogsBaseDir,
+          specDir: taskLogsSpecDir,
+          dir: taskLogsDir,
+        },
         maxCliConcurrency,
         workers,
         tasksById,
@@ -1309,7 +1842,7 @@ function registerMvp5Routes(app, ctx) {
         });
       } catch (error) {
         console.error('[MVP5] 启动执行错误:', error);
-        res.status(500).json({ error: error.message });
+        res.status(error?.status || 500).json({ error: error.message });
       }
     });
     
@@ -1399,7 +1932,7 @@ function registerMvp5Routes(app, ctx) {
         });
       } catch (error) {
         console.error('[MVP5] 重启任务错误:', error);
-        res.status(500).json({ error: error.message });
+        res.status(error?.status || 500).json({ error: error.message });
       }
     });
     

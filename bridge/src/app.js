@@ -157,6 +157,7 @@ const PROMPT_STAGE_KEYS = [
   'requirements',
   'design',
   'tasks',
+  'atomize',
   'reportScore',
   'mvp5Plan',
 ];
@@ -277,7 +278,7 @@ const DEFAULT_PROMPT_CONFIG = {
       label: '流程报告评分',
       scenario:
         '在生成 flow report 后调用。用于从 requirements/design/tasks 快照中评审“任务拆解质量（任务级 DAG，可直接交付 CLI 执行）”并打分，同时输出可直接作为下一轮生成约束的 suggestions。',
-      variables: ['specName', 'prompt', 'requirements', 'design', 'tasks'],
+      variables: ['specName', 'prompt', 'requirements', 'design', 'tasks', 'tasksAtomic'],
       system:
         '你是项目经理 + 资深工程评审。你将对 planA 的“任务拆解质量（任务级 DAG）”打分。只输出 JSON，不要解释。',
       user:
@@ -287,18 +288,20 @@ const DEFAULT_PROMPT_CONFIG = {
         '【requirements.md】\n{{requirements}}\n\n' +
         '【design.md】\n{{design}}\n\n' +
         '【tasks.md】\n{{tasks}}\n\n' +
-        '请基于以下事实评审：本流程已取消“任务原子化”阶段；tasks.md 将直接交付给 CLI Agent 执行（不会再进行二次拆解）。\n' +
-        '请按“任务粒度合理性 + DAG 依赖质量 + scope 冲突可控性 + 可执行性/可验收性”评审并评分（0-100）。\n' +
+        '【tasks_atomic.md】\n{{tasksAtomic}}\n\n' +
+        '请基于以下事实评审：本流程会在 tasks.md 之后生成 tasks_atomic.md（原子化任务表）供 CLI 逐条执行；因此请同时关注 tasks.md（模块级 DAG）与 tasks_atomic.md（文件级可执行性/冲突控制）的质量与一致性。\n' +
+        '请按“任务粒度合理性 + DAG 依赖质量 + scope 冲突可控性 + 原子化可执行性/可验收性”评审并评分（0-100）。\n' +
         '重点检查：\n' +
         '1) 粒度与数量：任务必须是模块级/交付物级，总数 <= 25；禁止原子级/步骤级拆解。\n' +
-	        '2) 可执行性：description 是否写清输入/输出/验收点，并给出关键接口/数据结构/页面路由/命令等必要细节，避免空泛。\n' +
-	        '3) 依赖质量：dependencies 是否准确引用任务 id，能形成无环 DAG，尽量最大化可并行性。\n' +
-	        '4) scope 冲突：scope 是否能有效隔离主要修改范围，减少重叠；必要重叠是否用依赖关系串行化。\n' +
-	        '5) 可验收性：是否提供可复现的验证方式（构建/测试/接口/页面路径与可观察结果）。\n\n' +
-	        '请严格只输出 JSON，字段必须包含：\n' +
-	        '- score：0-100 的整数\n' +
-	        '- summary：一句话总评\n' +
-	        '- strengths：3-8 条字符串数组\n' +
+        '2) 可执行性：description 是否写清输入/输出/验收点，并给出关键接口/数据结构/页面路由/命令等必要细节，避免空泛。\n' +
+        '3) 依赖质量：dependencies 是否准确引用任务 id，能形成无环 DAG，尽量最大化可并行性。\n' +
+        '4) scope 冲突：scope 是否能有效隔离主要修改范围，减少重叠；必要重叠是否用依赖关系串行化。\n' +
+        '5) 原子化：tasks_atomic 是否“单任务单文件、路径明确、AC 可验证、与 tasks 对齐”。\n' +
+        '6) 可验收性：是否提供可复现的验证方式（构建/测试/接口/页面路径与可观察结果）。\n\n' +
+        '请严格只输出 JSON，字段必须包含：\n' +
+        '- score：0-100 的整数\n' +
+        '- summary：一句话总评\n' +
+        '- strengths：3-8 条字符串数组\n' +
         '- weaknesses：3-8 条字符串数组\n' +
         '- suggestions：3-10 条字符串数组（每条以“必须/禁止/确保”开头，可直接作为下一轮约束）\n',
     },
@@ -306,9 +309,17 @@ const DEFAULT_PROMPT_CONFIG = {
       label: 'MVP5 执行方案生成',
       scenario:
         '在 MVP5 智能任务编排中调用。输入为 DAG（任务/依赖/风险/交互）摘要，输出为可落地的执行方案：并发 <= 8、禁止一任务一终端、按 worker 池复用，并给出默认 CLI 与必要 overrides。',
-      variables: ['specId', 'maxCliConcurrency', 'cliAvailability', 'tasks', 'dependencies', 'summary'],
+      variables: [
+        'specId',
+        'maxCliConcurrency',
+        'cliAvailability',
+        'tasks',
+        'dependencies',
+        'tasksAtomicHints',
+        'summary',
+      ],
       system:
-        '你是资深“任务编排 / 执行计划”专家。目标：给出可落地的 CLI 执行方案（并发受限、避免一任务一终端）。只输出 JSON，不要解释，不要包含分析或思考过程。',
+        '你是“统筹大师”（任务编排总监）。你要为 tasks.md 的任务级 DAG 生成可落地的 CLI 执行方案；注意：编排对象是 tasks（task_1...），不是 tasks_atomic 的子任务。只输出 JSON，不要解释，不要包含分析或思考过程。',
       user:
         `SpecId：{{specId}}\n` +
         `并发硬上限：{{maxCliConcurrency}}（必须 <= 8）\n` +
@@ -317,6 +328,8 @@ const DEFAULT_PROMPT_CONFIG = {
         '{{tasks}}\n\n' +
         '已识别依赖（from -> to｜type｜strength）：\n' +
         '{{dependencies}}\n\n' +
+        '原子化提示（来自 tasks_atomic.md，仅用于判断文件冲突与并发风险；不要把子任务当成编排对象）：\n' +
+        '{{tasksAtomicHints}}\n\n' +
         '摘要：{{summary}}\n\n' +
         '请严格只输出 JSON，必须包含字段：\n' +
         '- maxCliConcurrency：整数 1-8，且必须 <= 并发硬上限（建议值）\n' +
@@ -1020,19 +1033,42 @@ async function callLlm(messages, overrideConfig = null, handlers = {}) {
         body: JSON.stringify(body),
         signal: controller.signal,
       });
+      const contentType = String(response.headers.get('content-type') || '');
+      const rawText = String(await response.text() || '');
       if (!response.ok) {
-        const text = await response.text();
-        const message = text ? `${response.status}: ${text}` : `${response.status}`;
+        const message = rawText ? `${response.status}: ${truncateText(rawText, 2000)}` : `${response.status}`;
         const err = new Error(`LLM request failed: ${message}`);
-        err.llmContext = llmContext;
+        err.llmContext = {
+          ...llmContext,
+          url,
+          httpStatus: response.status,
+          contentType,
+          bodyPreview: rawText ? truncateText(rawText, 400) : '',
+        };
         throw err;
       }
-      const data = await response.json();
+      let data;
+      try {
+        data = JSON.parse(rawText.replace(/^\uFEFF/, ''));
+      } catch (parseError) {
+        const err = new Error(
+          `LLM response is not valid JSON (content-type: ${contentType || 'unknown'}). ` +
+            `Body preview: ${rawText ? truncateText(rawText, 400) : '(empty)'}`,
+        );
+        err.llmContext = {
+          ...llmContext,
+          url,
+          httpStatus: response.status,
+          contentType,
+          bodyPreview: rawText ? truncateText(rawText, 400) : '',
+        };
+        throw err;
+      }
       onUsage?.(normalizeLlmUsage(data?.usage));
       const content = data?.choices?.[0]?.message?.content;
       if (!content || typeof content !== 'string') {
         const err = new Error('LLM response empty');
-        err.llmContext = llmContext;
+        err.llmContext = { ...llmContext, url, httpStatus: response.status, contentType };
         throw err;
       }
       return content.trim();
@@ -1066,8 +1102,15 @@ async function callLlm(messages, overrideConfig = null, handlers = {}) {
       try {
         return await tryOnce(v1Url);
       } catch (error2) {
-        // Preserve the original error for easier debugging when both fail.
-        throw error;
+        const primary = error2 || error;
+        primary.llmContext = {
+          ...(primary?.llmContext || llmContext),
+          attempts: [
+            { baseUrl: trimmed, error: String(error?.message || error) },
+            { baseUrl: v1Url, error: String(error2?.message || error2) },
+          ],
+        };
+        throw primary;
       }
     }
   };
@@ -1150,27 +1193,65 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
         body: JSON.stringify(body),
         signal: controller.signal,
       });
+      const contentType = String(response.headers.get('content-type') || '');
       if (!response.ok) {
-        const text = await response.text();
-        const message = text ? `${response.status}: ${text}` : `${response.status}`;
+        const rawText = String(await response.text() || '');
+        const message = rawText ? `${response.status}: ${truncateText(rawText, 2000)}` : `${response.status}`;
         const err = new Error(`LLM request failed: ${message}`);
-        err.llmContext = llmContext;
+        err.llmContext = {
+          ...llmContext,
+          url,
+          httpStatus: response.status,
+          contentType,
+          bodyPreview: rawText ? truncateText(rawText, 400) : '',
+        };
         throw err;
       }
 
       // Some gateways ignore stream=true and still return a JSON payload.
-      const contentType = String(response.headers.get('content-type') || '');
       if (/application\/json/i.test(contentType)) {
-        const data = await response.json();
+        const rawText = String(await response.text() || '');
+        let data;
+        try {
+          data = JSON.parse(rawText.replace(/^\uFEFF/, ''));
+        } catch (parseError) {
+          const err = new Error(
+            `LLM response is not valid JSON (content-type: ${contentType || 'unknown'}). ` +
+              `Body preview: ${rawText ? truncateText(rawText, 400) : '(empty)'}`,
+          );
+          err.llmContext = {
+            ...llmContext,
+            url,
+            httpStatus: response.status,
+            contentType,
+            bodyPreview: rawText ? truncateText(rawText, 400) : '',
+          };
+          throw err;
+        }
         onUsage?.(normalizeLlmUsage(data?.usage));
         const content = data?.choices?.[0]?.message?.content;
         if (!content || typeof content !== 'string') {
           const err = new Error('LLM response empty');
-          err.llmContext = llmContext;
+          err.llmContext = { ...llmContext, url, httpStatus: response.status, contentType };
           throw err;
         }
         onToken?.(content);
         return content.trim();
+      }
+      if (/text\/html/i.test(contentType)) {
+        const rawText = String(await response.text() || '');
+        const err = new Error(
+          `LLM response is not a stream (content-type: ${contentType || 'unknown'}). ` +
+            `Body preview: ${rawText ? truncateText(rawText, 400) : '(empty)'}`,
+        );
+        err.llmContext = {
+          ...llmContext,
+          url,
+          httpStatus: response.status,
+          contentType,
+          bodyPreview: rawText ? truncateText(rawText, 400) : '',
+        };
+        throw err;
       }
 
       let buffer = '';
@@ -1244,8 +1325,16 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
       if (trimmed === v1Url) throw error;
       try {
         return await tryOnce(v1Url);
-      } catch {
-        throw error;
+      } catch (error2) {
+        const primary = error2 || error;
+        primary.llmContext = {
+          ...(primary?.llmContext || llmContext),
+          attempts: [
+            { baseUrl: trimmed, error: String(error?.message || error) },
+            { baseUrl: v1Url, error: String(error2?.message || error2) },
+          ],
+        };
+        throw primary;
       }
     }
   };
@@ -2527,8 +2616,9 @@ async function runTasksIterateJob(specName, runId, job, options = {}) {
     }
 
     const maxTotalTasks = 25;
-    // Reserve 1 slot for the final summary/debug task.
-    const baseMaxTasks = Math.min(Math.max(1, maxTotalTasks - 1), 24);
+    // Reserve slots for task_0 + final summary/debug task.
+    const reservedSystemTasks = 2;
+    const baseMaxTasks = Math.min(Math.max(1, maxTotalTasks - reservedSystemTasks), 23);
     const trimmed = normalized.slice(0, baseMaxTasks);
     const renumbered = renumberDagTasksToTaskSequence(trimmed, { prefix: 'task_' });
     const idSet = new Set(renumbered.map((t) => t.id));
@@ -2544,11 +2634,13 @@ async function runTasksIterateJob(specName, runId, job, options = {}) {
       const scope = Array.from(new Set(Array.isArray(t.scope) ? t.scope : [])).slice(0, 32);
       return { ...t, dependencies, scope };
     });
-    const finalTasks = ensureDagFinalSummaryTask(baseTasks, { maxTasks: maxTotalTasks });
+    const withTask0 = ensureDagTask0LogsTask(baseTasks);
+    const finalTasks = ensureDagFinalSummaryTask(withTask0, { maxTasks: maxTotalTasks });
 
     const notes = [
       `由 Claude 4.5 Opus 基于评分迭代生成（from runId: ${id}）`,
       userNote ? '包含用户补充修改意见' : null,
+      '已自动追加 task_0（初始化 task_logs）',
       '已自动追加“最终修复与调试（收尾）”任务',
     ].filter(Boolean);
     const tasksMarkdown = buildTasksDagMarkdown({ tasks: finalTasks }, { notes });
@@ -4670,6 +4762,54 @@ function renumberDagTasksToTaskSequence(tasks, options = {}) {
   });
 }
 
+function ensureDagTask0LogsTask(tasks) {
+  const list = Array.isArray(tasks) ? tasks.slice() : [];
+  if (!list.length) return list;
+
+  let task0 = null;
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const task = list[i];
+    if (String(task?.id || '').trim() === 'task_0') {
+      task0 = task;
+      list.splice(i, 1);
+      break;
+    }
+  }
+
+  const defaultTitle = '初始化 task_logs（协作日志）';
+  const defaultDescription =
+    '输入：无；输出：创建 task_logs/ 目录（用于任务协作与冲突规避）；后续任务在其中写入 task_*.md 工作报告；验收：task_logs 存在且可读写。';
+
+  const normalizedTask0 = {
+    ...(task0 || {}),
+    id: 'task_0',
+    title: String(task0?.title || '').trim() || defaultTitle,
+    description: String(task0?.description || '').trim() || defaultDescription,
+    dependencies: [],
+    scope: Array.isArray(task0?.scope) ? task0.scope : [],
+    estimated_complexity:
+      typeof task0?.estimated_complexity === 'string' && task0.estimated_complexity.trim()
+        ? task0.estimated_complexity.trim()
+        : 'Low',
+  };
+
+  const out = [normalizedTask0, ...list];
+
+  return out.map((t) => {
+    if (t.id === 'task_0') return t;
+    const deps = Array.isArray(t?.dependencies) ? t.dependencies : [];
+    const next = Array.from(
+      new Set(
+        deps
+          .map((d) => String(d ?? '').trim())
+          .filter((d) => d && d !== t.id && d !== 'task_0')
+          .concat(['task_0']),
+      ),
+    );
+    return { ...t, dependencies: next };
+  });
+}
+
 function looksLikeDagFinalSummaryTask(task) {
   const title = String(task?.title || '').trim();
   const description = String(task?.description || '').trim();
@@ -4702,7 +4842,7 @@ function ensureDagFinalSummaryTask(tasks, options = {}) {
 
   const dependencies = list.map((t) => t.id);
   const defaultDescription =
-    '输入：已完成的各模块交付物；输出：最终回归验证、修复残留问题、补齐必要日志/说明；验收：关键构建/健康检查通过，主要链路无明显异常。';
+    '输入：已完成的各模块交付物与 requirements 用户故事；输出：最终回归验证（含关键用户故事端到端检查，可使用浏览器/MCP）、修复残留问题、补齐必要日志/说明；验收：关键构建/健康检查通过，用户故事链路可复现通过。';
 
   if (!summary) {
     const baseId = `task_${dependencies.length + 1}`;
@@ -5041,6 +5181,79 @@ function parseTaskSummaries(markdown) {
 }
 
 function parseTasksForAtomize(markdown) {
+  const dagTasks = parseDagTasksFromTasksContent(markdown);
+  if (dagTasks && dagTasks.length) {
+    const list = dagTasks.slice();
+    const parseIdNumber = (id) => {
+      const match = /^task_(\d+)$/.exec(String(id || '').trim());
+      if (!match) return null;
+      const value = Number.parseInt(match[1], 10);
+      return Number.isFinite(value) ? value : null;
+    };
+
+    list.sort((a, b) => {
+      const left = parseIdNumber(a?.id);
+      const right = parseIdNumber(b?.id);
+      if (left == null && right == null) return 0;
+      if (left == null) return 1;
+      if (right == null) return -1;
+      return left - right;
+    });
+
+    const filtered = list.filter((task) => {
+      const id = String(task?.id || '').trim();
+      if (id === 'task_0') return false;
+      if (looksLikeDagFinalSummaryTask(task)) return false;
+      return true;
+    });
+
+    const titleById = new Map(
+      filtered.map((t) => [String(t?.id || '').trim(), sanitizeModelText(t?.title || '', '').trim()]),
+    );
+
+    return filtered.map((task, idx) => {
+      const id = String(task?.id || '').trim();
+      const titleText = sanitizeModelText(task?.title || '', '').trim();
+      const title = id && titleText ? `${id}｜${titleText}` : titleText || id || `Task ${idx + 1}`;
+
+      const description = sanitizeModelText(task?.description || '', '').trim();
+      const scope = Array.isArray(task?.scope)
+        ? task.scope
+            .map((v) => String(v ?? '').trim())
+            .filter(Boolean)
+            .slice(0, 24)
+        : [];
+      const complexity =
+        typeof task?.estimated_complexity === 'string' ? task.estimated_complexity.trim() : '';
+
+      const dependencies = Array.isArray(task?.dependencies) ? task.dependencies : [];
+      const depends = dependencies
+        .map((depId) => String(depId ?? '').trim())
+        .filter(Boolean)
+        .filter((depId) => depId !== 'task_0')
+        .slice(0, 24)
+        .map((depId) => {
+          const depTitle = titleById.get(depId);
+          return depTitle ? `${depId}｜${depTitle}` : depId;
+        });
+
+      const acMatch = description.match(/验收(?:点|标准)?\s*[：:]\s*([\s\S]+)$/);
+      const ac = acMatch ? String(acMatch[1] || '').trim() : '';
+
+      const detailLines = [];
+      if (scope.length) detailLines.push(`scope：${scope.join(', ')}`);
+      if (complexity) detailLines.push(`复杂度：${complexity}`);
+
+      return {
+        title,
+        core: description,
+        details: detailLines.join('\n'),
+        ac,
+        depends,
+      };
+    });
+  }
+
   const lines = normalizeLineEndings(markdown || '').split('\n');
   let inTaskList = false;
   let hasTaskListHeader = false;
@@ -5744,8 +5957,9 @@ async function generateTasksWithModel(design, prompt, options = {}) {
     }
 
     const maxTotalTasks = Math.min(maxTasks, 25);
-    // Reserve 1 slot for the final summary/debug task.
-    const baseMaxTasks = Math.min(Math.max(1, maxTotalTasks - 1), 24);
+    // Reserve slots for task_0 + final summary/debug task.
+    const reservedSystemTasks = 2;
+    const baseMaxTasks = Math.min(Math.max(1, maxTotalTasks - reservedSystemTasks), 23);
     const trimmed = normalized.slice(0, baseMaxTasks);
     const renumbered = renumberDagTasksToTaskSequence(trimmed, { prefix: 'task_' });
     const idSet = new Set(renumbered.map((t) => t.id));
@@ -5761,7 +5975,8 @@ async function generateTasksWithModel(design, prompt, options = {}) {
       const scope = Array.from(new Set(Array.isArray(t.scope) ? t.scope : [])).slice(0, 32);
       return { ...t, dependencies, scope };
     });
-    const finalTasks = ensureDagFinalSummaryTask(baseTasks, { maxTasks: maxTotalTasks });
+    const withTask0 = ensureDagTask0LogsTask(baseTasks);
+    const finalTasks = ensureDagFinalSummaryTask(withTask0, { maxTasks: maxTotalTasks });
 
     const notes = [];
     if (finalTasks.length < Math.min(minTasks, maxTasks)) {
@@ -7932,6 +8147,7 @@ const routesContext = {
   renderClarificationQuestions,
   renderStageAttempts,
   renumberDagTasksToTaskSequence,
+  ensureDagTask0LogsTask,
   reportScoreJobKey,
   requestAtomicTasks,
   resetAtomicFile,
