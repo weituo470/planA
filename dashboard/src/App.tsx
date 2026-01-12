@@ -2647,7 +2647,11 @@ export default function App() {
   const claudeAutoTerminalTailRef = useRef<Map<string, string>>(new Map());
 
   const patchMvp5TasksContent = useCallback(
-    (content: string, taskId: string, status: 'pending' | 'running' | 'completed') => {
+    (
+      content: string,
+      taskId: string,
+      status: 'pending' | 'running' | 'completed' | 'failed',
+    ) => {
       const parsedDoc = parseDagTasksFromTasksContent(content);
       if (!parsedDoc) return null;
       const payload = parsedDoc.payload;
@@ -2669,6 +2673,12 @@ export default function App() {
         nextTask.doneAt = nowIso;
         const startedAt = typeof nextTask.startedAt === 'string' ? nextTask.startedAt.trim() : '';
         if (startedAt) nextTask.startedAt = startedAt;
+      } else if (status === 'failed') {
+        nextTask.status = 'failed';
+        nextTask.done = false;
+        nextTask.doneAt = nowIso;
+        const startedAt = typeof nextTask.startedAt === 'string' ? nextTask.startedAt.trim() : '';
+        nextTask.startedAt = startedAt || nowIso;
       } else {
         nextTask.status = 'pending';
         nextTask.done = false;
@@ -2748,7 +2758,11 @@ export default function App() {
   );
 
   const saveMvp5TaskStatus = useCallback(
-    async (specId: string, taskId: string, status: 'pending' | 'running' | 'completed') => {
+    async (
+      specId: string,
+      taskId: string,
+      status: 'pending' | 'running' | 'completed' | 'failed',
+    ) => {
       const normalizedSpecId = String(specId || '').trim();
       const normalizedTaskId = String(taskId || '').trim();
       if (!normalizedSpecId || !normalizedTaskId) return;
@@ -2811,8 +2825,8 @@ export default function App() {
       if (run.failedMarker && nextTail.includes(run.failedMarker)) {
         claudeAutoRunsRef.current.delete(terminalId);
         claudeAutoTerminalTailRef.current.delete(terminalId);
-        void saveMvp5TaskStatus(run.specId, run.taskId, 'pending')
-          .then(() => showToast(`任务执行失败：${run.taskId}`))
+        void saveMvp5TaskStatus(run.specId, run.taskId, 'failed')
+          .then(() => showToast(`任务执行失败：${run.taskId}`, 'error'))
           .catch((e: any) => showToast(humanizeError(e)));
       }
     },
@@ -2830,9 +2844,12 @@ export default function App() {
       claudeAutoRunsRef.current.delete(terminalId);
       claudeAutoTerminalTailRef.current.delete(terminalId);
 
-      void saveMvp5TaskStatus(run.specId, run.taskId, 'pending')
+      void saveMvp5TaskStatus(run.specId, run.taskId, 'failed')
         .then(() =>
-          showToast(`终端已退出（exitCode=${event.exitCode}），未检测到完成标记：${run.taskId}`),
+          showToast(
+            `终端已退出（exitCode=${event.exitCode}），未检测到完成标记：${run.taskId}`,
+            'error',
+          ),
         )
         .catch((e: any) => showToast(humanizeError(e)));
     },

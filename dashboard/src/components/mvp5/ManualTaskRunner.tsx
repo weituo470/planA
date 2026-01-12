@@ -48,6 +48,24 @@ const GLOBAL_LOCK_SCOPE_MARKERS = [
   'prisma/migrations',
 ];
 
+const TASK1_INIT_SCOPE_HINTS = [
+  'package.json',
+  'package-lock.json',
+  'pnpm-lock.yaml',
+  'yarn.lock',
+  'tsconfig.json',
+  'tsconfig.app.json',
+  'tsconfig.node.json',
+  'vite.config.ts',
+  'vite.config.js',
+  'index.html',
+  'src/main.tsx',
+  'src/main.ts',
+  'src/App.tsx',
+  'src/App.ts',
+  'src/vite-env.d.ts',
+];
+
 export type DagTask = {
   id: string;
   title: string;
@@ -56,7 +74,7 @@ export type DagTask = {
   scope: string[];
   cliToolId?: string;
   estimated_complexity?: string;
-  status?: 'pending' | 'running' | 'completed';
+  status?: 'pending' | 'running' | 'completed' | 'failed';
   done?: boolean;
   startedAt?: string;
   doneAt?: string;
@@ -100,6 +118,7 @@ function normalizeTaskStatus(value: unknown) {
   if (!raw) return 'pending' as const;
   if (raw === 'running' || raw === 'in_progress' || raw === 'in-progress') return 'running' as const;
   if (raw === 'completed' || raw === 'done') return 'completed' as const;
+  if (raw === 'failed' || raw === 'error') return 'failed' as const;
   return 'pending' as const;
 }
 
@@ -151,6 +170,8 @@ function normalizeScopePathForConflict(value: string) {
 function scopeHitsGlobalLock(scope: string[]) {
   if (!Array.isArray(scope) || scope.length === 0) return true;
   const normalized = scope.map((v) => normalizeScopePathForConflict(v)).filter(Boolean);
+  // scope 全是 "/" 这类根路径时，normalize 后会变成空数组；此时视为全局写锁。
+  if (normalized.length === 0) return true;
   return normalized.some((path) => {
     return GLOBAL_LOCK_SCOPE_MARKERS.some((marker) => {
       const normalizedMarker = normalizeScopePathForConflict(marker);
@@ -175,10 +196,12 @@ function scopesMayConflict(a: string, b: string) {
 }
 
 function scopeListsMayConflict(a: string[], b: string[]) {
-  // scope 为空时无法判断，保守处理为“可能冲突”，避免并发改动导致冲突。
-  if (!a.length || !b.length) return true;
-  for (const sa of a) {
-    for (const sb of b) {
+  const left = Array.isArray(a) ? a.map((v) => normalizeScopePathForConflict(v)).filter(Boolean) : [];
+  const right = Array.isArray(b) ? b.map((v) => normalizeScopePathForConflict(v)).filter(Boolean) : [];
+  // scope 为空（或 normalize 后为空）时无法判断，保守处理为“可能冲突”，避免并发改动导致冲突。
+  if (!left.length || !right.length) return true;
+  for (const sa of left) {
+    for (const sb of right) {
       if (scopesMayConflict(sa, sb)) return true;
     }
   }
@@ -836,6 +859,70 @@ export function ManualTaskRunner({
     return map;
   }, [tasks]);
 
+  const task1ScopeUpgradedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (disabled) return;
+    if (!parsed) return;
+    if (task1ScopeUpgradedRef.current === specId) return;
+
+    const payload = (parsed as any)?.payload;
+    const list = Array.isArray(payload?.tasks) ? payload.tasks : [];
+    const idx = list.findIndex((t: any) => String(t?.id || '').trim() === 'task_1');
+    if (idx < 0) {
+      task1ScopeUpgradedRef.current = specId;
+      return;
+    }
+
+    const task1 = list[idx] || {};
+    const rawScope = Array.isArray(task1?.scope) ? task1.scope : [];
+    const cleanedScope = rawScope
+      .map((v: any) => String(v ?? '').trim())
+      .filter(Boolean)
+      .filter((v: string) => v !== '/' && v !== '.' && v !== './');
+
+    const normalized = new Set(cleanedScope.map((v) => normalizeScopePathForConflict(v)).filter(Boolean));
+    const desired = TASK1_INIT_SCOPE_HINTS.map((v) => normalizeScopePathForConflict(v)).filter(Boolean);
+    const missing = desired.filter((v) => !normalized.has(v));
+    if (!missing.length) {
+      task1ScopeUpgradedRef.current = specId;
+      return;
+    }
+
+    const nextScope = Array.from(new Set([...cleanedScope, ...TASK1_INIT_SCOPE_HINTS])).slice(0, 32);
+    const nextList = list.slice();
+    nextList[idx] = { ...task1, scope: nextScope };
+    const nextPayload = { ...payload, tasks: nextList };
+    const nextContent = replaceTasksJsonInContent(tasksContent, nextPayload);
+    if (!nextContent || nextContent === tasksContent) {
+      task1ScopeUpgradedRef.current = specId;
+      return;
+    }
+
+    task1ScopeUpgradedRef.current = specId;
+    void postTestLogEvent({
+      level: 'info',
+      source: 'dashboard',
+      action: 'tasks.scope.upgrade_task_1',
+      message: 'upgrade task_1 scope',
+      specId,
+      taskId: 'task_1',
+      data: { sessionId: testSessionId, from: cleanedScope, to: nextScope, missing },
+    }).catch((e: any) => console.error('[testlog] tasks.scope.upgrade_task_1 failed', e));
+
+    void onSaveTasksContent(nextContent).catch((e: any) => {
+      onToast(`自动补全 task_1 scope 失败：${String(e?.message || e || '未知错误')}`, 'error');
+      void postTestLogEvent({
+        level: 'warn',
+        source: 'dashboard',
+        action: 'tasks.scope.upgrade_task_1_save_failed',
+        message: String(e?.message || e || 'save failed'),
+        specId,
+        taskId: 'task_1',
+        data: { sessionId: testSessionId },
+      }).catch((err: any) => console.error('[testlog] tasks.scope.upgrade_task_1_save_failed failed', err));
+    });
+  }, [disabled, onSaveTasksContent, onToast, parsed, specId, tasksContent, testSessionId]);
+
   const [nowMs, setNowMs] = useState(() => Date.now());
   const hasStarted = useMemo(() => tasks.some((t) => parseIsoMs(t.startedAt) != null), [tasks]);
   const hasRunningTask = useMemo(
@@ -900,7 +987,14 @@ export function ManualTaskRunner({
     const map: Record<string, 'pending' | 'running' | 'completed' | 'failed'> = {};
     for (const task of tasks) {
       const status = task.status ?? (getTaskDone(task) ? 'completed' : 'pending');
-      map[task.id] = status === 'running' ? 'running' : status === 'completed' ? 'completed' : 'pending';
+      map[task.id] =
+        status === 'running'
+          ? 'running'
+          : status === 'completed'
+            ? 'completed'
+            : status === 'failed'
+              ? 'failed'
+              : 'pending';
     }
     return map;
   }, [tasks]);
@@ -1181,50 +1275,146 @@ export function ManualTaskRunner({
 
   const startTaskInClaudeAuto = useCallback(
     async (task: DagTask, reason: string) => {
-      if (!onRunPromptInClaudeAutoTerminal) throw new Error('终端面板未就绪');
+      if (!onRunPromptInClaudeAutoTerminal) throw new Error('终端面板未就绪');  
       const taskScope = task.scope ?? [];
       const taskGlobalLock = scopeHitsGlobalLock(taskScope);
       const maxRunning = PARALLEL_POLICY_MAX_RUNNING[parallelPolicy];
       const runningTasks = tasks.filter(
         (t) => t.id !== task.id && (statusById.get(t.id) ?? 'pending') === 'running',
       );
+      const cliToolId =
+        String(taskCliToolIdById?.[task.id] || '').trim() ||
+        String(effectiveDefaultCliToolId || '').trim();
+      void postTestLogEvent({
+        level: 'info',
+        source: 'dashboard',
+        action: 'task.start.request',
+        message: `start task ${task.id}`,
+        specId,
+        taskId: task.id,
+        data: {
+          sessionId: testSessionId,
+          reason,
+          parallelPolicy,
+          cliToolId,
+          scope: taskScope,
+          globalLock: taskGlobalLock,
+          runningTaskIds: runningTasks.map((t) => t.id),
+          maxRunning,
+        },
+      }).catch((e: any) => console.error('[testlog] task.start.request failed', e));
       if (runningTasks.length >= maxRunning) {
         const info = formatTaskIdList(
           runningTasks.map((t) => t.id),
           6,
         );
-        throw new Error(
-          `并行策略限制(${parallelPolicy})：运行中任务已达上限(${runningTasks.length}/${maxRunning})（${info.text}）`,
-        );
+        const message = `并行策略限制(${parallelPolicy})：运行中任务已达上限(${runningTasks.length}/${maxRunning})（${info.text}）`;
+        void postTestLogEvent({
+          level: 'warn',
+          source: 'dashboard',
+          action: 'task.start.blocked',
+          message,
+          specId,
+          taskId: task.id,
+          data: {
+            sessionId: testSessionId,
+            reason,
+            parallelPolicy,
+            cliToolId,
+            scope: taskScope,
+            globalLock: taskGlobalLock,
+            runningTaskIds: runningTasks.map((t) => t.id),
+            kind: 'max_running',
+            maxRunning,
+          },
+        }).catch((e: any) => console.error('[testlog] task.start.blocked failed', e));
+        throw new Error(message);
       }
       const runningGlobalLockIds = runningTasks
         .filter((t) => scopeHitsGlobalLock(t.scope ?? []))
         .map((t) => t.id);
       if (runningGlobalLockIds.length) {
         const info = formatTaskIdList(runningGlobalLockIds, 6);
-        throw new Error(`全局资源占用冲突：运行中任务占用全局资源（${info.text}）`);
+        const message = `全局资源占用冲突：运行中任务占用全局资源（${info.text}）`;
+        void postTestLogEvent({
+          level: 'warn',
+          source: 'dashboard',
+          action: 'task.start.blocked',
+          message,
+          specId,
+          taskId: task.id,
+          data: {
+            sessionId: testSessionId,
+            reason,
+            parallelPolicy,
+            cliToolId,
+            scope: taskScope,
+            globalLock: taskGlobalLock,
+            runningTaskIds: runningTasks.map((t) => t.id),
+            kind: 'running_global_lock',
+            runningGlobalLockIds,
+          },
+        }).catch((e: any) => console.error('[testlog] task.start.blocked failed', e));
+        throw new Error(message);
       }
       if (taskGlobalLock && runningTasks.length) {
         const info = formatTaskIdList(
           runningTasks.map((t) => t.id),
           6,
         );
-        throw new Error(`全局资源占用冲突：${task.id} 需要独占运行（${info.text}）`);
+        const message = `全局资源占用冲突：${task.id} 需要独占运行（${info.text}）`;
+        void postTestLogEvent({
+          level: 'warn',
+          source: 'dashboard',
+          action: 'task.start.blocked',
+          message,
+          specId,
+          taskId: task.id,
+          data: {
+            sessionId: testSessionId,
+            reason,
+            parallelPolicy,
+            cliToolId,
+            scope: taskScope,
+            globalLock: taskGlobalLock,
+            runningTaskIds: runningTasks.map((t) => t.id),
+            kind: 'task_requires_global_lock',
+          },
+        }).catch((e: any) => console.error('[testlog] task.start.blocked failed', e));
+        throw new Error(message);
       }
       const runningConflicts = runningTasks
         .filter((t) => scopeListsMayConflict(taskScope, t.scope ?? []))
         .map((t) => t.id);
       if (runningConflicts.length) {
         const info = formatTaskIdList(runningConflicts, 6);
-        throw new Error(`文件占用冲突：${task.id} 与运行中任务冲突（${info.text}）`);
+        const message = `文件占用冲突：${task.id} 与运行中任务冲突（${info.text}）`;
+        void postTestLogEvent({
+          level: 'warn',
+          source: 'dashboard',
+          action: 'task.start.blocked',
+          message,
+          specId,
+          taskId: task.id,
+          data: {
+            sessionId: testSessionId,
+            reason,
+            parallelPolicy,
+            cliToolId,
+            scope: taskScope,
+            globalLock: taskGlobalLock,
+            runningTaskIds: runningTasks.map((t) => t.id),
+            kind: 'scope_conflict',
+            conflicts: runningConflicts,
+          },
+        }).catch((e: any) => console.error('[testlog] task.start.blocked failed', e));
+        throw new Error(message);
       }
       const { prompt } = await fetchPromptForTask(task);
       const { promptWithMarkers, doneMarker, failedMarker } = buildClaudePromptWithMarkers(
         prompt,
         task.id,
       );
-      const cliToolId =
-        String(taskCliToolIdById?.[task.id] || '').trim() || String(effectiveDefaultCliToolId || '').trim();
       const created = await onRunPromptInClaudeAutoTerminal(promptWithMarkers, {
         specId,
         taskId: task.id,
@@ -1232,6 +1422,24 @@ export function ManualTaskRunner({
         failedMarker,
         ...(cliToolId ? { cliToolId } : {}),
       });
+      void postTestLogEvent({
+        level: 'info',
+        source: 'dashboard',
+        action: 'task.start.spawned',
+        message: `spawned terminal for ${task.id}`,
+        specId,
+        taskId: task.id,
+        data: {
+          sessionId: testSessionId,
+          reason,
+          parallelPolicy,
+          cliToolId,
+          scope: taskScope,
+          globalLock: taskGlobalLock,
+          terminalId: created.terminalId,
+          terminalTitle: created.title,
+        },
+      }).catch((e: any) => console.error('[testlog] task.start.spawned failed', e));
       onToast(`已启动：${task.id} · ${created.title || 'Claude Code'} · ${reason}`, 'info');
       return created;
     },
@@ -1246,6 +1454,7 @@ export function ManualTaskRunner({
       statusById,
       taskCliToolIdById,
       tasks,
+      testSessionId,
     ],
   );
 

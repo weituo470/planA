@@ -2634,7 +2634,8 @@ async function runTasksIterateJob(specName, runId, job, options = {}) {
       const scope = Array.from(new Set(Array.isArray(t.scope) ? t.scope : [])).slice(0, 32);
       return { ...t, dependencies, scope };
     });
-    const withTask0 = ensureDagTask0LogsTask(baseTasks);
+    const withTask1Scope = ensureDagTask1InitScope(baseTasks);
+    const withTask0 = ensureDagTask0LogsTask(withTask1Scope);
     const finalTasks = ensureDagFinalSummaryTask(withTask0, { maxTasks: maxTotalTasks });
 
     const notes = [
@@ -4810,6 +4811,47 @@ function ensureDagTask0LogsTask(tasks) {
   });
 }
 
+const TASK1_INIT_SCOPE_HINTS = [
+  'package.json',
+  'package-lock.json',
+  'pnpm-lock.yaml',
+  'yarn.lock',
+  'bun.lockb',
+  'npm-shrinkwrap.json',
+  'tsconfig.json',
+  'tsconfig.app.json',
+  'tsconfig.node.json',
+  'vite.config.ts',
+  'vite.config.js',
+  'index.html',
+  'src/main.tsx',
+  'src/main.ts',
+  'src/App.tsx',
+  'src/App.ts',
+  'src/vite-env.d.ts',
+];
+
+function normalizeScopeHintPath(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  const unified = raw.replace(/\\/g, '/').replace(/\/+/g, '/').trim();
+  if (!unified || unified === '/' || unified === '.' || unified === './') return '';
+  return unified.replace(/^\.\/+/, '').replace(/^\/+/, '').replace(/\/+$/, '');
+}
+
+function ensureDagTask1InitScope(tasks) {
+  const list = Array.isArray(tasks) ? tasks.slice() : [];
+  const idx = list.findIndex((t) => String(t?.id || '').trim() === 'task_1');
+  if (idx < 0) return list;
+
+  const task = list[idx] || {};
+  const rawScope = Array.isArray(task?.scope) ? task.scope : [];
+  const cleanedScope = rawScope.map(normalizeScopeHintPath).filter(Boolean);
+  const nextScope = Array.from(new Set([...cleanedScope, ...TASK1_INIT_SCOPE_HINTS])).slice(0, 32);
+  list[idx] = { ...task, scope: nextScope };
+  return list;
+}
+
 function looksLikeDagFinalSummaryTask(task) {
   const title = String(task?.title || '').trim();
   const description = String(task?.description || '').trim();
@@ -5975,7 +6017,8 @@ async function generateTasksWithModel(design, prompt, options = {}) {
       const scope = Array.from(new Set(Array.isArray(t.scope) ? t.scope : [])).slice(0, 32);
       return { ...t, dependencies, scope };
     });
-    const withTask0 = ensureDagTask0LogsTask(baseTasks);
+    const withTask1Scope = ensureDagTask1InitScope(baseTasks);
+    const withTask0 = ensureDagTask0LogsTask(withTask1Scope);
     const finalTasks = ensureDagFinalSummaryTask(withTask0, { maxTasks: maxTotalTasks });
 
     const notes = [];
