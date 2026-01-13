@@ -561,7 +561,8 @@ function registerCoreRoutes(app, ctx) {
         const startedAt = Date.now();
         await callLlm([{ role: 'user', content: 'ping' }], {
           ...cfg,
-          timeoutMs: Number(process.env.LLM_PING_TIMEOUT_MS || 8000),
+          // 连接探测允许更长延迟，避免高延迟网络被过早判定为不可用
+          timeoutMs: Number(process.env.LLM_PING_TIMEOUT_MS || 15000),
         });
     
         const latencyMs = Date.now() - startedAt;
