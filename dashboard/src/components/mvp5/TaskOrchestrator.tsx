@@ -12,8 +12,9 @@ import type {
   ExecutionState,
 } from './types';
 import { withTestSessionHeaders } from '../../lib/test-logger';
+import { getBridgeUrl } from '../../lib/bridge-url';
 
-const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
+const BRIDGE_URL = getBridgeUrl();
 
 interface TaskOrchestratorProps {
   specId: string;

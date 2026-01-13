@@ -1,18 +1,33 @@
 {
-  "name": "plana",
+  "name": "@weituo470/plana",
   "version": "0.1.0",
-  "private": true,
-  "description": "Action - AI 原生 DevOps 任务编排系统（npx 一键启动）",
+  "description": "Action - AI 原生 DevOps 任务编排系统（npx 即用）",
   "bin": {
     "plana": "bin/plana.js"
   },
+  "files": [
+    "bin/",
+    "bridge/src/",
+    "dashboard/dist/",
+    "docs/",
+    "workflow/"
+  ],
   "scripts": {
-    "setup": "node bin/plana.js --setup",
     "start": "node bin/plana.js",
-    "dev": "node bin/plana.js",
-    "postinstall": "node bin/plana.js --setup"
+    "prepack": "npm --prefix dashboard ci && npm --prefix dashboard run build"
+  },
+  "dependencies": {
+    "chokidar": "^3.6.0",
+    "cors": "^2.8.5",
+    "diff": "^5.2.0",
+    "express": "^4.18.2",
+    "node-pty": "^1.0.0",
+    "socket.io": "^4.7.2"
   },
   "engines": {
     "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

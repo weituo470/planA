@@ -1,4 +1,6 @@
-const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
+import { getBridgeUrl } from './bridge-url';
+
+const BRIDGE_URL = getBridgeUrl();
 
 const TEST_SESSION_STORAGE_KEY = 'mvp5:testSessionId';
 
@@ -124,4 +126,3 @@ export function getTestLogDownloadUrl(sessionId?: string) {
   const sid = String(sessionId || getTestSessionId()).trim();
   return `${BRIDGE_URL}/test-logs/download?sessionId=${encodeURIComponent(sid)}`;
 }
-

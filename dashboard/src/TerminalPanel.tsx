@@ -15,8 +15,9 @@ import '@xterm/xterm/css/xterm.css';
 
 import { Button } from './components/ui/button';
 import { getTestSessionId, postTestLogEvent, withTestSessionHeaders } from './lib/test-logger';
+import { getBridgeUrl } from './lib/bridge-url';
 
-const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
+const BRIDGE_URL = getBridgeUrl();
 const TERMINAL_SPACES_STORAGE_KEY = 'mvp5:terminalSpaces';
 const TERMINAL_ACTIVE_SPACE_STORAGE_KEY = 'mvp5:terminalActiveSpace';
 

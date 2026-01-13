@@ -1,20 +1,9 @@
 #!/usr/bin/env node
 /* eslint-disable no-console */
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
-
-function spawnNpm(args, options) {
-  const safeArgs = Array.isArray(args) ? args.map((v) => String(v ?? '')) : [];
-  if (process.platform === 'win32') {
-    return spawn('cmd.exe', ['/d', '/s', '/c', 'npm', ...safeArgs], {
-      shell: false,
-      ...options,
-    });
-  }
-  return spawn('npm', safeArgs, { shell: false, ...options });
-}
+const runtimeConfig = require('../bridge/src/lib/runtime-config');
 
 function fileExists(filePath) {
   try {
@@ -27,92 +16,6 @@ function fileExists(filePath) {
 
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
-}
-
-function parseArgs(argv) {
-  const args = {
-    port: null,
-    rootDir: null,
-    noInstall: false,
-    setupOnly: false,
-  };
-
-  for (let i = 0; i < argv.length; i += 1) {
-    const cur = String(argv[i] || '').trim();
-    if (!cur) continue;
-
-    if (cur === '--help' || cur === '-h') {
-      args.help = true;
-      continue;
-    }
-    if (cur === '--setup') {
-      args.setupOnly = true;
-      continue;
-    }
-    if (cur === '--no-install') {
-      args.noInstall = true;
-      continue;
-    }
-    if ((cur === '--port' || cur === '-p') && argv[i + 1]) {
-      args.port = Number(argv[i + 1]);
-      i += 1;
-      continue;
-    }
-    if ((cur === '--root' || cur === '--root-dir') && argv[i + 1]) {
-      args.rootDir = String(argv[i + 1]);
-      i += 1;
-      continue;
-    }
-  }
-
-  return args;
-}
-
-function printHelp() {
-  console.log(
-    [
-      'plana（Action）一键启动',
-      '',
-      '用法：',
-      '  plana',
-      '  plana --setup',
-      '  plana --root C:\\\\planA --port 4100',
-      '',
-      '参数：',
-      '  --setup              仅安装依赖并退出',
-      '  --root, --root-dir   默认工作目录（传给 Bridge 的 WORKFLOW_DEFAULT_CWD；默认：Windows=C:\\\\planA，其他=~/planA）',
-      '  -p, --port           Bridge 端口（默认：4100）',
-      '  --no-install         不自动安装 bridge/dashboard 依赖（依赖不存在将报错）',
-      '',
-      '访问：Dashboard http://localhost:5174 · Bridge http://localhost:<port>/health',
-    ].join('\n'),
-  );
-}
-
-function runNpmCommand(args, options) {
-  return new Promise((resolve, reject) => {
-    const child = spawnNpm(args, { stdio: 'inherit', ...options });
-    child.on('error', reject);
-    child.on('exit', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`npm ${args.join(' ')} exited with code ${code}`));
-    });
-  });
-}
-
-async function ensurePackageDeps(dirPath, label, options) {
-  const nodeModulesDir = path.join(dirPath, 'node_modules');
-  if (fileExists(nodeModulesDir)) return;
-  if (options.noInstall) {
-    throw new Error(`${label}/node_modules 不存在（已指定 --no-install）`);
-  }
-  console.log(`[plana] 安装 ${label} 依赖中…`);
-  await runNpmCommand(['ci'], { cwd: dirPath });
-}
-
-function resolveDefaultRootDir() {
-  if (process.platform === 'win32') return 'C:\\\\planA';
-  return path.join(os.homedir(), 'planA');
 }
 
 function killProcessTree(child) {
@@ -136,83 +39,153 @@ function killProcessTree(child) {
   }
 }
 
-async function main() {
-  const args = parseArgs(process.argv.slice(2));
+function parseArgs(argv) {
+  const args = {
+    cmd: 'start',
+    subcmd: null,
+    port: null,
+    rootDir: null,
+    help: false,
+  };
+
+  const list = Array.isArray(argv) ? argv.map((v) => String(v ?? '')) : [];
+  if (list[0] === 'config') {
+    args.cmd = 'config';
+    args.subcmd = list[1] ? String(list[1]) : null;
+    list.splice(0, args.subcmd ? 2 : 1);
+  }
+
+  for (let i = 0; i < list.length; i += 1) {
+    const cur = String(list[i] || '').trim();
+    if (!cur) continue;
+    if (cur === '--help' || cur === '-h') {
+      args.help = true;
+      continue;
+    }
+    if ((cur === '--port' || cur === '-p') && list[i + 1]) {
+      args.port = list[i + 1];
+      i += 1;
+      continue;
+    }
+    if ((cur === '--root' || cur === '--root-dir') && list[i + 1]) {
+      args.rootDir = list[i + 1];
+      i += 1;
+      continue;
+    }
+  }
+
+  return args;
+}
+
+function printHelp() {
+  console.log(
+    [
+      'plana（Action）启动器（支持 npx）',
+      '',
+      '用法：',
+      '  npx @weituo470/plana',
+      '  plana --root C:\\\\planA --port 4100',
+      '  plana config',
+      '  plana config set --root C:\\\\planA --port 4100',
+      '',
+      '说明：',
+      `  默认配置文件：${runtimeConfig.resolveConfigFile()}`,
+      '  UI 与 Bridge 统一在同一端口提供（默认 4100）。',
+    ].join('\n'),
+  );
+}
+
+function handleConfigCommand(args) {
   if (args.help) {
     printHelp();
     return;
   }
 
-  const repoDir = path.resolve(__dirname, '..');
-  const bridgeDir = path.join(repoDir, 'bridge');
-  const dashboardDir = path.join(repoDir, 'dashboard');
-
-  if (!fileExists(path.join(bridgeDir, 'package.json'))) {
-    throw new Error(`未找到 bridge：${bridgeDir}`);
-  }
-  if (!fileExists(path.join(dashboardDir, 'package.json'))) {
-    throw new Error(`未找到 dashboard：${dashboardDir}`);
-  }
-
-  const rootDir = path.resolve(args.rootDir || resolveDefaultRootDir());
-  ensureDir(rootDir);
-
-  await ensurePackageDeps(bridgeDir, 'bridge', args);
-  await ensurePackageDeps(dashboardDir, 'dashboard', args);
-
-  if (args.setupOnly) {
-    console.log('[plana] 依赖已就绪');
+  if (args.subcmd === 'set') {
+    const next = {};
+    if (args.port != null) next.defaultPort = args.port;
+    if (args.rootDir != null) next.defaultRootDir = args.rootDir;
+    const persisted = runtimeConfig.writeRuntimeConfig(next);
+    console.log('[plana] 已更新默认配置：');
+    console.log(JSON.stringify(persisted, null, 2));
     return;
   }
 
-  const port = Number.isFinite(args.port) && args.port > 0 ? Math.floor(args.port) : 4100;
+  const cfg = runtimeConfig.readRuntimeConfig();
+  console.log('[plana] 当前默认配置：');
+  console.log(JSON.stringify(cfg, null, 2));
+}
 
-  console.log(`[plana] Bridge：http://localhost:${port}（health: /health）`);
-  console.log('[plana] Dashboard：http://localhost:5174');
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  if (args.help && args.cmd !== 'config') {
+    printHelp();
+    return;
+  }
+  if (args.cmd === 'config') {
+    handleConfigCommand(args);
+    return;
+  }
 
-  const bridgeEnv = {
+  const repoDir = path.resolve(__dirname, '..');
+  const bridgeEntry = path.join(repoDir, 'bridge', 'src', 'index.js');
+  const dashboardDist = path.join(repoDir, 'dashboard', 'dist');
+
+  if (!fileExists(bridgeEntry)) {
+    throw new Error(`未找到 Bridge 入口：${bridgeEntry}`);
+  }
+  if (!fileExists(dashboardDist)) {
+    console.warn(`[plana] dashboard/dist 不存在：${dashboardDist}（建议先执行 npm --prefix dashboard run build）`);
+  }
+
+  const stored = runtimeConfig.readRuntimeConfig();
+  const port = runtimeConfig.normalizePort(args.port, stored.defaultPort);
+  const rootDir = runtimeConfig.normalizeRootDir(args.rootDir, stored.defaultRootDir);
+  ensureDir(rootDir);
+
+  const actionDir = path.join(rootDir, '.action');
+  const dataDir = path.join(actionDir, 'data');
+  const logsDir = path.join(actionDir, 'logs');
+  const specRoot = path.join(rootDir, 'workflow', 'specs');
+  const promptConfigFile = path.join(rootDir, 'workflow', 'prompt-config.json');
+
+  const env = {
     ...process.env,
     WORKFLOW_BRIDGE_PORT: String(port),
+    WORKFLOW_ROOT_DIR: rootDir,
     WORKFLOW_DEFAULT_CWD: rootDir,
-  };
-  const dashboardEnv = {
-    ...process.env,
-    VITE_BRIDGE_URL: `http://localhost:${port}`,
+    WORKFLOW_DATA_DIR: dataDir,
+    WORKFLOW_LOGS_DIR: logsDir,
+    WORKFLOW_SPEC_ROOT: specRoot,
+    WORKFLOW_PROMPT_CONFIG_FILE: promptConfigFile,
+    WORKFLOW_DASHBOARD_DIST: dashboardDist,
   };
 
-  const bridgeProc = spawn(process.execPath, [path.join(bridgeDir, 'src', 'index.js')], {
+  console.log(`[plana] RootDir：${rootDir}`);
+  console.log(`[plana] UI：http://localhost:${port}`);
+  console.log(`[plana] Health：http://localhost:${port}/health`);
+
+  const bridgeProc = spawn(process.execPath, [bridgeEntry], {
     stdio: 'inherit',
     shell: false,
-    cwd: bridgeDir,
-    env: bridgeEnv,
-    detached: process.platform !== 'win32',
-  });
-
-  const dashboardProc = spawnNpm(['run', 'dev'], {
-    stdio: 'inherit',
-    cwd: dashboardDir,
-    env: dashboardEnv,
+    cwd: repoDir,
+    env,
     detached: process.platform !== 'win32',
   });
 
   let shuttingDown = false;
-  const shutdownAll = (reason) => {
+  const shutdown = (reason) => {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`[plana] 停止中：${reason}`);
-    killProcessTree(dashboardProc);
     killProcessTree(bridgeProc);
   };
 
-  process.on('SIGINT', () => shutdownAll('SIGINT'));
-  process.on('SIGTERM', () => shutdownAll('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 
   bridgeProc.on('exit', (code) => {
-    shutdownAll(`bridge exited (${typeof code === 'number' ? code : 'unknown'})`);
-    process.exitCode = typeof code === 'number' ? code : 1;
-  });
-  dashboardProc.on('exit', (code) => {
-    shutdownAll(`dashboard exited (${typeof code === 'number' ? code : 'unknown'})`);
+    shutdown(`bridge exited (${typeof code === 'number' ? code : 'unknown'})`);
     process.exitCode = typeof code === 'number' ? code : 1;
   });
 }
@@ -221,3 +194,4 @@ main().catch((err) => {
   console.error(`[plana] 启动失败：${err?.message || String(err)}`);
   process.exit(1);
 });
+

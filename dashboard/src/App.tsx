@@ -6,6 +6,7 @@ import { ExplorerSidebar } from './ExplorerSidebar';
 import { TerminalPanel, type TerminalPanelHandle, type AssignableCliTerminal } from './TerminalPanel';
 import { ManualTaskRunner, parseDagTasksFromTasksContent, replaceTasksJsonInContent } from './components/mvp5';
 import { withTestSessionHeaders } from './lib/test-logger';
+import { getBridgeUrl } from './lib/bridge-url';
 import type {
   ClarificationQuestion,
   LlmInfo,
@@ -16,7 +17,7 @@ import type {
   SpecSummary,
 } from './types';
 
-const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
+const BRIDGE_URL = getBridgeUrl();
 const API_TIMEOUT_MS = Number(import.meta.env.VITE_API_TIMEOUT_MS || 90000);
 const TASK_TIMEOUT_MS = Number(import.meta.env.VITE_TASK_TIMEOUT_MS || 180000);
 const DOWNLOAD_PREFIX = 'planA-v0.1';
@@ -48,6 +49,19 @@ type CliToolDraft = {
   apiKeyEnvKey: string;
   envText: string;
   clearApiKey: boolean;
+};
+
+type RuntimeConfigPayload = {
+  defaultPort: number;
+  defaultRootDir: string;
+  filePath?: string;
+};
+
+type RuntimeConfigResponse = {
+  ok: boolean;
+  config: RuntimeConfigPayload;
+  effective?: { port: number; effectiveCwd: string };
+  note?: string;
 };
 
 type OutputScrollEl = HTMLDivElement | HTMLTextAreaElement;
@@ -846,6 +860,15 @@ export default function App() {
   const [cliTools, setCliTools] = useState<CliToolInfo[]>([]);
   const [cliToolsLoading, setCliToolsLoading] = useState(false);
   const [cliToolsError, setCliToolsError] = useState<string | null>(null);
+  const [runtimeConfigInfo, setRuntimeConfigInfo] = useState<RuntimeConfigResponse | null>(null);
+  const [runtimeConfigLoading, setRuntimeConfigLoading] = useState(false);
+  const [runtimeConfigDraft, setRuntimeConfigDraft] = useState<{
+    defaultPort: string;
+    defaultRootDir: string;
+  }>({
+    defaultPort: '',
+    defaultRootDir: '',
+  });
   const [cliConfigOpen, setCliConfigOpen] = useState(false);
   const [cliToolEditorOpen, setCliToolEditorOpen] = useState(false);
   const [cliToolEditingId, setCliToolEditingId] = useState<string | null>(null);
@@ -1402,6 +1425,59 @@ export default function App() {
     setPromptDraft(data.current ?? null);
     setPromptPresetToApply('');
   }, []);
+
+  const refreshRuntimeConfig = useCallback(async () => {
+    setRuntimeConfigLoading(true);
+    try {
+      const data = await apiJson<RuntimeConfigResponse>('/runtime-config');
+      setRuntimeConfigInfo(data);
+      setRuntimeConfigDraft({
+        defaultPort: data?.config?.defaultPort != null ? String(data.config.defaultPort) : '',
+        defaultRootDir: data?.config?.defaultRootDir != null ? String(data.config.defaultRootDir) : '',
+      });
+    } finally {
+      setRuntimeConfigLoading(false);
+    }
+  }, []);
+
+  const saveRuntimeConfig = useCallback(async () => {
+    const portText = runtimeConfigDraft.defaultPort.trim();
+    const rootText = runtimeConfigDraft.defaultRootDir.trim();
+    if (!portText) {
+      showToast('默认端口不能为空');
+      return;
+    }
+    const port = Number.parseInt(portText, 10);
+    if (!Number.isFinite(port) || port < 1 || port > 65535) {
+      showToast('默认端口需要是 1-65535 的整数');
+      return;
+    }
+    if (!rootText) {
+      showToast('默认根目录不能为空');
+      return;
+    }
+
+    setRuntimeConfigLoading(true);
+    try {
+      const data = await apiJson<RuntimeConfigResponse>('/runtime-config', {
+        method: 'POST',
+        body: JSON.stringify({
+          defaultPort: Math.floor(port),
+          defaultRootDir: rootText,
+        }),
+      });
+      setRuntimeConfigInfo(data);
+      setRuntimeConfigDraft({
+        defaultPort: String(data?.config?.defaultPort ?? Math.floor(port)),
+        defaultRootDir: String(data?.config?.defaultRootDir ?? rootText),
+      });
+      showToast(data.note ? `配置已保存（${data.note}）` : '配置已保存', 'info');
+    } catch (e: any) {
+      showToast(humanizeError(e));
+    } finally {
+      setRuntimeConfigLoading(false);
+    }
+  }, [runtimeConfigDraft.defaultPort, runtimeConfigDraft.defaultRootDir, showToast]);
 
   const savePromptDraftToServer = useCallback(async () => {
     if (!promptDraft) return;
@@ -3644,6 +3720,139 @@ export default function App() {
                   })}
                 </div>
               )}
+            </div>
+          </details>
+
+          <details
+            className="mt-3 rounded-md border border-slate-800 bg-slate-900/30 p-3"
+            onToggle={(e) => {
+              const el = e.currentTarget;
+              if (!el.open) return;
+              if (runtimeConfigInfo && !runtimeConfigLoading) return;
+              void refreshRuntimeConfig().catch((err) => showToast(humanizeError(err)));
+            }}
+          >
+            <summary className="cursor-pointer select-none text-sm font-semibold text-slate-200">
+              配置中心（端口/默认目录）
+            </summary>
+            <div className="mt-2 space-y-3">
+              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                <div className="min-w-0">
+                  配置文件：
+                  <span className="ml-1 break-all font-mono text-[11px] text-slate-300">
+                    {runtimeConfigInfo?.config?.filePath ?? '（未知）'}
+                  </span>
+                </div>
+                <div className="ml-auto flex flex-wrap items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      void refreshRuntimeConfig().catch((err) => showToast(humanizeError(err)))
+                    }
+                    disabled={runtimeConfigLoading || Boolean(busyLabel)}
+                  >
+                    重新加载
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={saveRuntimeConfig}
+                    disabled={
+                      runtimeConfigLoading ||
+                      Boolean(busyLabel) ||
+                      !runtimeConfigDraft.defaultPort.trim() ||
+                      !runtimeConfigDraft.defaultRootDir.trim()
+                    }
+                  >
+                    保存
+                  </Button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <div className="rounded-md border border-slate-800 bg-slate-950/40 p-3">
+                  <div className="text-sm font-semibold text-slate-200">当前运行</div>
+                  <div className="mt-2 space-y-1 text-xs text-slate-400">
+                    <div>
+                      端口：
+                      <span className="ml-1 font-mono text-slate-200">
+                        {runtimeConfigInfo?.effective?.port ?? '-'}
+                      </span>
+                    </div>
+                    <div className="break-all">
+                      默认工作目录：{' '}
+                      <span className="font-mono text-[11px] text-slate-200">
+                        {runtimeConfigInfo?.effective?.effectiveCwd ?? '（未知）'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-md border border-slate-800 bg-slate-950/40 p-3">
+                  <div className="text-sm font-semibold text-slate-200">
+                    默认值（下次启动生效）
+                  </div>
+                  <div className="mt-2 grid grid-cols-1 gap-2">
+                    <label className="space-y-1 text-xs text-slate-300">
+                      <div>默认端口</div>
+                      <input
+                        className="h-9 w-full rounded-md border border-slate-700 bg-slate-950 px-2 text-sm text-slate-100"
+                        value={runtimeConfigDraft.defaultPort}
+                        onChange={(e) =>
+                          setRuntimeConfigDraft((prev) => ({
+                            ...prev,
+                            defaultPort: e.target.value,
+                          }))
+                        }
+                        placeholder={
+                          runtimeConfigInfo?.config?.defaultPort != null
+                            ? String(runtimeConfigInfo.config.defaultPort)
+                            : '4100'
+                        }
+                      />
+                    </label>
+                    <label className="space-y-1 text-xs text-slate-300">
+                      <div>默认根目录</div>
+                      <input
+                        className="h-9 w-full rounded-md border border-slate-700 bg-slate-950 px-2 text-sm text-slate-100"
+                        value={runtimeConfigDraft.defaultRootDir}
+                        onChange={(e) =>
+                          setRuntimeConfigDraft((prev) => ({
+                            ...prev,
+                            defaultRootDir: e.target.value,
+                          }))
+                        }
+                        placeholder="例如：C:\\planA"
+                      />
+                    </label>
+                    {runtimeConfigInfo?.effective?.effectiveCwd ? (
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() =>
+                            setRuntimeConfigDraft((prev) => ({
+                              ...prev,
+                              defaultRootDir:
+                                runtimeConfigInfo?.effective?.effectiveCwd ?? prev.defaultRootDir,
+                            }))
+                          }
+                          disabled={Boolean(busyLabel)}
+                        >
+                          使用当前默认目录
+                        </Button>
+                      </div>
+                    ) : null}
+                    <div className="text-[11px] text-slate-500">
+                      保存后会写入本机配置文件；端口/根目录的改变需重启 plana 才会影响启动参数。
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {runtimeConfigLoading ? (
+                <div className="text-xs text-slate-400">加载中…</div>
+              ) : null}
             </div>
           </details>
 

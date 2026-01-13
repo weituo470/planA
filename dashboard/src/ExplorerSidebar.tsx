@@ -9,8 +9,9 @@ import {
 
 import { Button } from './components/ui/button';
 import { withTestSessionHeaders } from './lib/test-logger';
+import { getBridgeUrl } from './lib/bridge-url';
 
-const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:4100';
+const BRIDGE_URL = getBridgeUrl();
 
 type WorkspaceInfo = {
   defaultCwd: string | null;

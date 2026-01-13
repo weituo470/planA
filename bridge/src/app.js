@@ -9,6 +9,7 @@ const { Server } = require('socket.io');
 const chokidar = require('chokidar');
 const { createTwoFilesPatch } = require('diff');
 const pty = require('node-pty');
+const runtimeConfig = require('./lib/runtime-config');
 
 // MVP5: 智能任务编排服务
 const pathAdapter = require('./services/path-adapter.service');
@@ -26,35 +27,51 @@ function nanoid(size = 21) {
   return crypto.randomBytes(size).toString('base64url').slice(0, size);
 }
 
-const PORT = process.env.WORKFLOW_BRIDGE_PORT || 4100;
-const DATA_DIR = path.join(__dirname, '..', 'data');
+function resolvePathFromEnv(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  try {
+    return path.resolve(trimmed);
+  } catch {
+    return null;
+  }
+}
+
+const APP_DIR = path.resolve(__dirname, '..', '..', '..');
+const ROOT_DIR = resolvePathFromEnv(process.env.WORKFLOW_ROOT_DIR) || APP_DIR;
+const REPO_DIR = ROOT_DIR;
+
+const PORT = runtimeConfig.normalizePort(
+  process.env.WORKFLOW_BRIDGE_PORT,
+  runtimeConfig.readRuntimeConfig().defaultPort,
+);
+const DATA_DIR =
+  resolvePathFromEnv(process.env.WORKFLOW_DATA_DIR) || path.join(__dirname, '..', 'data');
 const EVENT_LOG = path.join(DATA_DIR, 'events.jsonl');
 const LLM_CONFIG_FILE = path.join(DATA_DIR, 'llm-config.json');
 // Prompts are editable via Dashboard and stored in a single, repo-local file for easy management.
-const PROMPT_CONFIG_FILE = path.resolve(__dirname, '..', '..', 'workflow', 'prompt-config.json');
+const PROMPT_CONFIG_FILE =
+  resolvePathFromEnv(process.env.WORKFLOW_PROMPT_CONFIG_FILE) ||
+  path.join(ROOT_DIR, 'workflow', 'prompt-config.json');
 // Reset-to-defaults reads from this repo-tracked baseline file.
-const PROMPT_CONFIG_DEFAULTS_FILE = path.resolve(
-  __dirname,
-  '..',
-  '..',
-  'workflow',
-  'prompt-config.defaults.json',
-);
+const PROMPT_CONFIG_DEFAULTS_FILE = path.join(APP_DIR, 'workflow', 'prompt-config.defaults.json');
 // Backward-compat: previous versions stored prompts under bridge/data (ignored by git).
 const PROMPT_CONFIG_LEGACY_FILE = path.join(DATA_DIR, 'prompt-config.json');
 const PROMPT_PRESETS_FILE = path.join(DATA_DIR, 'prompt-presets.json');
 const WORKSPACE_CONFIG_FILE = path.join(DATA_DIR, 'workspace-config.json');
 const CLI_TOOLS_CONFIG_FILE = path.join(DATA_DIR, 'cli-tools.json');
-const ROOT_DIR = path.resolve(__dirname, '..', '..', '..');
-const REPO_DIR = path.resolve(__dirname, '..', '..');
 const DOCS_DIR = path.join(REPO_DIR, 'docs');
 const WATCH_DIRS =
   process.env.WORKFLOW_WATCH_DIRS || '.codex,task,workflow';
 const MAX_DIFF_CHARS = 8000;
-const SPEC_ROOT = path.join(ROOT_DIR, 'workflow', 'specs');
+const SPEC_ROOT =
+  resolvePathFromEnv(process.env.WORKFLOW_SPEC_ROOT) || path.join(ROOT_DIR, 'workflow', 'specs');
 const DEFAULT_TESTCLI_DIR = path.join(os.homedir(), 'testcli');
-const LOGS_DIR = path.join(REPO_DIR, 'logs');
+const LOGS_DIR = resolvePathFromEnv(process.env.WORKFLOW_LOGS_DIR) || path.join(REPO_DIR, 'logs');
 const TEST_LOG_DIR = path.join(LOGS_DIR, 'test-sessions');
+const DASHBOARD_DIST_DIR =
+  resolvePathFromEnv(process.env.WORKFLOW_DASHBOARD_DIST) || path.join(APP_DIR, 'dashboard', 'dist');
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(SPEC_ROOT, { recursive: true });
@@ -8535,6 +8552,24 @@ const routesContext = {
 
 registerCoreRoutes(app, routesContext);
 registerMvp5Routes(app, routesContext);
+
+function registerDashboardStatic(appInstance) {
+  const indexFile = path.join(DASHBOARD_DIST_DIR, 'index.html');
+  if (!fs.existsSync(indexFile)) return;
+
+  appInstance.use(express.static(DASHBOARD_DIST_DIR, { index: false }));
+  appInstance.get('*', (req, res, next) => {
+    if (req.method !== 'GET') return next();
+    const accept = String(req.headers?.accept || '');
+    if (!accept.includes('text/html')) return next();
+    if (/^\/(api|socket\.io|terminals|llm|prompts|workspace|fs|test-logs)\b/i.test(req.path)) {
+      return next();
+    }
+    return res.sendFile(indexFile);
+  });
+}
+
+registerDashboardStatic(app);
 // ========== Routes end ==========
 
 io.on('connection', (socket) => {

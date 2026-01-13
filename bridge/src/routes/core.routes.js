@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { normalizeCodexSandbox, normalizeCodexModel } = require('../lib/codex-options');
+const runtimeConfig = require('../lib/runtime-config');
 
 function registerCoreRoutes(app, ctx) {
   // NOTE: 临时用 with(ctx) 保持等价重构，后续可逐步迁移到 controllers/services。
@@ -20,7 +21,7 @@ function registerCoreRoutes(app, ctx) {
     
     app.post('/workspace', (req, res) => {
       const raw = req.body?.defaultCwd;
-      if (raw == null || (typeof raw === 'string' && !raw.trim())) {
+      if (raw == null || (typeof raw === 'string' && !raw.trim())) {       
         writeWorkspaceConfig({ defaultCwd: null });
         return res.json({
           ok: true,
@@ -42,7 +43,70 @@ function registerCoreRoutes(app, ctx) {
         effectiveCwd: getDefaultWorkspaceCwd(),
       });
     });
-    
+
+    app.get('/runtime-config', (req, res) => {
+      const cfg = runtimeConfig.readRuntimeConfig();
+      return res.json({
+        ok: true,
+        config: {
+          defaultPort: cfg.defaultPort,
+          defaultRootDir: cfg.defaultRootDir,
+          filePath: cfg.filePath,
+        },
+        effective: {
+          port: PORT,
+          effectiveCwd: getDefaultWorkspaceCwd(),
+        },
+      });
+    });
+
+    app.post('/runtime-config', (req, res) => {
+      const hasPort = Object.prototype.hasOwnProperty.call(req.body || {}, 'defaultPort');
+      const hasRoot = Object.prototype.hasOwnProperty.call(req.body || {}, 'defaultRootDir');
+      if (!hasPort && !hasRoot) {
+        return res.status(400).json({ error: 'Nothing to update' });
+      }
+
+      const next = {};
+      if (hasPort) {
+        const rawPort = req.body?.defaultPort;
+        const parsed = Number.parseInt(String(rawPort ?? ''), 10);
+        if (!Number.isFinite(parsed) || parsed < 1 || parsed > 65535) {
+          return res.status(400).json({ error: 'defaultPort must be 1-65535' });
+        }
+        next.defaultPort = Math.floor(parsed);
+      }
+
+      if (hasRoot) {
+        const rawRoot = req.body?.defaultRootDir;
+        if (typeof rawRoot !== 'string' || !rawRoot.trim()) {
+          return res.status(400).json({ error: 'defaultRootDir must be a non-empty string' });
+        }
+        const resolved = path.resolve(rawRoot.trim());
+        try {
+          fs.mkdirSync(resolved, { recursive: true });
+          const stat = fs.statSync(resolved);
+          if (!stat.isDirectory()) {
+            return res.status(400).json({ error: 'defaultRootDir must be a directory' });
+          }
+        } catch {
+          return res.status(400).json({ error: 'defaultRootDir is not writable' });
+        }
+        next.defaultRootDir = resolved;
+      }
+
+      const persisted = runtimeConfig.writeRuntimeConfig(next);
+      return res.json({
+        ok: true,
+        config: {
+          defaultPort: persisted.defaultPort,
+          defaultRootDir: persisted.defaultRootDir,
+          filePath: persisted.filePath,
+        },
+        note: '端口/根目录修改需重启 plana 生效',
+      });
+    });
+
     function listWindowsDriveRoots() {
       const roots = [];
       for (let code = 65; code <= 90; code += 1) {
