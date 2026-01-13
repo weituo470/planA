@@ -2653,7 +2653,7 @@ export default function App() {
     (
       content: string,
       taskId: string,
-      status: 'pending' | 'running' | 'completed' | 'failed',
+      status: 'pending' | 'launching' | 'running' | 'completed' | 'failed',
     ) => {
       const parsedDoc = parseDagTasksFromTasksContent(content);
       if (!parsedDoc) return null;
@@ -2664,7 +2664,14 @@ export default function App() {
 
       const nextTask = { ...(list[idx] || {}) };
       const nowIso = new Date().toISOString();
-      if (status === 'running') {
+      if (status === 'launching') {
+        // “启动中”不写入 running，避免误判；但记录 startedAt，防止刷新/重载后任务被当作“可开始”重复启动。
+        nextTask.status = 'pending';
+        nextTask.done = false;
+        const startedAt = typeof nextTask.startedAt === 'string' ? nextTask.startedAt.trim() : '';
+        nextTask.startedAt = startedAt || nowIso;
+        delete nextTask.doneAt;
+      } else if (status === 'running') {
         nextTask.status = 'running';
         nextTask.done = false;
         const startedAt = typeof nextTask.startedAt === 'string' ? nextTask.startedAt.trim() : '';
@@ -2764,7 +2771,7 @@ export default function App() {
     async (
       specId: string,
       taskId: string,
-      status: 'pending' | 'running' | 'completed' | 'failed',
+      status: 'pending' | 'launching' | 'running' | 'completed' | 'failed',
     ) => {
       const normalizedSpecId = String(specId || '').trim();
       const normalizedTaskId = String(taskId || '').trim();
@@ -2965,6 +2972,8 @@ export default function App() {
         // 先发一次回车，再做兜底重试（若未检测到输出则补一次）
         await new Promise((resolve) => window.setTimeout(resolve, 120));
         await panel.sendTerminalInput(created.terminalId, '\r\n');
+        // 标记“已启动”（仍保持 pending）：用于防止刷新后任务被误判为“可开始”而重复启动
+        void saveMvp5TaskStatus(specId, taskId, 'launching').catch((e: any) => showToast(humanizeError(e)));
 
         const scheduleRetry = (delayMs: number) => {
           window.setTimeout(() => {

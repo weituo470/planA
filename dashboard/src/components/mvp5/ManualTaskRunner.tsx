@@ -944,12 +944,18 @@ export function ManualTaskRunner({
 
   const [nowMs, setNowMs] = useState(() => Date.now());
   const hasStarted = useMemo(() => tasks.some((t) => parseIsoMs(t.startedAt) != null), [tasks]);
-  const hasRunningTask = useMemo(
-    () =>
-      tasks.some((t) => (statusById.get(t.id) ?? 'pending') === 'running') ||
-      Object.keys(launchingTaskIds).some((id) => launchingTaskIds[id] === true),
-    [launchingTaskIds, statusById, tasks],
-  );
+  const hasRunningTask = useMemo(() => {
+    if (tasks.some((t) => (statusById.get(t.id) ?? 'pending') === 'running')) return true;
+    if (Object.keys(launchingTaskIds).some((id) => launchingTaskIds[id] === true)) return true;
+    // Codex/外部终端：可能已“启动”但 tasks.md 仍是 pending（例如刷新后丢失 launching 运行态）。
+    // 只要存在 startedAt，就按“启动中/进行中”处理，避免重复启动导致冲突。
+    return tasks.some((t) => {
+      const status = statusById.get(t.id) ?? 'pending';
+      if (status !== 'pending') return false;
+      if (doneById.get(t.id) === true) return false;
+      return parseIsoMs(t.startedAt) != null;
+    });
+  }, [doneById, launchingTaskIds, statusById, tasks]);
   const allDone = useMemo(
     () => tasks.length > 0 && tasks.every((t) => doneById.get(t.id) === true),
     [doneById, tasks],
@@ -989,7 +995,11 @@ export function ManualTaskRunner({
   const resourceBlockedById = useMemo(() => {
     const runningTasks = tasks.filter((t) => {
       const status = statusById.get(t.id) ?? 'pending';
-      return status === 'running' || launchingTaskIds[t.id] === true;
+      if (status === 'running') return true;
+      if (launchingTaskIds[t.id] === true) return true;
+      // 兼容刷新/重载后：launchingTaskIds 会丢失，但 startedAt 仍可保留
+      if (status === 'pending' && doneById.get(t.id) !== true && parseIsoMs(t.startedAt) != null) return true;
+      return false;
     });
     const map: Record<string, string[]> = {};
     for (const task of tasks) {
@@ -1017,7 +1027,9 @@ export function ManualTaskRunner({
     const map: Record<string, 'pending' | 'launching' | 'running' | 'completed' | 'failed'> = {};
     for (const task of tasks) {
       const status = task.status ?? (getTaskDone(task) ? 'completed' : 'pending');
-      const isLaunching = status === 'pending' && launchingTaskIds[task.id] === true;
+      const startedAtMs = parseIsoMs(task.startedAt);
+      const isLaunching =
+        status === 'pending' && (launchingTaskIds[task.id] === true || startedAtMs != null);
       map[task.id] =
         isLaunching
           ? 'launching'
@@ -1316,7 +1328,9 @@ export function ManualTaskRunner({
         if (t.id === task.id) return false;
         const status = statusById.get(t.id) ?? (doneById.get(t.id) ? 'completed' : 'pending');
         if (status === 'running') return true;
-        return launchingTaskIds[t.id] === true;
+        if (launchingTaskIds[t.id] === true) return true;
+        if (status === 'pending' && doneById.get(t.id) !== true && parseIsoMs(t.startedAt) != null) return true;
+        return false;
       });
       const cliToolId =
         String(taskCliToolIdById?.[task.id] || '').trim() ||
@@ -1522,6 +1536,7 @@ export function ManualTaskRunner({
           const status = statusById.get(task.id) ?? 'pending';
           if (status !== 'pending') return false;
           if (launchingTaskIds[task.id] === true) return false;
+          if (parseIsoMs(task.startedAt) != null) return false;
           const missingDeps = (task.dependencies || []).filter((depId) => !doneById.get(depId));
           return missingDeps.length === 0;
         });
@@ -1529,7 +1544,10 @@ export function ManualTaskRunner({
 
         const runningTasks = tasks.filter((t) => {
           const status = statusById.get(t.id) ?? 'pending';
-          return status === 'running' || launchingTaskIds[t.id] === true;
+          if (status === 'running') return true;
+          if (launchingTaskIds[t.id] === true) return true;
+          if (status === 'pending' && doneById.get(t.id) !== true && parseIsoMs(t.startedAt) != null) return true;
+          return false;
         });
         const runningCount = runningTasks.length;
         const maxRunning = PARALLEL_POLICY_MAX_RUNNING[parallelPolicy];
@@ -1769,7 +1787,10 @@ export function ManualTaskRunner({
       const runningTasks = tasks.filter((t) => {
         if (t.id === task.id) return false;
         const status = statusById.get(t.id) ?? (doneById.get(t.id) ? 'completed' : 'pending');
-        return status === 'running' || launchingTaskIds[t.id] === true;
+        if (status === 'running') return true;
+        if (launchingTaskIds[t.id] === true) return true;
+        if (status === 'pending' && doneById.get(t.id) !== true && parseIsoMs(t.startedAt) != null) return true;
+        return false;
       });
       const runningGlobalLockIds = runningTasks
         .filter((t) => scopeHitsGlobalLock(t.scope ?? []))
@@ -1850,7 +1871,9 @@ export function ManualTaskRunner({
     for (const task of tasks) {
       const done = doneById.get(task.id) === true;
       const status = statusById.get(task.id) ?? (done ? 'completed' : 'pending');
-      const isLaunching = launchingTaskIds[task.id] === true;
+      const startedAtMs = parseIsoMs(task.startedAt);
+      const isLaunching =
+        launchingTaskIds[task.id] === true || (status === 'pending' && startedAtMs != null);
       const missingDeps = (task.dependencies || []).filter((depId) => !doneById.get(depId));
       const blocked = missingDeps.length > 0;
       const resourceBlockers = resourceBlockedById?.[task.id] ?? [];
@@ -2400,8 +2423,10 @@ export function ManualTaskRunner({
          {tasks.map((task) => {
            const done = doneById.get(task.id) === true;
            const status = statusById.get(task.id) ?? (done ? 'completed' : 'pending');
-           const isLaunching = launchingTaskIds[task.id] === true && status === 'pending';
-           const effectiveStatus = isLaunching ? 'launching' : status;
+            const startedAtMs = parseIsoMs(task.startedAt);
+            const isLaunching =
+              status === 'pending' && (launchingTaskIds[task.id] === true || startedAtMs != null);
+            const effectiveStatus = isLaunching ? 'launching' : status;
             const missingDeps = (task.dependencies || []).filter((depId) => !doneById.get(depId));
             const blocked = missingDeps.length > 0;
             const blockedInfo = blocked ? formatTaskIdList(missingDeps, 3) : null;
@@ -2428,6 +2453,8 @@ export function ManualTaskRunner({
                     className={`h-2 w-2 rounded-full ${
                       effectiveStatus === 'completed'
                         ? 'bg-green-400'
+                        : effectiveStatus === 'failed'
+                          ? 'bg-red-400'
                         : effectiveStatus === 'running'
                           ? 'bg-blue-300'
                           : effectiveStatus === 'launching'
@@ -2444,6 +2471,8 @@ export function ManualTaskRunner({
                     className={`${
                       effectiveStatus === 'completed'
                         ? 'text-green-400'
+                        : effectiveStatus === 'failed'
+                          ? 'text-red-300'
                         : effectiveStatus === 'running'
                           ? 'text-blue-300'
                           : effectiveStatus === 'launching'
@@ -2464,6 +2493,8 @@ export function ManualTaskRunner({
                   >
                     {effectiveStatus === 'completed'
                       ? '已完成'
+                      : effectiveStatus === 'failed'
+                        ? '失败'
                       : effectiveStatus === 'running'
                         ? '进行中'
                         : effectiveStatus === 'launching'

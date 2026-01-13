@@ -562,9 +562,11 @@ export function TaskDagGraph({
             targetVisualStatus === 'running' ||
             targetVisualStatus === 'launching');
 
-        const stroke = isConflict ? '#f59e0b' : isBlocking ? '#94a3b8' : '#cbd5e1';
+        // 冲突线也使用灰色：依靠虚线来区分，避免黄色干扰观感
+        const stroke = isConflict ? '#94a3b8' : isBlocking ? '#94a3b8' : '#cbd5e1';
         const opacity = isConflict ? 0.95 : isBlocking ? 0.88 : isSatisfied ? 0.55 : 0.75;
         const strokeWidth = isBlocking ? 2.25 : isFlowing ? 2.75 : 2;
+        const baseStyle = { stroke, strokeWidth, opacity, strokeLinecap: 'round' as const };
         return {
           id: `${from}->${to}:${idx}`,
           source: from,
@@ -573,7 +575,7 @@ export function TaskDagGraph({
           animated: false,
           markerEnd: { type: MarkerType.ArrowClosed, color: isFlowing ? '#ffffff' : stroke, width: 18, height: 18 },
           style: isConflict
-            ? { stroke, strokeDasharray: '6 4', strokeWidth, opacity }
+            ? { ...baseStyle, strokeDasharray: '6 4' }
             : isFlowing
               ? {
                   stroke: '#ffffff',
@@ -585,7 +587,7 @@ export function TaskDagGraph({
                   animation: 'dag-edge-flow 1.6s linear infinite',
                   filter: 'drop-shadow(0 0 6px rgba(255,255,255,0.55))',
                 }
-              : { stroke, strokeWidth, opacity },
+              : baseStyle,
         };
       })
       .filter(Boolean) as Edge[];
