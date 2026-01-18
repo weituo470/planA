@@ -3475,27 +3475,16 @@ export default function App() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => {
-                  if (showLlmConfig) {
-                    setShowLlmConfig(false);
-                    return;
-                  }
-                  if (llmConfigUnlocked) {
-                    setShowLlmConfig(true);
-                    return;
-                  }
-                  const input = window.prompt('请输入密码以展开模型配置');
-                  if (input === '159753') {
-                    setLlmConfigUnlocked(true);
-                    setShowLlmConfig(true);
-                    return;
-                  }
-                  if (input !== null) {
-                    showToast('密码错误');
-                  }
-                }}
+                onClick={() => setShowLlmConfig((v) => !v)}
               >
                 {showLlmConfig ? '收起模型配置' : '展开模型配置'}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={openCliConfig}
+              >
+                CLI配置
               </Button>
               {activePing && activePing.status !== 'unsupported' && (
                 <span
@@ -3912,9 +3901,6 @@ export default function App() {
                   </div>
                 );
               })}
-              <div className="rounded-md border border-slate-800 bg-slate-900/40 p-3 text-xs text-slate-400">
-                CLI 工具配置已移动到「终端」面板的「＋ 新建终端」旁边。
-              </div>
             </div>
           )}
               </section>
@@ -5326,9 +5312,6 @@ export default function App() {
           <div className="w-[980px] max-w-[96vw] overflow-hidden rounded-lg border border-slate-700 bg-slate-950 shadow-2xl">
             <div className="flex flex-wrap items-center gap-2 border-b border-slate-800 bg-slate-950 px-4 py-3">
               <div className="text-sm font-semibold text-slate-200">CLI 配置</div>
-              <div className="text-xs text-slate-400">
-                配置入口已移动到「终端」面板的「新建终端」旁边
-              </div>
               <div className="ml-auto flex items-center gap-2">
                 <Button variant="outline" size="sm" onClick={closeCliConfig}>
                   关闭
