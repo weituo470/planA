@@ -3,6 +3,7 @@ const path = require('path');
 const os = require('os');
 const http = require('http');
 const crypto = require('crypto');
+const { AsyncLocalStorage } = require('async_hooks');
 const express = require('express');
 const cors = require('cors');
 const { Server } = require('socket.io');
@@ -10,6 +11,7 @@ const chokidar = require('chokidar');
 const { createTwoFilesPatch } = require('diff');
 const pty = require('node-pty');
 const runtimeConfig = require('./lib/runtime-config');
+const db = require('./lib/db');
 
 // MVP5: 智能任务编排服务
 const pathAdapter = require('./services/path-adapter.service');
@@ -27,6 +29,8 @@ function nanoid(size = 21) {
   return crypto.randomBytes(size).toString('base64url').slice(0, size);
 }
 
+const requestContext = new AsyncLocalStorage();
+
 function resolvePathFromEnv(value) {
   if (typeof value !== 'string') return null;
   const trimmed = value.trim();
@@ -36,6 +40,45 @@ function resolvePathFromEnv(value) {
   } catch {
     return null;
   }
+}
+
+function normalizeSpecId(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (typeof sanitizeSpecName === 'function') {
+    return sanitizeSpecName(trimmed);
+  }
+  return trimmed;
+}
+
+function extractSpecIdFromRequest(req) {
+  const fromParams = normalizeSpecId(req?.params?.name);
+  if (fromParams) return fromParams;
+  const fromBody =
+    normalizeSpecId(req?.body?.specId) ||
+    normalizeSpecId(req?.body?.specName) ||
+    normalizeSpecId(req?.body?.name);
+  if (fromBody) return fromBody;
+  return normalizeSpecId(req?.query?.specId) || normalizeSpecId(req?.query?.specName);
+}
+
+function extractStageFromRequest(req) {
+  const pathText = String(req?.path || '');
+  if (/\/requirements\b/i.test(pathText)) return 'requirements';
+  if (/\/design\b/i.test(pathText)) return 'design';
+  if (/\/tasks_atomic\b/i.test(pathText)) return 'tasks_atomic';
+  if (/\/tasks\b/i.test(pathText)) return 'tasks';
+  if (/\/atomize\b/i.test(pathText)) return 'atomize';
+  if (/\/reports\b/i.test(pathText) && /\/score\b/i.test(pathText)) return 'reportScore';
+  if (/\/prompts\b/i.test(pathText)) return 'prompts';
+  if (/\/llm\b/i.test(pathText)) return 'llm';
+  if (/\/api\/mvp5\b/i.test(pathText)) return 'mvp5';
+  return null;
+}
+
+function getRequestContext() {
+  return requestContext.getStore() || {};
 }
 
 const APP_DIR = path.resolve(__dirname, '..', '..', '..');
@@ -72,6 +115,8 @@ const LOGS_DIR = resolvePathFromEnv(process.env.WORKFLOW_LOGS_DIR) || path.join(
 const TEST_LOG_DIR = path.join(LOGS_DIR, 'test-sessions');
 const DASHBOARD_DIST_DIR =
   resolvePathFromEnv(process.env.WORKFLOW_DASHBOARD_DIST) || path.join(APP_DIR, 'dashboard', 'dist');
+const ADMIN_DASHBOARD_DIST_DIR =
+  resolvePathFromEnv(process.env.WORKFLOW_ADMIN_DIST) || path.join(APP_DIR, 'admin-dashboard', 'dist');
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(SPEC_ROOT, { recursive: true });
@@ -86,9 +131,24 @@ try {
   // ignore
 }
 
+db.initDb()
+  .then((result) => {
+    if (!result?.ok) {
+      console.warn('[db] init skipped:', result?.error || 'missing config');
+    }
+  })
+  .catch((error) => {
+    console.error('[db] init failed:', error?.message || error);
+  });
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
+app.use((req, res, next) => {
+  const specId = extractSpecIdFromRequest(req);
+  const stage = extractStageFromRequest(req);
+  requestContext.run({ specId, stage }, () => next());
+});
 app.use(testLogRequestMiddleware);
 
 const server = http.createServer(app);
@@ -1009,6 +1069,18 @@ function getLlmRetryDelayMs(attemptIndex) {
   return base * multiplier;
 }
 
+function formatPromptText(messages) {
+  if (!Array.isArray(messages)) return '';
+  return messages
+    .map((msg) => {
+      const role = String(msg?.role || 'unknown').trim() || 'unknown';
+      const content =
+        typeof msg?.content === 'string' ? msg.content : String(msg?.content ?? '');
+      return `# ${role}\n${content}`;
+    })
+    .join('\n\n');
+}
+
 async function callLlm(messages, overrideConfig = null, handlers = {}) {
   const activeConfig = getActiveLlmConfig();
   const mergedConfig = overrideConfig ? { ...activeConfig, ...overrideConfig } : activeConfig;
@@ -1017,6 +1089,46 @@ async function callLlm(messages, overrideConfig = null, handlers = {}) {
   const llmContext = describeLlmConfig(mergedConfig);
   const timeoutMsOverride = Number(mergedConfig?.timeoutMs || 0) || null;
   const onUsage = typeof handlers?.onUsage === 'function' ? handlers.onUsage : null;
+  const meta = handlers && typeof handlers.meta === 'object' ? handlers.meta : {};
+  const ctx = getRequestContext();
+  const specId = normalizeSpecId(meta.specId || ctx.specId);
+  const stageKey = meta.stage || ctx.stage || null;
+  const promptText = formatPromptText(messages);
+  const requestBody = {
+    model,
+    temperature: 0.3,
+    messages,
+  };
+  if (responseFormat && responseFormat !== 'none' && responseFormat !== 'text') {
+    requestBody.response_format = { type: responseFormat };
+  }
+  const requestText = JSON.stringify(requestBody);
+  const startedAt = new Date().toISOString();
+  const startedMs = Date.now();
+  let usage = null;
+  let conversationId = null;
+  let lastResponseText = null;
+  let lastResponseContent = null;
+  const onUsageWrapped = (u) => {
+    usage = u;
+    onUsage?.(u);
+  };
+
+  if (db.isReady()) {
+    try {
+      conversationId = await db.insertLlmConversationStart({
+        specId,
+        stageKey,
+        model,
+        providerId,
+        requestText,
+        promptText,
+        startedAt,
+      });
+    } catch (error) {
+      console.error('[db] llm start failed:', error?.message || error);
+    }
+  }
 
   const tryOnce = async (rootUrl) => {
     const url = `${String(rootUrl || '').replace(/\/$/, '')}/chat/completions`;
@@ -1031,14 +1143,7 @@ async function callLlm(messages, overrideConfig = null, handlers = {}) {
         reject(err);
       }, timeoutMs);
     });
-    const body = {
-      model,
-      temperature: 0.3,
-      messages,
-    };
-    if (responseFormat && responseFormat !== 'none' && responseFormat !== 'text') {
-      body.response_format = { type: responseFormat };
-    }
+    const body = requestBody;
 
     const requestPromise = (async () => {
       const response = await fetch(url, {
@@ -1051,7 +1156,8 @@ async function callLlm(messages, overrideConfig = null, handlers = {}) {
         signal: controller.signal,
       });
       const contentType = String(response.headers.get('content-type') || '');
-      const rawText = String(await response.text() || '');
+      const rawText = String((await response.text()) || '');
+      lastResponseText = rawText;
       if (!response.ok) {
         const message = rawText ? `${response.status}: ${truncateText(rawText, 2000)}` : `${response.status}`;
         const err = new Error(`LLM request failed: ${message}`);
@@ -1081,13 +1187,14 @@ async function callLlm(messages, overrideConfig = null, handlers = {}) {
         };
         throw err;
       }
-      onUsage?.(normalizeLlmUsage(data?.usage));
+      onUsageWrapped(normalizeLlmUsage(data?.usage));
       const content = data?.choices?.[0]?.message?.content;
       if (!content || typeof content !== 'string') {
         const err = new Error('LLM response empty');
         err.llmContext = { ...llmContext, url, httpStatus: response.status, contentType };
         throw err;
       }
+      lastResponseContent = content.trim();
       return content.trim();
     })();
 
@@ -1133,8 +1240,32 @@ async function callLlm(messages, overrideConfig = null, handlers = {}) {
   };
 
   try {
-    return await withV1Fallback();
+    const content = await withV1Fallback();
+    const endedAt = new Date().toISOString();
+    if (conversationId) {
+      await db.finishLlmConversation(conversationId, {
+        responseText: lastResponseText,
+        responseContent: lastResponseContent || content,
+        usage,
+        status: 'ok',
+        endedAt,
+        durationMs: Date.now() - startedMs,
+      });
+    }
+    return content;
   } catch (error) {
+    const endedAt = new Date().toISOString();
+    if (conversationId) {
+      await db.finishLlmConversation(conversationId, {
+        responseText: lastResponseText,
+        responseContent: lastResponseContent,
+        usage,
+        status: 'error',
+        errorMessage: error?.message || String(error || ''),
+        endedAt,
+        durationMs: Date.now() - startedMs,
+      });
+    }
     console.error('LLM call failed:', error?.message || error, error?.llmContext || llmContext);
     throw error;
   }
@@ -1149,6 +1280,49 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
   const timeoutMsOverride = Number(mergedConfig?.timeoutMs || 0) || null;
   const onToken = typeof handlers?.onToken === 'function' ? handlers.onToken : null;
   const onUsage = typeof handlers?.onUsage === 'function' ? handlers.onUsage : null;
+  const meta = handlers && typeof handlers.meta === 'object' ? handlers.meta : {};
+  const ctx = getRequestContext();
+  const specId = normalizeSpecId(meta.specId || ctx.specId);
+  const stageKey = meta.stage || ctx.stage || null;
+  const promptText = formatPromptText(messages);
+  const requestBody = {
+    model,
+    temperature: 0.3,
+    messages,
+    stream: true,
+    stream_options: { include_usage: Boolean(onUsage) },
+  };
+  if (responseFormat && responseFormat !== 'none' && responseFormat !== 'text') {
+    requestBody.response_format = { type: responseFormat };
+  }
+  const requestText = JSON.stringify(requestBody);
+  const startedAt = new Date().toISOString();
+  const startedMs = Date.now();
+  let usage = null;
+  let conversationId = null;
+  let lastResponseText = null;
+  let lastResponseContent = null;
+  let rawStreamText = '';
+  const onUsageWrapped = (u) => {
+    usage = u;
+    onUsage?.(u);
+  };
+
+  if (db.isReady()) {
+    try {
+      conversationId = await db.insertLlmConversationStart({
+        specId,
+        stageKey,
+        model,
+        providerId: mergedConfig?.providerId,
+        requestText,
+        promptText,
+        startedAt,
+      });
+    } catch (error) {
+      console.error('[db] llm stream start failed:', error?.message || error);
+    }
+  }
 
   const readResponseTextStream = async (response, onTextChunk) => {
     const body = response.body;
@@ -1188,16 +1362,7 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
       hardTimer.unref?.();
     });
 
-    const body = {
-      model,
-      temperature: 0.3,
-      messages,
-      stream: true,
-      stream_options: { include_usage: Boolean(onUsage) },
-    };
-    if (responseFormat && responseFormat !== 'none' && responseFormat !== 'text') {
-      body.response_format = { type: responseFormat };
-    }
+    const body = requestBody;
 
     const requestPromise = (async () => {
       const response = await fetch(url, {
@@ -1212,7 +1377,8 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
       });
       const contentType = String(response.headers.get('content-type') || '');
       if (!response.ok) {
-        const rawText = String(await response.text() || '');
+        const rawText = String((await response.text()) || '');
+        lastResponseText = rawText;
         const message = rawText ? `${response.status}: ${truncateText(rawText, 2000)}` : `${response.status}`;
         const err = new Error(`LLM request failed: ${message}`);
         err.llmContext = {
@@ -1227,7 +1393,8 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
 
       // Some gateways ignore stream=true and still return a JSON payload.
       if (/application\/json/i.test(contentType)) {
-        const rawText = String(await response.text() || '');
+        const rawText = String((await response.text()) || '');
+        lastResponseText = rawText;
         let data;
         try {
           data = JSON.parse(rawText.replace(/^\uFEFF/, ''));
@@ -1245,7 +1412,7 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
           };
           throw err;
         }
-        onUsage?.(normalizeLlmUsage(data?.usage));
+        onUsageWrapped(normalizeLlmUsage(data?.usage));
         const content = data?.choices?.[0]?.message?.content;
         if (!content || typeof content !== 'string') {
           const err = new Error('LLM response empty');
@@ -1253,10 +1420,12 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
           throw err;
         }
         onToken?.(content);
+        lastResponseContent = content.trim();
         return content.trim();
       }
       if (/text\/html/i.test(contentType)) {
-        const rawText = String(await response.text() || '');
+        const rawText = String((await response.text()) || '');
+        lastResponseText = rawText;
         const err = new Error(
           `LLM response is not a stream (content-type: ${contentType || 'unknown'}). ` +
             `Body preview: ${rawText ? truncateText(rawText, 400) : '(empty)'}`,
@@ -1280,6 +1449,7 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
       };
 
       await readResponseTextStream(response, (chunk) => {
+        rawStreamText += chunk;
         buffer += chunk;
         // Parse SSE line-by-line. We only care about `data:` lines.
         while (true) {
@@ -1301,7 +1471,7 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
             continue;
           }
           if (payload?.usage) {
-            onUsage?.(normalizeLlmUsage(payload.usage));
+            onUsageWrapped(normalizeLlmUsage(payload.usage));
           }
           const delta =
             payload?.choices?.[0]?.delta?.content ??
@@ -1316,6 +1486,8 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
         err.llmContext = llmContext;
         throw err;
       }
+      lastResponseText = rawStreamText;
+      lastResponseContent = full.trim();
       return full.trim();
     })();
 
@@ -1356,27 +1528,59 @@ async function callLlmStream(messages, overrideConfig = null, handlers = {}) {
     }
   };
 
-  const retryLimit = getLlmRetryLimit();
-  for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
-    try {
-      return await withV1Fallback();
-    } catch (error) {
-      const canRetry = attempt < retryLimit && isRetryableLlmError(error);
-      if (!canRetry) {
-        console.error('LLM call failed:', error?.message || error, error?.llmContext || llmContext);
-        throw error;
+  let content = null;
+  try {
+    const retryLimit = getLlmRetryLimit();
+    for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
+      try {
+        content = await withV1Fallback();
+        break;
+      } catch (error) {
+        const canRetry = attempt < retryLimit && isRetryableLlmError(error);
+        if (!canRetry) {
+          console.error('LLM call failed:', error?.message || error, error?.llmContext || llmContext);
+          throw error;
+        }
+        const delayMs = getLlmRetryDelayMs(attempt);
+        console.warn(
+          `[llm] retry ${attempt + 1}/${retryLimit} after ${delayMs}ms: ${error?.message || error}`,
+          error?.llmContext || llmContext,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
-      const delayMs = getLlmRetryDelayMs(attempt);
-      console.warn(
-        `[llm] retry ${attempt + 1}/${retryLimit} after ${delayMs}ms: ${error?.message || error}`,
-        error?.llmContext || llmContext,
-      );
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
+    if (!content) {
+      const unreachable = new Error('LLM call retry loop exhausted');
+      unreachable.llmContext = llmContext;
+      throw unreachable;
+    }
+    const endedAt = new Date().toISOString();
+    if (conversationId) {
+      await db.finishLlmConversation(conversationId, {
+        responseText: lastResponseText || rawStreamText,
+        responseContent: lastResponseContent || content,
+        usage,
+        status: 'ok',
+        endedAt,
+        durationMs: Date.now() - startedMs,
+      });
+    }
+    return content;
+  } catch (error) {
+    const endedAt = new Date().toISOString();
+    if (conversationId) {
+      await db.finishLlmConversation(conversationId, {
+        responseText: lastResponseText || rawStreamText,
+        responseContent: lastResponseContent,
+        usage,
+        status: 'error',
+        errorMessage: error?.message || String(error || ''),
+        endedAt,
+        durationMs: Date.now() - startedMs,
+      });
+    }
+    throw error;
   }
-  const unreachable = new Error('LLM call retry loop exhausted');
-  unreachable.llmContext = llmContext;
-  throw unreachable;
 }
 
 function isNdjsonStreamRequest(req) {
@@ -1478,6 +1682,10 @@ function writeSpecStatus(name, status) {
     JSON.stringify(status, null, 2),
     'utf8',
   );
+  const specId = normalizeSpecId(name);
+  db.upsertSpec(specId, { status, promptText: status?.prompt }).catch((error) => {
+    console.error('[db] spec upsert failed:', error?.message || error);
+  });
 }
 
 function ensureSpecStatus(name, overrides = null) {
@@ -1490,6 +1698,10 @@ function ensureSpecStatus(name, overrides = null) {
 function writeSpecFile(name, artifact, content) {
   fs.mkdirSync(resolveSpecDir(name), { recursive: true });
   fs.writeFileSync(resolveSpecFile(name, artifact), content, 'utf8');
+  const specId = normalizeSpecId(name);
+  db.insertArtifact(specId, String(artifact || ''), content).catch((error) => {
+    console.error('[db] artifact insert failed:', error?.message || error);
+  });
 }
 
 function normalizeFlowReportMeta(input) {
@@ -1622,6 +1834,9 @@ function appendFlowRunStageAttempt(specName, stageKey, attempt, options = {}) {
   if (nextStatus.flowReport?.activeRunId !== run.runId) {
     writeSpecStatus(specName, nextStatus);
   }
+  db.insertStageAttempt(normalizeSpecId(specName), key, attemptRecord).catch((error) => {
+    console.error('[db] stage attempt insert failed:', error?.message || error);
+  });
   return attemptRecord;
 }
 
@@ -1661,6 +1876,9 @@ function appendFlowRunStageAttemptToRun(specName, runId, stageKey, attempt) {
     },
   };
   writeFlowRun(specName, nextRun);
+  db.insertStageAttempt(normalizeSpecId(specName), key, attemptRecord).catch((error) => {
+    console.error('[db] stage attempt insert failed:', error?.message || error);
+  });
   return attemptRecord;
 }
 
@@ -7096,6 +7314,11 @@ function emitEvent(type, payload) {
   applyEventToState(event);
   appendEvent(event);
   io.emit('event', event);
+  const ctx = getRequestContext();
+  const specId = normalizeSpecId(payload?.specId || ctx.specId);
+  db.insertEvent(specId, type, payload).catch((error) => {
+    console.error('[db] event insert failed:', error?.message || error);
+  });
   return event;
 }
 
@@ -8280,6 +8503,7 @@ function startPty(command, args, options = {}) {
 // ========== Routes (split modules) ==========
 const { registerCoreRoutes } = require('./routes/core.routes');
 const { registerMvp5Routes } = require('./routes/mvp5.routes');
+const { registerAdminRoutes } = require('./routes/admin.routes');
 
 function writeCliInput(input) {
   if (ptyProcess && typeof input === 'string') {
@@ -8295,6 +8519,7 @@ const routesContext = {
   LOGS_DIR,
   TEST_LOG_DIR,
   SPEC_ROOT,
+  db,
   SPEC_ARTIFACTS,
   LLM_PROVIDERS,
   LLM_MODEL_OPTIONS,
@@ -8552,6 +8777,7 @@ const routesContext = {
 
 registerCoreRoutes(app, routesContext);
 registerMvp5Routes(app, routesContext);
+registerAdminRoutes(app, routesContext);
 
 function registerDashboardStatic(appInstance) {
   const indexFile = path.join(DASHBOARD_DIST_DIR, 'index.html');
@@ -8562,13 +8788,27 @@ function registerDashboardStatic(appInstance) {
     if (req.method !== 'GET') return next();
     const accept = String(req.headers?.accept || '');
     if (!accept.includes('text/html')) return next();
-    if (/^\/(api|socket\.io|terminals|llm|prompts|workspace|fs|test-logs)\b/i.test(req.path)) {
+    if (/^\/(api|admin|socket\.io|terminals|llm|prompts|workspace|fs|test-logs)\b/i.test(req.path)) {
       return next();
     }
     return res.sendFile(indexFile);
   });
 }
 
+function registerAdminStatic(appInstance) {
+  const indexFile = path.join(ADMIN_DASHBOARD_DIST_DIR, 'index.html');
+  if (!fs.existsSync(indexFile)) return;
+
+  appInstance.use('/admin', express.static(ADMIN_DASHBOARD_DIST_DIR, { index: false }));
+  appInstance.get('/admin/*', (req, res, next) => {
+    if (req.method !== 'GET') return next();
+    const accept = String(req.headers?.accept || '');
+    if (!accept.includes('text/html')) return next();
+    return res.sendFile(indexFile);
+  });
+}
+
+registerAdminStatic(app);
 registerDashboardStatic(app);
 // ========== Routes end ==========
 

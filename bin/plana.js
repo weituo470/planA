@@ -130,12 +130,16 @@ async function main() {
   const repoDir = path.resolve(__dirname, '..');
   const bridgeEntry = path.join(repoDir, 'bridge', 'src', 'index.js');
   const dashboardDist = path.join(repoDir, 'dashboard', 'dist');
+  const adminDist = path.join(repoDir, 'admin-dashboard', 'dist');
 
   if (!fileExists(bridgeEntry)) {
     throw new Error(`未找到 Bridge 入口：${bridgeEntry}`);
   }
   if (!fileExists(dashboardDist)) {
     console.warn(`[plana] dashboard/dist 不存在：${dashboardDist}（建议先执行 npm --prefix dashboard run build）`);
+  }
+  if (!fileExists(adminDist)) {
+    console.warn(`[plana] admin-dashboard/dist 不存在：${adminDist}（可选：npm --prefix admin-dashboard run build）`);
   }
 
   const stored = runtimeConfig.readRuntimeConfig();
@@ -159,10 +163,12 @@ async function main() {
     WORKFLOW_SPEC_ROOT: specRoot,
     WORKFLOW_PROMPT_CONFIG_FILE: promptConfigFile,
     WORKFLOW_DASHBOARD_DIST: dashboardDist,
+    WORKFLOW_ADMIN_DIST: adminDist,
   };
 
   console.log(`[plana] RootDir：${rootDir}`);
   console.log(`[plana] UI：http://localhost:${port}`);
+  console.log(`[plana] Admin UI：http://localhost:${port}/admin`);
   console.log(`[plana] Health：http://localhost:${port}/health`);
 
   const bridgeProc = spawn(process.execPath, [bridgeEntry], {

@@ -13,6 +13,33 @@ function registerMvp5Routes(app, ctx) {
   // NOTE: 临时用 with(ctx) 保持等价重构，后续可逐步迁移到 controllers/services。
   with (ctx) {
     // ========== MVP5: 智能任务编排 API ==========
+
+    const mvp5PersistTimers = new Map();
+
+    function scheduleMvp5ExecutionPersist(state) {
+      if (!state || !state.executionId) return;
+      if (!db?.isReady || !db.isReady()) return;
+      if (mvp5PersistTimers.has(state.executionId)) return;
+      const executionId = state.executionId;
+      const timer = setTimeout(() => {
+        mvp5PersistTimers.delete(executionId);
+        const specId = sanitizeSpecName(state.specId);
+        db.upsertMvp5Execution(specId, executionId, state.status, state).catch((error) => {
+          console.error('[db] mvp5 execution persist failed:', error?.message || error);
+        });
+      }, 200);
+      timer.unref?.();
+      mvp5PersistTimers.set(executionId, timer);
+    }
+
+    function persistMvp5Plan(plan) {
+      if (!plan?.planId) return;
+      if (!db?.isReady || !db.isReady()) return;
+      const specId = sanitizeSpecName(plan.specId);
+      db.insertMvp5Plan(specId, plan.planId, plan).catch((error) => {
+        console.error('[db] mvp5 plan persist failed:', error?.message || error);
+      });
+    }
     
     function normalizeCliAvailabilityForMvp5(value) {
       const obj = value && typeof value === 'object' ? value : {};
@@ -973,7 +1000,8 @@ function registerMvp5Routes(app, ctx) {
         };
     
         executionPlans.set(planId, plan);
-    
+        persistMvp5Plan(plan);
+
         res.json(plan);
       } catch (error) {
         console.error('[MVP5] 创建执行计划错误:', error);
@@ -1194,6 +1222,7 @@ function registerMvp5Routes(app, ctx) {
         state.status = 'completed';
         state.updatedAt = new Date().toISOString();
         plan.status = 'completed';
+        scheduleMvp5ExecutionPersist(state);
         return;
       }
     
@@ -1203,6 +1232,7 @@ function registerMvp5Routes(app, ctx) {
         state.status = 'failed';
         state.updatedAt = new Date().toISOString();
         plan.status = 'failed';
+        scheduleMvp5ExecutionPersist(state);
         return;
       }
     
@@ -1213,6 +1243,7 @@ function registerMvp5Routes(app, ctx) {
       if (isPhaseDone) {
         state.currentPhase = phaseIndex + 1;
         state.updatedAt = new Date().toISOString();
+        scheduleMvp5ExecutionPersist(state);
         setTimeout(() => scheduleMvp5Execution(runner), 0);
         return;
       }
@@ -1404,6 +1435,7 @@ function registerMvp5Routes(app, ctx) {
       }
 
       state.updatedAt = finishedAt;
+      scheduleMvp5ExecutionPersist(state);
       worker.busy = false;
       worker.current = null;
       worker.tail = '';
@@ -1431,6 +1463,7 @@ function registerMvp5Routes(app, ctx) {
           taskState.error = undefined;
         }
         state.updatedAt = startedAt;
+        scheduleMvp5ExecutionPersist(state);
 
         const taskLogsDir =
           runner?.taskLogs?.dir || path.join(runner.projectDir || REPO_DIR, 'task_logs', runner.specName, runner.executionId);
@@ -1475,6 +1508,7 @@ function registerMvp5Routes(app, ctx) {
             taskState.error = undefined;
           }
           state.updatedAt = finishedAt;
+          scheduleMvp5ExecutionPersist(state);
           emitEvent('log:append', {
             source: 'task_logs',
             message: `[task_logs] task_0 ready dir=${normalizePathForPrompt(taskLogsDir)}`,
@@ -1498,6 +1532,7 @@ function registerMvp5Routes(app, ctx) {
           state.status = 'failed';
           plan.status = 'failed';
           state.updatedAt = failedAt;
+          scheduleMvp5ExecutionPersist(state);
           emitEvent('log:append', {
             source: 'task_logs',
             message: `[task_logs] task_0 failed err=${message}`,
@@ -1533,6 +1568,7 @@ function registerMvp5Routes(app, ctx) {
         state.status = 'failed';
         plan.status = 'failed';
         state.updatedAt = failedAt;
+        scheduleMvp5ExecutionPersist(state);
         runner.stopped = true;
         emitEvent('log:append', {
           source: 'mvp5',
@@ -1620,6 +1656,7 @@ function registerMvp5Routes(app, ctx) {
         taskState.error = undefined;
       }
       state.updatedAt = startedAt;
+      scheduleMvp5ExecutionPersist(state);
 
       worker.busy = true;
       worker.current = { taskId, phaseIndex, marker, runDocPathRel: doc.runDocPathRel, worktree };
@@ -1658,6 +1695,7 @@ function registerMvp5Routes(app, ctx) {
         state.status = 'failed';
         plan.status = 'failed';
         state.updatedAt = failedAt;
+        scheduleMvp5ExecutionPersist(state);
         worker.busy = false;
         worker.current = null;
       }
@@ -1807,6 +1845,7 @@ function registerMvp5Routes(app, ctx) {
         executionStates.set(executionId, executionState);
         plan.status = 'running';
         plan.executionId = executionId;
+        scheduleMvp5ExecutionPersist(executionState);
     
         const specName = sanitizeSpecName(plan.specId);
         if (!specName) {
@@ -1837,6 +1876,7 @@ function registerMvp5Routes(app, ctx) {
           executionState.status = 'failed';
           executionState.updatedAt = new Date().toISOString();
           plan.status = 'failed';
+          scheduleMvp5ExecutionPersist(executionState);
           return res.status(500).json({ error: '启动执行失败：runner 初始化失败' });
         }
     
@@ -1893,6 +1933,7 @@ function registerMvp5Routes(app, ctx) {
         task.retryCount += 1;
         task.error = undefined;
         state.updatedAt = new Date().toISOString();
+        scheduleMvp5ExecutionPersist(state);
     
         // 重新执行任务（复用既有 runner；如 runner 丢失则尝试重建）
         const plan = executionPlans.get(state.planId);
